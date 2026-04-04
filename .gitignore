@@ -1,2 +1,12 @@
 # Cursor local plans (not part of functional source)
 .cursor/plans/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+.env

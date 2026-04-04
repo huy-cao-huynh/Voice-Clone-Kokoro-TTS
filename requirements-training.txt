@@ -1,0 +1,13 @@
+# Voice-clone training + inference dependencies (Kokoro fork + WavLM + HF).
+#
+# Install PyTorch FIRST for your hardware (ROCm / CUDA / CPU). This file does not
+# pin torch, so a plain `pip install -r` would pull the default wheel from PyPI,
+# which is usually wrong for AMD GPUs. See docs/environment.md.
+#
+# From the repository root, after torch+torchaudio are installed:
+#   pip install -r requirements-training.txt
+
+-e ./kokoro
+
+transformers>=4.36.0
+huggingface_hub>=0.20.0
