@@ -314,7 +314,7 @@ class Generator(nn.Module):
             else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
         )
 
-    def forward(self, x, s, f0):
+    def forward(self, x, s, f0, z_style: Optional[torch.Tensor] = None):
         with torch.no_grad():
             f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
             har_source, noi_source, uv = self.m_source(f0)
@@ -337,7 +337,9 @@ class Generator(nn.Module):
                     xs += self.resblocks[i*self.num_kernels+j](x, s)
             x = xs / self.num_kernels
             if self.adapters is not None:
-                x = self.adapters[i](x, s)
+                if z_style is None:
+                    raise ValueError("Generator adapters require z_style [B, Z]")
+                x = self.adapters[i](x, z_style)
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
@@ -443,13 +445,15 @@ class Decoder(nn.Module):
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=disable_complex,
                                    adapters=generator_adapters)
 
-    def forward(self, asr, F0_curve, N, s):
+    def forward(self, asr, F0_curve, N, s, z_style: Optional[torch.Tensor] = None):
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
         N = self.N_conv(N.unsqueeze(1))
         x = torch.cat([asr, F0, N], axis=1)
         x = self.encode(x, s)
         if self.decoder_adapters is not None:
-            x = self.decoder_adapters[0](x, s)
+            if z_style is None:
+                raise ValueError("decoder_adapters require z_style [B, Z]")
+            x = self.decoder_adapters[0](x, z_style)
         asr_res = self.asr_res(asr)
         res = True
         for bi, block in enumerate(self.decode):
@@ -457,8 +461,8 @@ class Decoder(nn.Module):
                 x = torch.cat([x, asr_res, F0, N], axis=1)
             x = block(x, s)
             if self.decoder_adapters is not None:
-                x = self.decoder_adapters[bi + 1](x, s)
+                x = self.decoder_adapters[bi + 1](x, z_style)
             if block.upsample_type != "none":
                 res = False
-        x = self.generator(x, s, F0_curve)
+        x = self.generator(x, s, F0_curve, z_style=z_style)
         return x

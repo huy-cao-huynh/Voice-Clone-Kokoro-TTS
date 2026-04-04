@@ -145,6 +145,39 @@ class WavLMSV(nn.Module):
         attention_mask = enc["attention_mask"].to(device=self.device, dtype=torch.long)
         return input_values, attention_mask
 
+    def _extract_inputs_torch(
+        self,
+        waveforms: Union[Tensor, Sequence[Tensor]],
+    ) -> Tuple[Tensor, Tensor]:
+        """Pad mono waveforms like the HF feature extractor (no normalization for this checkpoint)."""
+        if isinstance(waveforms, Tensor):
+            w = waveforms
+            if w.dim() == 1:
+                w = w.unsqueeze(0)
+            if w.dim() != 2:
+                raise ValueError("waveforms tensor must be (batch, samples) or (samples,)")
+            input_values = w.to(device=self.device, dtype=self.dtype)
+            attention_mask = torch.ones(
+                input_values.shape[0], input_values.shape[1], device=self.device, dtype=torch.long
+            )
+            return input_values, attention_mask
+
+        rows: List[Tensor] = []
+        for i, x in enumerate(waveforms):
+            t = x if isinstance(x, Tensor) else torch.as_tensor(x, dtype=self.dtype)
+            if t.dim() != 1:
+                raise ValueError(f"waveforms[{i}] must be 1-D, got shape {tuple(t.shape)}")
+            rows.append(t.to(device=self.device, dtype=self.dtype))
+        max_len = max(int(t.shape[0]) for t in rows)
+        b = len(rows)
+        padded = torch.zeros(b, max_len, device=self.device, dtype=self.dtype)
+        attention_mask = torch.zeros(b, max_len, device=self.device, dtype=torch.long)
+        for i, t in enumerate(rows):
+            L = t.shape[0]
+            padded[i, :L] = t
+            attention_mask[i, :L] = 1
+        return padded, attention_mask
+
     def forward(
         self,
         waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
@@ -152,6 +185,7 @@ class WavLMSV(nn.Module):
         sampling_rate: int = 16_000,
         normalize_embeddings: bool = True,
         output_hidden_states: bool = False,
+        grad_through_input: bool = False,
     ) -> WavLMSVOutput:
         """Run frozen WavLM-SV on mono waveforms (default **16 kHz** per model card).
 
@@ -161,6 +195,9 @@ class WavLMSV(nn.Module):
             normalize_embeddings: If True, L2-normalize `pooled_embedding` (speaker cosine loss).
             output_hidden_states: If True, `all_hidden_states` is set on the output (tuple of every
                 encoder layer) for multi-layer SLM / analysis. Frames always use the last layer.
+            grad_through_input: If True, run the forward **without** `torch.no_grad()` so gradients
+                can flow into `waveforms` (weights stay frozen). Use for generated audio in speaker
+                / SLM generator losses.
 
         Returns:
             `WavLMSVOutput` with pooled embedding, last-layer frame features, and masks.
@@ -170,15 +207,25 @@ class WavLMSV(nn.Module):
                 f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
             )
 
-        input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
+        if grad_through_input:
+            input_values, attention_mask = self._extract_inputs_torch(waveforms)
+        else:
+            input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
         frame_mask = frame_mask_from_sample_mask(attention_mask, self.wavlm_xv.wavlm)
 
-        with torch.no_grad():
+        if grad_through_input:
             out = self.wavlm_xv(
                 input_values,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
+        else:
+            with torch.no_grad():
+                out = self.wavlm_xv(
+                    input_values,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
 
         frames = out.hidden_states[-1]
         emb = out.embeddings
@@ -201,15 +248,22 @@ class WavLMSV(nn.Module):
         *,
         sampling_rate: int = 16_000,
         normalize: bool = True,
+        grad_through_input: bool = False,
     ) -> Tensor:
         """X-vector embeddings only, shape `(batch, 512)`."""
         if sampling_rate != 16_000:
             raise ValueError(
                 f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
             )
-        input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
-        with torch.no_grad():
+        if grad_through_input:
+            input_values, attention_mask = self._extract_inputs_torch(waveforms)
+        else:
+            input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
+        if grad_through_input:
             out = self.wavlm_xv(input_values, attention_mask=attention_mask)
+        else:
+            with torch.no_grad():
+                out = self.wavlm_xv(input_values, attention_mask=attention_mask)
         emb = out.embeddings
         return F.normalize(emb, dim=-1) if normalize else emb
 
@@ -219,6 +273,7 @@ class WavLMSV(nn.Module):
         *,
         sampling_rate: int = 16_000,
         output_all_hidden_states: bool = False,
+        grad_through_input: bool = False,
     ) -> Tuple[Tensor, Tensor, Optional[Tuple[Tensor, ...]]]:
         """Encoder frame states and frame mask (and optionally all layer states).
 
@@ -231,14 +286,24 @@ class WavLMSV(nn.Module):
             raise ValueError(
                 f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
             )
-        input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
+        if grad_through_input:
+            input_values, attention_mask = self._extract_inputs_torch(waveforms)
+        else:
+            input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
         frame_mask = frame_mask_from_sample_mask(attention_mask, self.wavlm_xv.wavlm)
-        with torch.no_grad():
+        if grad_through_input:
             out = self.wavlm_xv(
                 input_values,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
+        else:
+            with torch.no_grad():
+                out = self.wavlm_xv(
+                    input_values,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
         all_hs: Optional[Tuple[Tensor, ...]] = None
         if output_all_hidden_states:
             all_hs = out.hidden_states

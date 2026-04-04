@@ -89,22 +89,6 @@ class AdaLayerNorm(nn.Module):
         return x.transpose(1, -1).transpose(-1, -2)
 
 
-class ResidualStyleAdapter(nn.Module):
-    """Residual L-adapter: h' = h + W_up(ReLU(W_down([h || z]))). h is [B, C, T], z is [B, style_dim]."""
-
-    def __init__(self, hidden_dim: int, style_dim: int, bottleneck_dim: int):
-        super().__init__()
-        self.down = nn.Linear(hidden_dim + style_dim, bottleneck_dim)
-        self.up = nn.Linear(bottleneck_dim, hidden_dim)
-
-    def forward(self, h: torch.Tensor, z_style: torch.Tensor) -> torch.Tensor:
-        b, _, t = h.shape
-        z = z_style.unsqueeze(-1).expand(b, z_style.size(1), t)
-        x = torch.cat([h, z], dim=1).transpose(1, 2)
-        delta = self.up(F.relu(self.down(x))).transpose(1, 2)
-        return h + delta
-
-
 class ProsodyPredictor(nn.Module):
     def __init__(
         self,
@@ -166,7 +150,14 @@ class ProsodyPredictor(nn.Module):
 
 
 class DurationEncoder(nn.Module):
-    def __init__(self, sty_dim, d_model, nlayers, dropout=0.1):
+    def __init__(
+        self,
+        sty_dim,
+        d_model,
+        nlayers,
+        dropout=0.1,
+        adapters: Optional[nn.ModuleList] = None,
+    ):
         super().__init__()
         self.lstms = nn.ModuleList()
         for _ in range(nlayers):
@@ -175,8 +166,15 @@ class DurationEncoder(nn.Module):
         self.dropout = dropout
         self.d_model = d_model
         self.sty_dim = sty_dim
+        self.adapters = adapters
+        if adapters is not None and len(adapters) != nlayers:
+            raise ValueError(
+                f"DurationEncoder adapters length {len(adapters)} must equal nlayers {nlayers}"
+            )
 
-    def forward(self, x, style, text_lengths, m):
+    def forward(self, x, style, text_lengths, m, z_style: Optional[torch.Tensor] = None):
+        if self.adapters is not None and z_style is None:
+            raise ValueError("DurationEncoder adapters require z_style [B, Z]")
         masks = m
         x = x.permute(2, 0, 1)
         s = style.expand(x.shape[0], x.shape[1], -1)
@@ -184,9 +182,13 @@ class DurationEncoder(nn.Module):
         x.masked_fill_(masks.unsqueeze(-1).transpose(0, 1), 0.0)
         x = x.transpose(0, 1)
         x = x.transpose(-1, -2)
+        adapter_idx = 0
         for block in self.lstms:
             if isinstance(block, AdaLayerNorm):
                 x = block(x.transpose(-1, -2), style).transpose(-1, -2)
+                if self.adapters is not None and z_style is not None:
+                    x = self.adapters[adapter_idx](x, z_style)
+                    adapter_idx += 1
                 x = torch.cat([x, s.permute(1, 2, 0)], axis=1)
                 x.masked_fill_(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
             else:

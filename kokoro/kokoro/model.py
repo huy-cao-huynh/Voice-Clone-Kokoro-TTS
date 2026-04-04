@@ -90,7 +90,6 @@ class KModel(torch.nn.Module):
         audio: torch.FloatTensor
         pred_dur: Optional[torch.LongTensor] = None
 
-    @torch.no_grad()
     def forward_with_tokens(
         self,
         input_ids: torch.LongTensor,
@@ -108,8 +107,9 @@ class KModel(torch.nn.Module):
         text_mask = torch.gt(text_mask+1, input_lengths.unsqueeze(1)).to(self.device)
         bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
         d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
+        z_style = ref_s
         s = ref_s[:, 128:]
-        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask, z_style=z_style)
         x, _ = self.predictor.lstm(d)
         duration = self.predictor.duration_proj(x)
         duration = torch.sigmoid(duration).sum(axis=-1) / speed
@@ -122,9 +122,10 @@ class KModel(torch.nn.Module):
         F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
         t_en = self.text_encoder(input_ids, input_lengths, text_mask)
         asr = t_en @ pred_aln_trg
-        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
+        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128], z_style=z_style).squeeze()
         return audio, pred_dur
 
+    @torch.no_grad()
     def forward(
         self,
         phonemes: str,

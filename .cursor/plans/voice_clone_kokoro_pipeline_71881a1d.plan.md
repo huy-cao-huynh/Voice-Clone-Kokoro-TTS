@@ -7,22 +7,22 @@ todos:
     status: completed
   - id: hf-wavlm-sv
     content: "voice_clone/wavlm_sv.py: frozen microsoft/wavlm-base-plus-sv; pooled_embedding + frame_hidden_states + length masks"
-    status: pending
+    status: completed
   - id: segment-gst
     content: "segment_gst.py: MHA bank B, queries from WavLM frames, output ref_s 256 split 128|128"
-    status: pending
+    status: completed
   - id: adapters-module
     content: "adapters.py: ResidualAdapter [h||z] equation; wire z_style at duration + decoder sites"
-    status: pending
+    status: completed
   - id: losses-train
     content: "losses.py + train_adapters.py: mel, speaker cosine ref-vs-gen, SLM feature GAN (train D only on WavLM feats)"
-    status: pending
+    status: completed
   - id: multilingual-data
     content: Dataset with lang_code; KPipeline(model=False) phonemization; repo_id/vocab constraints documented
-    status: pending
+    status: completed
   - id: infer-cli
     content: "infer.py: load KModel + GST/adapters + frozen WavLM-SV; ref wav + text + lang → audio"
-    status: pending
+    status: completed
 isProject: false
 ---
 
