@@ -5,6 +5,10 @@
 hub/
 # hf_xet / xet-core local cache and logs
 xet/
+# wandb runs
+wandb/
+.editorconfig
+.gitattributes
 # Python
 __pycache__/
 *.py[cod]
