@@ -7,6 +7,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
 import torch
 import torchaudio
 from torch.utils.data import Dataset
@@ -84,7 +85,17 @@ def text_to_phonemes(
 def load_audio_mono(path: Union[str, Path], *, target_sr: int) -> torch.Tensor:
     """Load a file as ``(time,)`` float32 mono at ``target_sr``."""
     path = Path(path)
-    wav, sr = torchaudio.load(str(path))
+    try:
+        import soundfile as sf
+    except ImportError:
+        wav, sr = torchaudio.load(str(path))
+    else:
+        data, sr = sf.read(str(path), always_2d=False, dtype="float32")
+        t = torch.from_numpy(np.ascontiguousarray(data))
+        if t.ndim == 1:
+            wav = t.unsqueeze(0)
+        else:
+            wav = t.T
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
     wav = wav.squeeze(0)

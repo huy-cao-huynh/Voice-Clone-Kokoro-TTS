@@ -423,6 +423,54 @@ def g2p_filter_rows(
     return kept, stats
 
 
+def _top_stat_buckets(stats: Dict[str, int], *, limit: int = 8) -> List[Tuple[str, int]]:
+    items = [(k, v) for k, v in stats.items() if v > 0]
+    items.sort(key=lambda kv: (-kv[1], kv[0]))
+    return items[:limit]
+
+
+def _print_dry_run_summary(
+    *,
+    join_stats: Dict[str, int],
+    g2p_stats: Dict[str, int],
+    joined_unique_paths: int,
+    hours_joined: float,
+    hours_after_cap: float,
+    rows_after_cap: int,
+    g2p_input_rows: int,
+    would_write_rows: int,
+    hours_would_manifest: float,
+    max_rows: Optional[int],
+    skip_g2p: bool,
+) -> None:
+    out = sys.stderr
+    print("=== dry-run summary ===", file=out)
+    print(
+        f"Joined unique paths (with duration): {joined_unique_paths} "
+        f"({join_stats.get('validated_rows', 0)} validated.tsv rows read)",
+        file=out,
+    )
+    for k, v in _top_stat_buckets({k: join_stats[k] for k in join_stats if k != "validated_rows"}):
+        print(f"  join {k}: {v}", file=out)
+    print(f"Hours total joined: {hours_joined:.4f}", file=out)
+    print(f"Hours after cap / sampling: {hours_after_cap:.4f} ({rows_after_cap} rows)", file=out)
+    if max_rows is not None and g2p_input_rows < rows_after_cap:
+        print(f"  (--max-rows={max_rows}: G2P/line prep uses first {g2p_input_rows} rows after sampling)", file=out)
+    if skip_g2p:
+        print("G2P skipped (--skip-g2p-check).", file=out)
+    else:
+        print(f"G2P: processed {g2p_input_rows} rows, kept {g2p_stats.get('g2p_ok', 0)}", file=out)
+        for k, v in _top_stat_buckets({k: g2p_stats[k] for k in g2p_stats if k.startswith("g2p_") and k != "g2p_ok"}):
+            print(f"  {k}: {v}", file=out)
+    print(f"Would write {would_write_rows} manifest rows (~{hours_would_manifest:.4f} h audio in manifest).", file=out)
+    if max_rows is not None and g2p_input_rows < rows_after_cap:
+        print(
+            f"Note: full build would G2P all {rows_after_cap} post-cap rows; re-run without --max-rows for exact counts.",
+            file=out,
+        )
+    print("No manifest or metadata files were written.", file=out)
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -434,8 +482,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--out",
         type=Path,
-        required=True,
-        help="Output JSONL manifest path.",
+        default=None,
+        help="Output JSONL manifest path (required unless --dry-run).",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run join, cap/stratify, and G2P (unless --skip-g2p-check) but do not write --out or metadata; print a summary.",
+    )
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --dry-run only: after sampling, process at most N rows through G2P and line prep (faster on huge corpora).",
     )
     p.add_argument(
         "--metadata-out",
@@ -481,6 +541,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     _repo_sys_path()
+
+    if args.max_rows is not None:
+        if args.max_rows < 1:
+            print("--max-rows must be >= 1", file=sys.stderr)
+            return 1
+        if not args.dry_run:
+            print("--max-rows requires --dry-run", file=sys.stderr)
+            return 1
+    if not args.dry_run and args.out is None:
+        print("--out is required unless --dry-run", file=sys.stderr)
+        return 1
 
     locale_dir = args.locale_dir.resolve()
     validated_tsv = locale_dir / "validated.tsv"
@@ -533,7 +604,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         rng = random.Random(args.seed + 1)
         rng.shuffle(selected)
 
-    g2p_stats: Dict[str, int] = {"g2p_ok": len(selected), "g2p_dropped": 0}
+    rows_after_cap = len(selected)
+    hours_after_cap = sum(r.duration_sec for r in selected) / 3600.0
+
+    rows_for_pipeline = list(selected)
+    if args.dry_run and args.max_rows is not None:
+        rows_for_pipeline = rows_for_pipeline[: args.max_rows]
+    g2p_input_rows = len(rows_for_pipeline)
+
+    g2p_stats: Dict[str, int] = {"g2p_ok": len(rows_for_pipeline), "g2p_dropped": 0}
+    selected = rows_for_pipeline
     if not args.skip_g2p_check:
         _repo_sys_path()
         selected, g2p_stats = g2p_filter_rows(
@@ -544,15 +624,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         rng = random.Random(args.seed + 2)
         rng.shuffle(selected)
-
-    out_path = args.out.resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path = args.metadata_out
-    if meta_path is None:
-        meta_path = out_path.parent / f"{out_path.stem}.meta.json"
-    else:
-        meta_path = meta_path.resolve()
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
 
     lines: List[Dict[str, Any]] = []
     lang_infer_failures = 0
@@ -583,6 +654,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     hours_manifest = sum(item["_dur"] for item in lines) / 3600.0
+    would_write = len(lines)
+
+    if args.dry_run:
+        _print_dry_run_summary(
+            join_stats=join_stats,
+            g2p_stats=g2p_stats,
+            joined_unique_paths=len(joined),
+            hours_joined=total_sec / 3600.0,
+            hours_after_cap=hours_after_cap,
+            rows_after_cap=rows_after_cap,
+            g2p_input_rows=g2p_input_rows,
+            would_write_rows=would_write,
+            hours_would_manifest=hours_manifest,
+            max_rows=args.max_rows,
+            skip_g2p=bool(args.skip_g2p_check),
+        )
+        return 0
+
+    assert args.out is not None
+    out_path = args.out.resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path = args.metadata_out
+    if meta_path is None:
+        meta_path = out_path.parent / f"{out_path.stem}.meta.json"
+    else:
+        meta_path = meta_path.resolve()
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+
     rows_written = 0
     with out_path.open("w", encoding="utf-8") as f:
         for item in lines:

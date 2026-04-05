@@ -15,6 +15,7 @@ def main() -> int:
     for name in (
         "torch",
         "torchaudio",
+        "soundfile",
         "transformers",
         "huggingface_hub",
         "numpy",

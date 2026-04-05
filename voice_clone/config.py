@@ -50,7 +50,8 @@ class TrainConfig:
     grad_clip_g: Optional[float] = 1.0
     grad_clip_d: Optional[float] = 1.0
     use_amp: bool = False
-    log_interval: int = 10
+    # How often to log to W&B and refresh training metrics in the terminal (tqdm postfix or one-line \r).
+    log_interval: int = 1
     checkpoint_interval: int = 500
     slm_d_steps_per_g_step: int = 1
     speed: float = 1.0

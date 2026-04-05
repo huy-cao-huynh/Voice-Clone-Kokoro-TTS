@@ -12,6 +12,7 @@ wandb/
 .gitattributes
 # dataset
 data/
+manifests/
 # Python
 __pycache__/
 *.py[cod]

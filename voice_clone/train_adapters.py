@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import shutil
+import sys
 import warnings
 from dataclasses import asdict
 from pathlib import Path
@@ -69,12 +71,17 @@ def _configure_training_warnings() -> None:
     )
 
 
-def _emit_train_step_line(msg: str, *, tqdm_mod: Any, pbar: Any) -> None:
-    """Avoid plain ``print`` while tqdm is active (prevents a second full bar redraw)."""
-    if pbar is not None and tqdm_mod is not None:
-        tqdm_mod.write(msg)
-    else:
-        print(msg)
+def _terminal_metrics_cr_line(global_step: int, metrics: Dict[str, float]) -> str:
+    """Single-line status padded for carriage-return overwrite (no tqdm)."""
+    parts = [f"step {global_step}"] + [f"{k}={v:.4f}" for k, v in metrics.items()]
+    line = " ".join(parts)
+    try:
+        width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns - 1)
+    except OSError:
+        width = 100
+    if len(line) < width:
+        line = line + " " * (width - len(line))
+    return line[:width]
 
 
 def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
@@ -345,46 +352,6 @@ def training_step_generator(
     }
 
 
-class DummyVoiceCloneDataset(Dataset):
-    """Random waveforms and token ids for shape / gradient smoke tests (not for quality)."""
-
-    def __init__(
-        self,
-        n: int,
-        *,
-        device_for_tensors: bool = False,
-        ref_samples_16k: int = 32_000,
-        tgt_samples_24k: int = 48_000,
-        seq_len: int = 32,
-        vocab_max: int = 177,
-    ) -> None:
-        self.n = n
-        self.ref_samples_16k = ref_samples_16k
-        self.tgt_samples_24k = tgt_samples_24k
-        self.seq_len = seq_len
-        self.vocab_max = vocab_max
-        self.device_for_tensors = device_for_tensors
-
-    def __len__(self) -> int:
-        return self.n
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        g = torch.Generator().manual_seed(idx + 13)
-        ref = torch.randn(self.ref_samples_16k, generator=g) * 0.02
-        tgt = torch.randn(self.tgt_samples_24k, generator=g) * 0.02
-        # Valid Kokoro boundaries: 0; interior from vocab (skip 0).
-        interior = torch.randint(1, self.vocab_max + 1, (self.seq_len - 2,), generator=g)
-        ids = torch.cat([torch.tensor([0]), interior, torch.tensor([0])]).long()
-        batch = {
-            "ref_wav_16k": ref,
-            "target_wav_24k": tgt,
-            "input_ids": ids,
-        }
-        if self.device_for_tensors:
-            raise NotImplementedError
-        return batch
-
-
 def _kokoro_id_to_char_map(vocab: Dict[str, int]) -> Dict[int, str]:
     """Invert Kokoro vocab for captions; ids with multiple graphemes are omitted."""
     id_to_chars: Dict[int, List[str]] = {}
@@ -515,13 +482,15 @@ def train_loop(
         batches_seen = 0
 
         # Manual tqdm updates: wrapping ``for batch in tqdm(dataloader)`` and then ``break`` skips the
-        # generator's post-yield update, so the bar can freeze at (N-1)/N (e.g. 4/5 for --dummy-steps 5).
+        # generator's post-yield update, so the bar can freeze at (N-1)/N.
         pbar_ctx: Any = contextlib.nullcontext()
+        use_tqdm_pbar = False
         if _tqdm_cls is not None and expected_batches_per_epoch is not None:
             n_tqdm = expected_batches_per_epoch
             if max_steps is not None:
                 n_tqdm = min(expected_batches_per_epoch, max(0, max_steps - global_step))
             if n_tqdm > 0:
+                use_tqdm_pbar = True
                 pbar_ctx = _tqdm_cls(
                     total=n_tqdm,
                     desc=f"train epoch {epoch_idx + 1}/{epochs}",
@@ -582,8 +551,13 @@ def train_loop(
                 at_max_stop = max_steps is not None and global_step >= max_steps
 
                 if at_log_interval or at_max_stop:
-                    line = f"step {global_step} " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-                    _emit_train_step_line(line, tqdm_mod=_tqdm_cls, pbar=pbar)
+                    if pbar is not None:
+                        postfix: Dict[str, Any] = {"step": global_step}
+                        postfix.update({k: round(float(v), 4) for k, v in metrics.items()})
+                        pbar.set_postfix(**postfix, refresh=True)
+                    else:
+                        sys.stdout.write("\r" + _terminal_metrics_cr_line(global_step, metrics))
+                        sys.stdout.flush()
                     if wandb_run is not None:
                         w = cfg.loss_weights
                         wandb_run.log(
@@ -616,6 +590,10 @@ def train_loop(
                 if max_steps is not None and global_step >= max_steps:
                     break
 
+        if not use_tqdm_pbar:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
         full_epoch = (
             expected_batches_per_epoch is not None
             and expected_batches_per_epoch > 0
@@ -646,7 +624,6 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train voice-clone GST + adapters + SLM discriminator.")
     p.add_argument("--device", type=str, default=None, help="cuda | cpu | mps (default: auto)")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--dummy-steps", type=int, default=2, help="Run N steps on random data (smoke test).")
     p.add_argument("--ckpt-dir", type=Path, default=None)
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--amp", action="store_true", help="CUDA autocast + GradScaler")
@@ -654,8 +631,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--manifest",
         type=Path,
-        default=None,
-        help="JSONL manifest (see voice_clone/DATASET.md). If omitted, uses dummy random data.",
+        required=True,
+        help="JSONL manifest (see voice_clone/DATASET.md).",
     )
     p.add_argument(
         "--manifest-root",
@@ -718,11 +695,10 @@ def main() -> None:
         wandb_config.update(
             {
                 "device": str(device),
-                "manifest": str(args.manifest) if args.manifest else None,
+                "manifest": str(args.manifest),
                 "manifest_root": str(args.manifest_root) if args.manifest_root else None,
                 "epochs": args.epochs,
                 "max_steps": args.max_steps,
-                "dummy_steps": args.dummy_steps,
                 "resume": str(args.resume) if args.resume else None,
                 "ckpt_dir": str(args.ckpt_dir) if args.ckpt_dir else None,
             }
@@ -752,41 +728,26 @@ def _run_training(
     cfg: TrainConfig,
     wandb_run: Optional[Any],
 ) -> None:
-    if args.manifest is not None:
-        vocab, ctx = kokoro_vocab_and_context_length(cfg.kokoro_repo_id)
-        ds: Dataset = VoiceCloneManifestDataset(
-            args.manifest,
-            kokoro_repo_id=cfg.kokoro_repo_id,
-            vocab=vocab,
-            context_length=ctx,
-            manifest_root=args.manifest_root,
-        )
-        dl = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_voice_clone_batch)
-        train_loop(
-            dl,
-            cfg,
-            device,
-            epochs=args.epochs,
-            max_steps=args.max_steps,
-            ckpt_dir=args.ckpt_dir,
-            resume=args.resume,
-            wandb_run=wandb_run,
-            wandb_num_samples=args.wandb_samples,
-        )
-    else:
-        ds = DummyVoiceCloneDataset(max(args.dummy_steps * 4, args.dummy_steps))
-        dl = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_voice_clone_batch)
-        train_loop(
-            dl,
-            cfg,
-            device,
-            epochs=1,
-            max_steps=args.dummy_steps,
-            ckpt_dir=args.ckpt_dir,
-            resume=args.resume,
-            wandb_run=wandb_run,
-            wandb_num_samples=args.wandb_samples,
-        )
+    vocab, ctx = kokoro_vocab_and_context_length(cfg.kokoro_repo_id)
+    ds: Dataset = VoiceCloneManifestDataset(
+        args.manifest,
+        kokoro_repo_id=cfg.kokoro_repo_id,
+        vocab=vocab,
+        context_length=ctx,
+        manifest_root=args.manifest_root,
+    )
+    dl = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_voice_clone_batch)
+    train_loop(
+        dl,
+        cfg,
+        device,
+        epochs=args.epochs,
+        max_steps=args.max_steps,
+        ckpt_dir=args.ckpt_dir,
+        resume=args.resume,
+        wandb_run=wandb_run,
+        wandb_num_samples=args.wandb_samples,
+    )
 
 
 if __name__ == "__main__":
