@@ -7,8 +7,11 @@ hub/
 xet/
 # wandb runs
 wandb/
+# terminal configurations
 .editorconfig
 .gitattributes
+# dataset
+data/
 # Python
 __pycache__/
 *.py[cod]

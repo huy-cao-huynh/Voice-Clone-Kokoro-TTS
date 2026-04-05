@@ -1,79 +1,172 @@
 # Architecture: Voice Cloning with Kokoro TTS
 
-## Phase 1: Feature Extraction and Aggregation
-
-The initial stage of the pipeline involves processing the unseen reference audio to extract a robust, content-agnostic speaker identity vector.
-
-### SSL front-end
-
-Utilize a pre-trained WavLM-Base+ or WavLM-Large model. The reference waveform (resampled to 16 kHz to match WavLM’s expected input) is passed through the frozen WavLM encoder. The output is a sequence of frame-level hidden states $H \in \mathbb{R}^{T \times 1024}$, where $T$ is the number of acoustic frames.
-
-### Attentive pooling aggregation
-
-To convert the variable-length sequence $H$ into a fixed-size vector without losing critical temporal characteristics, pass the representations through an ECAPA-TDNN head. The attentive statistics pooling layer calculates the attention weights for each frame, producing a global speaker embedding $z_{\text{speaker}} \in \mathbb{R}^{256}$. This dimensionality must be chosen to tightly match the latent spaces typical of Kokoro / StyleTTS2 condition vectors.
+This document matches the current `voice_clone` training and inference code: frozen [microsoft/wavlm-base-plus-sv](https://huggingface.co/microsoft/wavlm-base-plus-sv) plus trainable **SegmentGST** and Kokoro **L-adapters**, with a separate **SLM feature discriminator**.
 
 ---
 
-## Phase 2: Bottleneck layer regularization
+## 1. Frozen speaker front-end: WavLM-Base+ SV
 
-Drawing directly from the findings of the Google VT module research, the $z_{\text{speaker}}$ embedding must be heavily constrained before being injected into the Kokoro backbone. Feeding unconstrained, high-dimensional embeddings extracted by WavLM directly into an 82M-parameter model will almost certainly overwhelm the decoder, leading to a catastrophic degradation of linguistic content and causing the model to output garbled noise.
+- **Checkpoint**: `microsoft/wavlm-base-plus-sv` (`TrainConfig.wavlm_model_id`, `WavLMSV`).
+- **Wrapper**: Hugging Face `WavLMForXVector` + `Wav2Vec2FeatureExtractor` (weights frozen, module stays in `eval()` even when training adapters).
+- **Reference audio**: mono, **16 kHz** (hard requirement of this checkpoint).
+- **Outputs** (see `WavLMSVOutput` in `voice_clone/wavlm_sv.py`):
+  - **Pooled x-vector** `embeddings`: shape **(B, 512)**, L2-normalized when `normalize_embeddings=True` (default for speaker loss).
+  - **Last encoder layer frame features**: **(B, T_frames, 768)** — WavLM-Base+ hidden size; used as SegmentGST queries and as SLM real/fake feature inputs.
+  - **Frame mask** **(B, T_frames)** derived from the feature extractor’s sample-level attention mask and WavLM’s `_get_feat_extract_output_lengths`.
 
-The optimal design choice is to implement a **SegmentGST** (Segment Global Style Token) bottleneck.
-
-- Initialize a learnable embedding bank (the simplex) $B \in \mathbb{R}^{N \times d}$, where $N$ is the number of voice bases (e.g., 512 or 1024) and $d$ is the embedding dimensionality (e.g., 256).
-- Rather than using a single global vector, allow the bottleneck’s multi-head attention mechanism to query the bank $B$ using the compressed sequential outputs of the ECAPA-TDNN before the final pooling stage.
-- The attention weights map the reference audio to a convex combination of the learned bases, producing a highly regularized style vector $\tilde{z}_{\text{style}}$.
-
-This bottleneck enforces that any unseen speaker is mathematically represented strictly as a combination of acoustic archetypes already understood by the training paradigm. By constraining the embedding to lie within this learned simplex, the adapter is prevented from hallucinating out-of-distribution acoustic features that the Kokoro decoder cannot process.
-
----
-
-## Phase 3: Residual adapter architecture and injection routing
-
-Kokoro-82M utilizes a decoder-only architecture heavily reliant on textual token embeddings and grapheme-to-phoneme (G2P) alignments provided by the misaki library. To adapt the model without altering its foundational weights, residual adapters (specifically Layer adapters, or L-adapters) must be carefully inserted into the execution graph.
-
-A standard residual adapter consists of a down-projection linear layer, a non-linear activation function, and an up-projection linear layer, wrapped in a residual connection. For this application, the adapter must fuse the hidden states of the backbone with the regularized speaker embedding:
-
-$$
-h_{\text{adapted}} = h_{\text{input}} + W_{\text{up}}\bigl(\mathrm{ReLU}\bigl(W_{\text{down}}\bigl([h_{\text{input}} \parallel \tilde{z}_{\text{style}}]\bigr)\bigr)\bigr)
-$$
-
-The strategic choice of where to inject these adapters within Kokoro determines the success of the voice cloning, as demonstrated by the Google VT architecture.
-
-### Duration predictor injection
-
-Kokoro relies on predicting the length of each phoneme to establish the temporal rhythm of the speech. Injecting an adapter into the hidden layers of the duration predictor ensures that the synthesized speech adopts the target speaker’s unique pacing, speech rate, and pause structures.
-
-### Prosody and feature decoder injection
-
-To clone the actual timbre, pitch, and vocal tract characteristics, a second set of residual adapters must be inserted into the transformer blocks of the feature decoder, prior to the ISTFTNet vocoder. This residual addition forces the latent acoustic features to shift toward the target speaker’s spectral envelope without overriding the linguistic intent.
+There is **no ECAPA-TDNN** in this repo; speaker identity for training losses comes from the same frozen **WavLM-SV x-vector head** (512-D), not from a separate ECAPA stack.
 
 ---
 
-## Phase 4: Training regime and objective functions
+## 2. Trainable bottleneck: SegmentGST
 
-The paramount advantage of this architecture is parameter efficiency. Because the WavLM encoder, the ECAPA-TDNN extractor, and the entire Kokoro-82M backbone are kept frozen, the only parameters being updated during training are the SegmentGST bottleneck and the lightweight residual adapters. These represent a fraction of a percent of the total pipeline weights.
+Implemented in `voice_clone/segment_gst.py`.
 
-The training dataset should comprise a diverse, multi-speaker corpus (such as LibriTTS or VCTK). During each training step:
+- **Learnable bank** `B`: **(512, 256)** — `num_bases=512`, `embed_dim=256`, initialized `N(0, 0.02)`.
+- **Queries**: WavLM frames projected with `nn.Linear(768 → 256)`.
+- **Attention**: `nn.MultiheadAttention` with **8 heads**, `batch_first=True`, **keys/values = bank** (expanded per batch). Frame validity is **not** passed as `key_padding_mask`; invalid frames are zeroed out **after** MHA via masked mean pooling.
+- **Post-MHA**: `LayerNorm(256)`, `Dropout(0.1)`.
+- **Pooling**: mask-weighted mean over time → **(B, 256)** `pooled_style`.
+- **Readout**: `Linear(256 → 256)` → **`ref_s`** **(B, 256)**.
+- **Kokoro split** (matches `KModel.forward_with_tokens`):
+  - `ref_s[:, :128]` → **decoder AdaIN** style `s` (timbre / decoder conditioning).
+  - `ref_s[:, 128:]` → **prosody** path as `s` into duration/F0/N blocks (`style_dim=128` in Kokoro `config.json`).
+  - Full **`ref_s`** is **`z_style`** for all **L-adapters** (256-D concatenation in adapter MLPs).
 
-1. A reference utterance and a target text sequence from the same speaker are sampled.
-2. The reference utterance is passed through the frozen WavLM and the trainable adapter pipeline to produce the conditioned latent variables.
-3. Kokoro generates the predicted mel-spectrogram or waveform based on the text and the adapted condition.
+---
 
-The loss function must carefully balance acoustic reconstruction with zero-shot speaker similarity:
+## 3. Frozen backbone: Kokoro-82M + L-adapter injection sites
 
-### Reconstruction loss
+- **Default repo**: `hexgrad/Kokoro-82M` (`TrainConfig.kokoro_repo_id`).
+- **Frozen**: full `KModel` except the injected adapter parameters (`freeze_kokoro_except_adapters` in `voice_clone/train_adapters.py`).
 
-Standard L1/L2 loss on the predicted mel-spectrograms against the ground truth to ensure the text is properly spoken.
+Numeric backbone settings come from Kokoro’s published `config.json` (current HF snapshot):
 
-### Speaker consistency loss
+| Setting | Value |
+|--------|--------|
+| PLBERT hidden size | 768 |
+| `hidden_dim` (`d_hid`, duration/encoder width) | 512 |
+| `n_layer` (duration encoder depth) | 3 |
+| Kokoro `style_dim` (AdaIN / prosody `s`) | 128 |
+| `n_mels` | 80 |
+| ISTFTNet `upsample_initial_channel` | 512 |
+| ISTFTNet `upsample_rates` | [10, 6] → **2** upsample stages |
 
-A pre-trained speaker verification network (e.g., a frozen WavLM–ECAPA model) evaluates the generated audio against the reference. The cosine similarity between the embedding of the generated audio and the original reference is maximized:
+**Forward sketch** (see `kokoro/kokoro/model.py`): phoneme `input_ids` → PLBERT → linear to **512**-D → prosody/duration → alignment → decoder → **24 kHz** waveform.
 
-$$
-\mathcal{L}_{\text{speaker}} = 1 - \cos\bigl(\mathrm{Emb}_{\text{target}}, \mathrm{Emb}_{\text{generated}}\bigr)
-$$
+### 3.1 Residual L-adapter definition
 
-### Adversarial SLM loss
+In `voice_clone/adapters.py`, each adapter implements:
 
-Following the original StyleTTS 2 methodology, a frozen WavLM model can act as a feature-level discriminator. This ensures the generated speech matches the high-level naturalness of real human speech, penalizing the adapters if they produce robotic or degraded artifacts.
+\[
+h' = h + W_{\text{up}}\bigl(\mathrm{ReLU}(W_{\text{down}}([h \,\|\, z_{\text{style}}]))\bigr)
+\]
+
+with `h` **(B, C, T)** and `z_style` **(B, 256)** broadcast along **T**. Per adapter:
+
+- `W_down`: **Linear(C + 256 → 64)** (`adapter_bottleneck=64` from `TrainConfig`).
+- `W_up`: **Linear(64 → C)**.
+
+### 3.2 Where adapters attach (block-level)
+
+| Subsystem | # adapters | Channel width **C** at each site | When it runs |
+|-----------|-------------|----------------------------------|--------------|
+| **Duration encoder** (`DurationEncoder` in `kokoro/kokoro/modules.py`) | **3** (= `n_layer`) | **512** each | After each **AdaLayerNorm** block (after every 1-layer BiLSTM stage), using full **`z_style` = `ref_s`**. |
+| **ISTFTNet decoder** (`Decoder` in `kokoro/kokoro/istftnet.py`) | **5** | **(1024, 1024, 1024, 1024, 512)** = `DECODER_L_ADAPTER_HIDDEN_DIMS` | Index **0**: after **encode** (`AdainResBlk1d` to 1024 ch). Indices **1–4**: after each **decode** `AdainResBlk1d` (last block upsamples to 512 ch). |
+| **Generator** (ISTFTNet `Generator`) | **2** (= `len(upsample_rates)`) | **(256, 128)** from `generator_l_adapter_hidden_dims(512, 2)` | After each upsample/resblock segment, in order. |
+
+**Total L-adapters**: 3 + 5 + 2 = **10**, all conditioned on **`ref_s` (256-D)**.
+
+---
+
+## 4. Tensor shapes through the conditioning path
+
+Rough data flow for one training step (batch size **B**):
+
+1. **Reference waveform** `ref_wav_16k`: **(B, N_16k)** → WavLM → frames **(B, T_w, 768)**, mask **(B, T_w)**.
+2. **SegmentGST** → `ref_s` **(B, 256)**; internally MHA output **(B, T_w, 256)** → pooled **(B, 256)**.
+3. **Kokoro** `forward_with_tokens(input_ids, ref_s)`:
+   - `input_ids`: **(B, L)** (phoneme token ids including boundaries).
+   - PLBERT sequence: **(B, L, 768)** → `bert_encoder` → **(B, 512, L)** (duration input layout as in `KModel`).
+   - Duration path features stay at hidden width **512** at adapter sites; decoder feature maps use the channel counts in §3.2.
+4. **Synthesis output** `pred_wav`: **(B, T_24k)** mono at **24 kHz**.
+
+For **SLM / speaker losses**, `pred_wav` is resampled **24 kHz → 16 kHz** (`torchaudio.functional.resample`) before re-entering frozen WavLM so frame tensors stay aligned with the SV model.
+
+---
+
+## 5. Losses (training)
+
+Composite generator objective:
+
+\[
+\mathcal{L}_G = \lambda_{\text{mel}}\mathcal{L}_{\text{mel}} + \lambda_{\text{spk}}\mathcal{L}_{\text{spk}} + \lambda_{\text{slm}}\mathcal{L}_{\text{slm},G}
+\]
+
+with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.1**, **λ_slm = 0.05** (`voice_clone/config.py`).
+
+### 5.1 Mel reconstruction (`MelReconstructionLoss`)
+
+- **Signal**: Kokoro output vs target waveform, both **24 kHz**, cropped to matching length.
+- **Frontend**: `torchaudio.transforms.MelSpectrogram` with `MelLossConfig`: **n_fft = 1024**, **hop_length = 256**, **win_length = 1024**, **n_mels** from Kokoro config (**80**), `f_min = 0`, `f_max = None` (Nyquist), `center=True`, power **1.0**.
+- **Loss**: **mean L1** on **log** mels (with `log_floor = 1e-5`). **l2_weight = 0** (L2 term not used unless changed in code).
+
+### 5.2 Speaker consistency (`speaker_cosine_loss`)
+
+- Embeddings: frozen WavLM-SV **pooled x-vectors** **(B, 512)**.
+- **Reference**: `ref_wav_16k` through WavLM with **no grad** through audio.
+- **Generated**: resampled predicted waveform, with **`grad_through_input=True`** so gradients reach the generator.
+- **Loss**: mean over batch of **1 − cos(a, b)** with **L2 re-normalization** of both vectors (cosine in 512-D).
+
+### 5.3 SLM feature GAN (`SLMFeatureDiscriminator` + hinge)
+
+- **Not** a WavLM-as-discriminator setup: a **small trainable conv discriminator** (`voice_clone/losses.py`) runs on **frozen WavLM last-layer frame features** **(B, T, 768)**.
+- **Architecture**: `LayerNorm(768)` → **4** layers of **Conv1d** (kernel **7**, padding 3), hidden **256**, **LeakyReLU(0.2)** → **Conv1d → 1** channel; logits pooled to **one scalar per utterance** via **mask-weighted mean** over time.
+- **D step** (`slm_discriminator_loss_hinge`): hinge loss on **real** (target 16 kHz) vs **fake** (generated 16 kHz, **detached**). Optimizer **AdamW** on discriminator only.
+- **G step** (`slm_generator_loss_hinge`): **−E[D(fake_features)]** (discriminator weights **frozen** / `requires_grad=False` for this forward).
+
+**Discriminator hyperparameters** (`SLMDiscriminatorConfig`): `hidden_channels=256`, `num_layers=4`, `kernel_size=7`.
+
+---
+
+## 6. Optimization and training loop
+
+- **Generator trainable parameters**: SegmentGST + all Kokoro L-adapters (duration, decoder, generator).
+- **Discriminator trainable parameters**: `SLMFeatureDiscriminator` only.
+- **Optimizers**: **AdamW** for both; **lr_g = lr_d = 1e-4**; **weight_decay_g = weight_decay_d = 0** (defaults).
+- **Gradient clipping**: **1.0** L2 norm on generator params and on discriminator params when not `None` (`grad_clip_g`, `grad_clip_d`).
+- **AMP**: optional CUDA autocast + `GradScaler` when `TrainConfig.use_amp=True` (default **False**).
+- **SLM schedule**: **`slm_d_steps_per_g_step = 1`** discriminator update per batch using the **current** generator output from a no-grad forward, then the generator step with fresh forward.
+- **Kokoro inference timing**: `speed` default **1.0** (`TrainConfig.speed`), passed into `forward_with_tokens`.
+
+Logging defaults: **`log_interval = 10`**, **`checkpoint_interval = 500`**.
+
+---
+
+## 7. Hyperparameter summary (chosen defaults)
+
+| Group | Parameter | Value |
+|--------|-----------|--------|
+| Models | Kokoro repo | `hexgrad/Kokoro-82M` |
+| | WavLM repo | `microsoft/wavlm-base-plus-sv` |
+| Adapters | `adapter_bottleneck` | **64** |
+| SegmentGST | `num_bases` | **512** |
+| | `embed_dim` | **256** |
+| | `frame_dim` | **768** |
+| | `num_heads` | **8** |
+| | `ref_dim` / `style_dec_dim` | **256** / **128** |
+| | `dropout` | **0.1** |
+| Loss weights | `lambda_mel` / `lambda_spk` / `lambda_slm` | **1.0** / **0.1** / **0.05** |
+| Mel loss | `sample_rate` | **24000** |
+| | `n_fft` / `hop_length` / `win_length` | **1024** / **256** / **1024** |
+| SLM D | `hidden_channels` / `num_layers` / `kernel_size` | **256** / **4** / **7** |
+| Optim | `lr_g`, `lr_d` | **1e-4** |
+| | `weight_decay_g`, `weight_decay_d` | **0** |
+| | `grad_clip_g`, `grad_clip_d` | **1.0** |
+| Schedule | `slm_d_steps_per_g_step` | **1** |
+| | `speed` | **1.0** |
+| Run | `use_amp` | **False** |
+| | `log_interval` | **10** |
+| | `checkpoint_interval` | **500** |
+
+CLI overrides (e.g. `--kokoro-repo`, `--amp`) patch `TrainConfig` in `voice_clone/train_adapters.py` and should be treated as run-time changes to the table above.

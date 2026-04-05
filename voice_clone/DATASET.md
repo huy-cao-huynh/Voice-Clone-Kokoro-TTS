@@ -22,6 +22,12 @@ Optional fields:
 
 Paths may be relative; they are resolved against `--manifest-root` if given, otherwise against the manifest file’s directory.
 
+## Sampling rates and disk
+
+Reference and target waveforms are resampled to **mono 16 kHz** (reference / WavLM) and **mono 24 kHz** (target / Kokoro mel loss) **when the dataloader reads them**—you do not need to store clips at those rates on disk for correctness. If profiling shows resampling as a bottleneck, you can precompute 16 kHz / 24 kHz WAVs or add caching later.
+
+For large corpora (e.g. Common Voice), **keeping the full download** (TSVs + `clips/`) while only changing manifests is usually preferable: you can regenerate subsets with different seeds or hour caps without re-downloading. If disk is tight, you may **prune** files under `clips/` that no manifest you care about references (union across languages if needed); treat pruning as destructive and keep the metadata TSVs if you might want to re-expand later.
+
 Example line:
 
 ```json
