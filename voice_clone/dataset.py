@@ -195,6 +195,7 @@ class VoiceCloneManifestDataset(Dataset):
             "target_wav_24k": target_wav,
             "input_ids": input_ids,
             "lang_code": lang,
+            "text": row["text"],
         }
         if "speaker_id" in row and row["speaker_id"] is not None:
             out["speaker_id"] = str(row["speaker_id"])
@@ -216,4 +217,6 @@ def collate_voice_clone_batch(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
     if "speaker_id" in s:
         batch["speaker_id"] = s["speaker_id"]
+    if "text" in s:
+        batch["text"] = s["text"]
     return batch

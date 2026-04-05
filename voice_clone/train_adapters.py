@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
 from kokoro.model import KModel
@@ -29,10 +32,49 @@ from .segment_gst import SegmentGST
 from .wavlm_sv import WavLMSV
 
 
+def _import_wandb():
+    """Import wandb only when ``--wandb`` is used so inference-only installs can skip it."""
+    try:
+        import wandb
+    except ImportError as e:
+        raise ImportError(
+            "wandb is required when using --wandb. Install training dependencies, e.g. "
+            "pip install -r requirements-training.txt"
+        ) from e
+    return wandb
+
+
 def _cuda_amp_context(use_amp: bool, reference_tensor: torch.Tensor):
     if use_amp and reference_tensor.is_cuda:
-        return autocast("cuda")
+        return autocast("cuda", enabled=True)
     return contextlib.nullcontext()
+
+
+def _configure_training_warnings() -> None:
+    """Drop known-noisy PyTorch messages that are not actionable during adapter training."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Support for mismatched key_padding_mask and attn_mask is deprecated\..*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Mem Efficient attention on Current AMD GPU is still experimental\..*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Flash Efficient attention on Current AMD GPU is still experimental\..*",
+        category=UserWarning,
+    )
+
+
+def _emit_train_step_line(msg: str, *, tqdm_mod: Any, pbar: Any) -> None:
+    """Avoid plain ``print`` while tqdm is active (prevents a second full bar redraw)."""
+    if pbar is not None and tqdm_mod is not None:
+        tqdm_mod.write(msg)
+    else:
+        print(msg)
 
 
 def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
@@ -343,6 +385,89 @@ class DummyVoiceCloneDataset(Dataset):
         return batch
 
 
+def _kokoro_id_to_char_map(vocab: Dict[str, int]) -> Dict[int, str]:
+    """Invert Kokoro vocab for captions; ids with multiple graphemes are omitted."""
+    id_to_chars: Dict[int, List[str]] = {}
+    for ch, tid in vocab.items():
+        id_to_chars.setdefault(int(tid), []).append(ch)
+    return {tid: chars[0] for tid, chars in id_to_chars.items() if len(chars) == 1}
+
+
+def _caption_from_input_ids(input_ids: torch.Tensor, id_to_char: Dict[int, str], *, max_chars: int = 512) -> str:
+    out: List[str] = []
+    for tid in input_ids.flatten().tolist():
+        ch = id_to_char.get(int(tid))
+        if ch is not None:
+            out.append(ch)
+        if sum(len(c) for c in out) >= max_chars:
+            break
+    s = "".join(out)
+    return s[:max_chars]
+
+
+def _log_wandb_epoch_audio_table(
+    wandb_run: Any,
+    *,
+    dataset: Dataset,
+    kmodel: KModel,
+    gst: SegmentGST,
+    wavlm: WavLMSV,
+    cfg: TrainConfig,
+    device: torch.device,
+    epoch: int,
+    global_step: int,
+    num_samples: int,
+    vocab: Dict[str, int],
+) -> None:
+    """Log a small wandb Table of pred vs target 24 kHz audio at epoch end (eval forward, no grad)."""
+    wb = _import_wandb()
+    n = min(int(num_samples), len(dataset))
+    if n <= 0:
+        return
+
+    id_to_char = _kokoro_id_to_char_map(vocab)
+    prev_k_train = kmodel.training
+    prev_g_train = gst.training
+    kmodel.eval()
+    gst.eval()
+    try:
+        columns = ["idx", "caption", "pred_audio", "target_audio"]
+        rows: List[List[Any]] = []
+        for i in range(n):
+            sample = dataset[i]
+            batch = collate_voice_clone_batch([sample])
+            ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(device))
+            tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(device))
+            input_ids = batch["input_ids"].to(device)
+            caption = batch.get("text")
+            if not caption:
+                caption = _caption_from_input_ids(batch["input_ids"].squeeze(0), id_to_char)
+
+            with torch.no_grad():
+                wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
+                gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
+                ref_s = gst_out.ref_s
+                pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
+                pred_wav = _ensure_batch_time(pred_wav)
+
+            pred_np = pred_wav.squeeze(0).detach().float().cpu().numpy().astype(np.float32)
+            tgt_np = tgt_24.squeeze(0).detach().float().cpu().numpy().astype(np.float32)
+            sr = 24_000
+            rows.append(
+                [
+                    i,
+                    str(caption)[:2048],
+                    wb.Audio(pred_np, sample_rate=sr),
+                    wb.Audio(tgt_np, sample_rate=sr),
+                ]
+            )
+        table = wb.Table(columns=columns, data=rows)
+        wandb_run.log({f"epoch_audio/epoch_{epoch + 1}": table}, step=global_step)
+    finally:
+        kmodel.train(prev_k_train)
+        gst.train(prev_g_train)
+
+
 def train_loop(
     dataloader: DataLoader,
     cfg: TrainConfig,
@@ -352,8 +477,11 @@ def train_loop(
     max_steps: Optional[int] = None,
     ckpt_dir: Optional[Path] = None,
     resume: Optional[Path] = None,
+    wandb_run: Optional[Any] = None,
+    wandb_num_samples: int = 3,
 ) -> None:
-    kmodel, gst, wavlm, disc, mel_loss_mod, _kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, wavlm, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
+    vocab: Dict[str, int] = kokoro_cfg["vocab"]
     params_g = generator_trainable_parameters(kmodel, gst)
     opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g, weight_decay=cfg.weight_decay_g)
     opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d, weight_decay=cfg.weight_decay_d)
@@ -365,64 +493,153 @@ def train_loop(
         print(f"Resumed step {step} from {resume}")
 
     global_step = step
-    for _epoch in range(epochs):
-        for batch in dataloader:
-            global_step += 1
-            with torch.no_grad():
-                ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(device))
-                tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(device))
-                input_ids = batch["input_ids"].to(device)
-                wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
-                gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
-                ref_s = gst_out.ref_s
-                pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
-                pred_wav = _ensure_batch_time(pred_wav)
+    try:
+        expected_batches_per_epoch = len(dataloader)
+    except TypeError:
+        expected_batches_per_epoch = None
 
-            for _ in range(cfg.slm_d_steps_per_g_step):
-                ld = slm_discriminator_step(
-                    disc,
+    try:
+        from tqdm.auto import tqdm as _tqdm_cls
+    except ImportError:
+        _tqdm_cls = None  # type: ignore[misc, assignment]
+
+    for epoch_idx in range(epochs):
+        epoch_sums = {
+            "loss_g": 0.0,
+            "loss_mel": 0.0,
+            "loss_spk": 0.0,
+            "loss_slm_g": 0.0,
+            "loss_d": 0.0,
+        }
+        epoch_count = 0
+        batches_seen = 0
+
+        # Manual tqdm updates: wrapping ``for batch in tqdm(dataloader)`` and then ``break`` skips the
+        # generator's post-yield update, so the bar can freeze at (N-1)/N (e.g. 4/5 for --dummy-steps 5).
+        pbar_ctx: Any = contextlib.nullcontext()
+        if _tqdm_cls is not None and expected_batches_per_epoch is not None:
+            n_tqdm = expected_batches_per_epoch
+            if max_steps is not None:
+                n_tqdm = min(expected_batches_per_epoch, max(0, max_steps - global_step))
+            if n_tqdm > 0:
+                pbar_ctx = _tqdm_cls(
+                    total=n_tqdm,
+                    desc=f"train epoch {epoch_idx + 1}/{epochs}",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
+
+        with pbar_ctx as pbar:
+            for batch in dataloader:
+                global_step += 1
+                batches_seen += 1
+                with torch.no_grad():
+                    ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(device))
+                    tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(device))
+                    input_ids = batch["input_ids"].to(device)
+                    wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
+                    gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
+                    ref_s = gst_out.ref_s
+                    pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
+                    pred_wav = _ensure_batch_time(pred_wav)
+
+                for _ in range(cfg.slm_d_steps_per_g_step):
+                    ld = slm_discriminator_step(
+                        disc,
+                        wavlm,
+                        opt_d,
+                        pred_wav_24k=pred_wav,
+                        target_wav_24k=tgt_24,
+                        grad_clip=cfg.grad_clip_d,
+                        scaler=scaler,
+                        use_amp=cfg.use_amp,
+                    )
+
+                metrics = training_step_generator(
+                    kmodel,
+                    gst,
                     wavlm,
-                    opt_d,
-                    pred_wav_24k=pred_wav,
-                    target_wav_24k=tgt_24,
-                    grad_clip=cfg.grad_clip_d,
+                    disc,
+                    mel_loss_mod,
+                    opt_g,
+                    batch,
+                    cfg.loss_weights,
+                    speed=cfg.speed,
+                    grad_clip=cfg.grad_clip_g,
                     scaler=scaler,
                     use_amp=cfg.use_amp,
                 )
+                metrics["loss_d"] = float(ld.detach()) if isinstance(ld, torch.Tensor) else float(ld)
 
-            metrics = training_step_generator(
-                kmodel,
-                gst,
-                wavlm,
-                disc,
-                mel_loss_mod,
-                opt_g,
-                batch,
-                cfg.loss_weights,
-                speed=cfg.speed,
-                grad_clip=cfg.grad_clip_g,
-                scaler=scaler,
-                use_amp=cfg.use_amp,
+                epoch_count += 1
+                for k in epoch_sums:
+                    epoch_sums[k] += metrics[k]
+
+                if pbar is not None:
+                    pbar.update(1)
+
+                at_log_interval = global_step % cfg.log_interval == 0
+                at_max_stop = max_steps is not None and global_step >= max_steps
+
+                if at_log_interval or at_max_stop:
+                    line = f"step {global_step} " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+                    _emit_train_step_line(line, tqdm_mod=_tqdm_cls, pbar=pbar)
+                    if wandb_run is not None:
+                        w = cfg.loss_weights
+                        wandb_run.log(
+                            {
+                                "train/loss_g": metrics["loss_g"],
+                                "train/loss_mel": metrics["loss_mel"],
+                                "train/loss_spk": metrics["loss_spk"],
+                                "train/loss_slm_g": metrics["loss_slm_g"],
+                                "train/loss_d": metrics["loss_d"],
+                                "train/weighted_mel": w.lambda_mel * metrics["loss_mel"],
+                                "train/weighted_spk": w.lambda_spk * metrics["loss_spk"],
+                                "train/weighted_slm": w.lambda_slm * metrics["loss_slm_g"],
+                                "train/epoch": float(epoch_idx + 1),
+                            },
+                            step=global_step,
+                        )
+
+                if ckpt_dir is not None and global_step % cfg.checkpoint_interval == 0:
+                    save_checkpoint(
+                        ckpt_dir / f"checkpoint_{global_step}.pt",
+                        gst=gst,
+                        disc=disc,
+                        kmodel=kmodel,
+                        opt_g=opt_g,
+                        opt_d=opt_d,
+                        step=global_step,
+                        cfg=cfg,
+                    )
+
+                if max_steps is not None and global_step >= max_steps:
+                    break
+
+        full_epoch = (
+            expected_batches_per_epoch is not None
+            and expected_batches_per_epoch > 0
+            and batches_seen == expected_batches_per_epoch
+        )
+        if wandb_run is not None and epoch_count > 0 and full_epoch:
+            mean_payload = {f"epoch/mean_{k}": epoch_sums[k] / epoch_count for k in epoch_sums}
+            wandb_run.log(mean_payload, step=global_step)
+            _log_wandb_epoch_audio_table(
+                wandb_run,
+                dataset=dataloader.dataset,
+                kmodel=kmodel,
+                gst=gst,
+                wavlm=wavlm,
+                cfg=cfg,
+                device=device,
+                epoch=epoch_idx,
+                global_step=global_step,
+                num_samples=wandb_num_samples,
+                vocab=vocab,
             )
-            metrics["loss_d"] = float(ld.detach()) if isinstance(ld, torch.Tensor) else float(ld)
 
-            if global_step % cfg.log_interval == 0:
-                print(f"step {global_step} " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
-
-            if ckpt_dir is not None and global_step % cfg.checkpoint_interval == 0:
-                save_checkpoint(
-                    ckpt_dir / f"checkpoint_{global_step}.pt",
-                    gst=gst,
-                    disc=disc,
-                    kmodel=kmodel,
-                    opt_g=opt_g,
-                    opt_d=opt_d,
-                    step=global_step,
-                    cfg=cfg,
-                )
-
-            if max_steps is not None and global_step >= max_steps:
-                return
+        if max_steps is not None and global_step >= max_steps:
+            return
 
 
 def parse_args() -> argparse.Namespace:
@@ -446,24 +663,98 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory for resolving relative paths in the manifest (default: manifest file's parent).",
     )
+    p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases (requires wandb package).")
+    p.add_argument(
+        "--wandb-project",
+        type=str,
+        default="voice-clone-kokoro",
+        help="Wandb project name (used when --wandb).",
+    )
+    p.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name (optional).")
+    p.add_argument("--wandb-entity", type=str, default=None, help="Wandb entity / team (optional).")
+    p.add_argument(
+        "--wandb-samples",
+        type=int,
+        default=3,
+        help="Number of pred vs target audio rows to log per epoch when --wandb (default: 3).",
+    )
+    p.add_argument(
+        "--wandb-offline",
+        action="store_true",
+        help="Log wandb in offline mode (no network upload until sync).",
+    )
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Stop manifest training after this many optimizer steps (across epochs).",
+    )
     return p.parse_args()
+
+
+def _resolve_device(device_str: Optional[str]) -> torch.device:
+    if device_str:
+        return torch.device(device_str)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def main() -> None:
     args = parse_args()
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
+    # ROCm/MIOpen: default to errors-only logging (quiets IsEnoughWorkspace spam). Set MIOPEN_LOG_LEVEL
+    # yourself (e.g. 4) if you need MIOpen warnings. See AMD MIOpen env variable docs.
+    os.environ.setdefault("MIOPEN_LOG_LEVEL", "3")
+    _configure_training_warnings()
+    device = _resolve_device(args.device)
     cfg = TrainConfig(kokoro_repo_id=args.kokoro_repo, use_amp=args.amp)
+
+    wandb_run: Optional[Any] = None
+    if args.wandb:
+        wb = _import_wandb()
+        wandb_config = asdict(cfg)
+        wandb_config.update(
+            {
+                "device": str(device),
+                "manifest": str(args.manifest) if args.manifest else None,
+                "manifest_root": str(args.manifest_root) if args.manifest_root else None,
+                "epochs": args.epochs,
+                "max_steps": args.max_steps,
+                "dummy_steps": args.dummy_steps,
+                "resume": str(args.resume) if args.resume else None,
+                "ckpt_dir": str(args.ckpt_dir) if args.ckpt_dir else None,
+            }
+        )
+        init_kw: Dict[str, Any] = {
+            "project": args.wandb_project,
+            "config": wandb_config,
+        }
+        if args.wandb_entity:
+            init_kw["entity"] = args.wandb_entity
+        if args.wandb_run_name:
+            init_kw["name"] = args.wandb_run_name
+        if args.wandb_offline:
+            init_kw["mode"] = "offline"
+        wandb_run = wb.init(**init_kw)
+    try:
+        _run_training(args, device=device, cfg=cfg, wandb_run=wandb_run)
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
+
+
+def _run_training(
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+    cfg: TrainConfig,
+    wandb_run: Optional[Any],
+) -> None:
     if args.manifest is not None:
         vocab, ctx = kokoro_vocab_and_context_length(cfg.kokoro_repo_id)
-        ds = VoiceCloneManifestDataset(
+        ds: Dataset = VoiceCloneManifestDataset(
             args.manifest,
             kokoro_repo_id=cfg.kokoro_repo_id,
             vocab=vocab,
@@ -471,77 +762,30 @@ def main() -> None:
             manifest_root=args.manifest_root,
         )
         dl = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_voice_clone_batch)
-    else:
-        ds = DummyVoiceCloneDataset(args.dummy_steps * 4)
-        dl = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_voice_clone_batch)
-
-    kmodel, gst, wavlm, disc, mel_loss_mod, _ = build_models(cfg, device)
-    params_g = generator_trainable_parameters(kmodel, gst)
-    opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g, weight_decay=cfg.weight_decay_g)
-    opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d, weight_decay=cfg.weight_decay_d)
-    scaler: Optional[GradScaler] = GradScaler("cuda", enabled=cfg.use_amp) if device.type == "cuda" else None
-
-    if args.resume:
-        load_checkpoint(args.resume, gst=gst, disc=disc, kmodel=kmodel, opt_g=opt_g, opt_d=opt_d, device=device)
-
-    step = 0
-    dl_iter = iter(dl)
-    for _ in range(args.dummy_steps):
-        try:
-            batch = next(dl_iter)
-        except StopIteration:
-            dl_iter = iter(dl)
-            batch = next(dl_iter)
-        step += 1
-        with torch.no_grad():
-            ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(device))
-            tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(device))
-            input_ids = batch["input_ids"].to(device)
-            wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
-            gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
-            ref_s = gst_out.ref_s
-            pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
-            pred_wav = _ensure_batch_time(pred_wav)
-
-        for _ in range(cfg.slm_d_steps_per_g_step):
-            ld = slm_discriminator_step(
-                disc,
-                wavlm,
-                opt_d,
-                pred_wav_24k=pred_wav,
-                target_wav_24k=tgt_24,
-                grad_clip=cfg.grad_clip_d,
-                scaler=scaler,
-                use_amp=cfg.use_amp,
-            )
-
-        metrics = training_step_generator(
-            kmodel,
-            gst,
-            wavlm,
-            disc,
-            mel_loss_mod,
-            opt_g,
-            batch,
-            cfg.loss_weights,
-            speed=cfg.speed,
-            grad_clip=cfg.grad_clip_g,
-            scaler=scaler,
-            use_amp=cfg.use_amp,
+        train_loop(
+            dl,
+            cfg,
+            device,
+            epochs=args.epochs,
+            max_steps=args.max_steps,
+            ckpt_dir=args.ckpt_dir,
+            resume=args.resume,
+            wandb_run=wandb_run,
+            wandb_num_samples=args.wandb_samples,
         )
-        metrics["loss_d"] = float(ld.detach()) if isinstance(ld, torch.Tensor) else float(ld)
-        print(f"step {step} " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
-
-    if args.ckpt_dir:
-        save_checkpoint(
-            args.ckpt_dir / "checkpoint_last.pt",
-            gst=gst,
-            disc=disc,
-            kmodel=kmodel,
-            opt_g=opt_g,
-            opt_d=opt_d,
-            step=step,
-            cfg=cfg,
+    else:
+        ds = DummyVoiceCloneDataset(max(args.dummy_steps * 4, args.dummy_steps))
+        dl = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_voice_clone_batch)
+        train_loop(
+            dl,
+            cfg,
+            device,
+            epochs=1,
+            max_steps=args.dummy_steps,
+            ckpt_dir=args.ckpt_dir,
+            resume=args.resume,
+            wandb_run=wandb_run,
+            wandb_num_samples=args.wandb_samples,
         )
 
 

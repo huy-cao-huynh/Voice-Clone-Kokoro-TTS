@@ -98,8 +98,9 @@ class SLMFeatureDiscriminator(nn.Module):
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd for same-length conv")
         pad = kernel_size // 2
+        # Normalize on (B, T, C); Conv1d expects (B, C, T) after transpose.
+        self.input_norm = nn.LayerNorm(in_dim)
         layers: list[nn.Module] = [
-            nn.LayerNorm(in_dim),
             nn.Conv1d(in_dim, hidden_channels, kernel_size=kernel_size, padding=pad),
             nn.LeakyReLU(0.2, inplace=True),
         ]
@@ -120,7 +121,7 @@ class SLMFeatureDiscriminator(nn.Module):
         """
         if frame_features.dim() != 3:
             raise ValueError("frame_features must be (batch, time, dim)")
-        x = frame_features.transpose(1, 2)
+        x = self.input_norm(frame_features).transpose(1, 2)
         logits_t = self.net(x).squeeze(1)
         m = frame_mask.to(dtype=logits_t.dtype, device=logits_t.device)
         if m.dim() != 2:

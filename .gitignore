@@ -1,6 +1,10 @@
 # Cursor local plans (not part of functional source)
 .cursor/plans/
-
+.hub/
+# Hugging Face hub cache when HF_HUB_CACHE (or equivalent) points into the repo
+hub/
+# hf_xet / xet-core local cache and logs
+xet/
 # Python
 __pycache__/
 *.py[cod]
