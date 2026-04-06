@@ -105,7 +105,7 @@ Composite generator objective:
 \mathcal{L}_G = \lambda_{\text{mel}}\mathcal{L}_{\text{mel}} + \lambda_{\text{spk}}\mathcal{L}_{\text{spk}} + \lambda_{\text{slm}}\mathcal{L}_{\text{slm},G}
 \]
 
-with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.1**, **λ_slm = 0.05** (`voice_clone/config.py`).
+with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.5**, **λ_slm = 0.05** (`voice_clone/config.py`). The elevated `λ_spk` reflects the importance of cross-utterance speaker identity transfer.
 
 ### 5.1 Mel reconstruction (`MelReconstructionLoss`)
 
@@ -123,11 +123,11 @@ with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.1**, **λ_slm = 0.05
 ### 5.3 SLM feature GAN (`SLMFeatureDiscriminator` + hinge)
 
 - **Not** a WavLM-as-discriminator setup: a **small trainable conv discriminator** (`voice_clone/losses.py`) runs on **frozen WavLM last-layer frame features** **(B, T, 768)**.
-- **Architecture**: `LayerNorm(768)` → **4** layers of **Conv1d** (kernel **7**, padding 3), hidden **256**, **LeakyReLU(0.2)** → **Conv1d → 1** channel; logits pooled to **one scalar per utterance** via **mask-weighted mean** over time.
+- **Architecture**: `LayerNorm(768)` → **4** layers of **Conv1d** (kernel **7**, padding 3), hidden **256**, **LeakyReLU(0.2)** → **Conv1d → 1** channel; logits pooled to **one scalar per utterance** via **mask-weighted mean** over time. All **Conv1d** layers are wrapped with **spectral normalization** (`torch.nn.utils.spectral_norm`) when `SLMDiscriminatorConfig.use_spectral_norm=True` (default), constraining the discriminator's Lipschitz constant and stabilizing the hinge loss.
 - **D step** (`slm_discriminator_loss_hinge`): hinge loss on **real** (target 16 kHz) vs **fake** (generated 16 kHz, **detached** from the shared generator forward). Optimizer **AdamW** on discriminator only.
 - **G step** (`slm_generator_loss_hinge`): **−E[D(fake_features)]** (discriminator weights **frozen** / `requires_grad=False` for this forward), using WavLM features of the **same** non-detached `pred_wav` as mel and speaker losses.
 
-**Discriminator hyperparameters** (`SLMDiscriminatorConfig`): `hidden_channels=256`, `num_layers=4`, `kernel_size=7`.
+**Discriminator hyperparameters** (`SLMDiscriminatorConfig`): `hidden_channels=256`, `num_layers=4`, `kernel_size=7`, `use_spectral_norm=True`.
 
 ### 5.4 Numerical safeguard: ISTFTNet exp clamping
 
@@ -139,28 +139,48 @@ The `Generator` in `kokoro/kokoro/istftnet.py` converts log-magnitude to linear 
 
 - **Generator trainable parameters**: SegmentGST + all Kokoro L-adapters (duration, decoder, generator).
 - **Discriminator trainable parameters**: `SLMFeatureDiscriminator` only.
-- **Optimizers**: **AdamW** for both; **lr_g = lr_d = 1e-4**; **weight_decay_g = weight_decay_d = 0** (defaults).
+- **Optimizers**: **AdamW** for both; **lr_g = 1e-4**, **lr_d = 5e-5** (TTUR — Two Time-scale Update Rule: the discriminator learns at half the generator rate to prevent D from overpowering G early in training); **weight_decay_g = weight_decay_d = 0** (defaults).
 - **Gradient clipping**: **1.0** L2 norm on generator params and on discriminator params when not `None` (`grad_clip_g`, `grad_clip_d`).
-- **AMP**: optional CUDA autocast + `GradScaler` when `TrainConfig.use_amp=True` (default **False**). A single `scaler.update()` is called once per step after both D and G optimizer steps, per PyTorch best practice for multi-optimizer AMP.
-- **Learning rate warmup**: `LinearLR` scheduler ramps both `opt_g` and `opt_d` from `1e-3 × lr` to full `lr` over `warmup_steps` (default **200**). When resuming from a checkpoint, schedulers are fast-forwarded to match the resumed step.
+- **AMP**: optional CUDA autocast + `GradScaler` when `TrainConfig.use_amp=True` (default **False**). A single `scaler.update()` is called once per effective step after both D and G optimizer steps, per PyTorch best practice for multi-optimizer AMP.
+- **Learning rate warmup**: `LinearLR` scheduler ramps `opt_g` from `1e-3 × lr_g` to full `lr_g` over `warmup_steps` (default **200**) starting from step 0. `opt_d` gets its own warmup ramp of the same length, but starting from `disc_start_step` (so D ramps in after the generator-only phase). When resuming from a checkpoint, schedulers are fast-forwarded to match the resumed step.
 - **Weight-norm stripping**: `strip_weight_norm_frozen` bakes `weight_norm` decompositions in frozen Kokoro `ConvTranspose1d` layers into static parameters at model-build time, avoiding AMP autocast cache misses on ROCm. Safe because the Kokoro model is frozen (`requires_grad=False`).
-- **Per-step order** (`train_loop` in `voice_clone/train_adapters.py`):
-  1. **`opt_g.zero_grad`** once.
-  2. **WavLM ref** (`wavlm_ref`): reference **16 kHz** → frozen WavLM (no grad) → frame features + pooled x-vector; SegmentGST → `ref_s`.
-  3. **Kokoro forward** (`kokoro_fwd`): `KModel.forward_with_tokens(input_ids, ref_s)` → `pred_wav` (**24 kHz**), under autocast when AMP is on.
-  4. **WavLM gen** (`wavlm_gen`): resample `pred_wav` **24 → 16 kHz**, one WavLM forward **with grad** (`grad_through_input=True`) → `wv_gen` (`WavLMSVOutput`). Computed **once**; the same output feeds both D and G steps.
-  5. **WavLM tgt** (`wavlm_tgt`): resample `tgt_24` **24 → 16 kHz**, `wavlm.frame_hidden_states(...)` **without grad** → `real_feats`, `real_mask`. Uses the optimized base-encoder-only path (skips the x-vector head).
-  6. **D step** (`disc`): **`slm_d_steps_per_g_step`** times — `slm_discriminator_step` receives **pre-computed, detached** feature tensors (`wv_gen.frame_hidden_states.detach()`, `real_feats`) instead of raw audio. `opt_d.zero_grad` inside.
-  7. **G step** (`gen_backward`): `generator_loss_backward_step` receives the **grad-tracked** `wv_gen` directly — `wv_gen.pooled_embedding` for speaker loss, `wv_gen.frame_hidden_states` / `frame_mask` for SLM generator loss, plus mel loss on `pred_wav` vs `tgt_24`. Backward and **`opt_g.step()`** (no second Kokoro forward).
-  8. **`scaler.update()`** (AMP only): single call after both D and G steps.
-  9. **LR scheduler step**: `sched_g.step()` and `sched_d.step()` (during warmup phase).
 
-This gives **3 WavLM forward passes per step** (ref, gen, tgt) instead of the original 4, because the generated-audio WavLM output is computed once and shared between D (detached) and G (with grad).
+### 6.1 Gradient accumulation
 
-- **SLM schedule**: **`slm_d_steps_per_g_step`** (default **1**) is how many **D** updates run **after** the shared WavLM forwards and **before** each **G** update.
+Batch size stays **1** in the DataLoader (Kokoro's `forward_with_tokens` constraint), but effective batch size is increased via **gradient accumulation** over `grad_accum_steps` micro-steps (default **8**). Gradients from each micro-step are scaled by `1/grad_accum_steps` before `.backward()`, then accumulated into a single optimizer step. `global_step` increments once per effective step (not per micro-step), and LR schedulers step once per effective step.
+
+### 6.2 Phased training (generator-only warmup)
+
+For the first `disc_start_step` effective steps (default **500**), the discriminator is disabled:
+
+- `slm_discriminator_backward` is skipped entirely.
+- `generator_loss_backward` runs with `include_slm=False`, so `loss_g = λ_mel · L_mel + λ_spk · L_spk` (no SLM term).
+- `opt_d.step()` and `sched_d.step()` are skipped; `loss_d` and `loss_slm_g` are logged as 0.
+
+Once `global_step >= disc_start_step`, the discriminator activates and the full adversarial objective is used. The discriminator's LR warmup begins at this point.
+
+### 6.3 Per-step order
+
+The training loop (`train_loop` in `voice_clone/train_adapters.py`) uses a two-level structure — one outer effective step wrapping N micro-steps:
+
+  1. **`opt_g.zero_grad`** and **`opt_d.zero_grad`** once per effective step.
+  2. **For each micro-step** (N = `grad_accum_steps`):
+     1. **WavLM ref** (`wavlm_ref`): reference **16 kHz** → frozen WavLM (no grad) → frame features + pooled x-vector; SegmentGST → `ref_s`.
+     2. **Kokoro forward** (`kokoro_fwd`): `KModel.forward_with_tokens(input_ids, ref_s)` → `pred_wav` (**24 kHz**), under autocast when AMP is on.
+     3. **WavLM gen** (`wavlm_gen`): resample `pred_wav` **24 → 16 kHz**, one WavLM forward **with grad** (`grad_through_input=True`) → `wv_gen` (`WavLMSVOutput`). Computed **once**; the same output feeds both D and G losses.
+     4. **WavLM tgt** (`wavlm_tgt`): resample `tgt_24` **24 → 16 kHz**, `wavlm.frame_hidden_states(...)` **without grad** → `real_feats`, `real_mask`. Uses the optimized base-encoder-only path (skips the x-vector head).
+     5. **D backward** (`disc`): if `global_step >= disc_start_step`, `slm_discriminator_backward` computes hinge loss on **detached** features and calls `.backward()` scaled by `1/N`.
+     6. **G backward** (`gen_backward`): `generator_loss_backward` computes mel + speaker + conditional SLM losses, scales by `1/N`, and calls `.backward()`.
+  3. **Deferred optimizer steps** (after all micro-steps): unscale (AMP), clip gradients, `opt_d.step()` (if D is active), `opt_g.step()`, `scaler.update()` (AMP).
+  4. **`global_step += 1`**.
+  5. **LR scheduler step**: `sched_g.step()` every step; `sched_d.step()` only when `global_step > disc_start_step`.
+
+This gives **3 WavLM forward passes per micro-step** (ref, gen, tgt), because the generated-audio WavLM output is computed once and shared between D (detached) and G (with grad). Partial final accumulation (when the dataloader runs out mid-accumulation) still triggers the optimizer step on whatever gradients were accumulated.
+
+- **SLM schedule**: **`slm_d_steps_per_g_step`** (default **1**) is how many **D** backward calls run within each micro-step.
 - **Kokoro inference timing**: `speed` default **1.0** (`TrainConfig.speed`), passed into `forward_with_tokens`.
 
-Logging defaults: **`log_interval = 1`**, **`checkpoint_interval = 10000`**.
+Logging defaults: **`log_interval = 1`**, **`checkpoint_interval = 10000`**. Metrics logged are averages over the N micro-steps in each effective step.
 
 ---
 
@@ -177,14 +197,18 @@ Logging defaults: **`log_interval = 1`**, **`checkpoint_interval = 10000`**.
 | | `num_heads` | **8** |
 | | `ref_dim` / `style_dec_dim` | **256** / **128** |
 | | `dropout` | **0.1** |
-| Loss weights | `lambda_mel` / `lambda_spk` / `lambda_slm` | **1.0** / **0.1** / **0.05** |
+| Loss weights | `lambda_mel` / `lambda_spk` / `lambda_slm` | **1.0** / **0.5** / **0.05** |
 | Mel loss | `sample_rate` | **24000** |
 | | `n_fft` / `hop_length` / `win_length` | **1024** / **256** / **1024** |
 | SLM D | `hidden_channels` / `num_layers` / `kernel_size` | **256** / **4** / **7** |
-| Optim | `lr_g`, `lr_d` | **1e-4** |
+| | `use_spectral_norm` | **True** |
+| Optim | `lr_g` | **1e-4** |
+| | `lr_d` | **5e-5** (TTUR) |
 | | `weight_decay_g`, `weight_decay_d` | **0** |
 | | `grad_clip_g`, `grad_clip_d` | **1.0** |
+| | `grad_accum_steps` | **8** |
 | Schedule | `warmup_steps` | **200** |
+| | `disc_start_step` | **500** (G-only warmup) |
 | | `slm_d_steps_per_g_step` | **1** |
 | | `speed` | **1.0** |
 | Run | `use_amp` | **False** |

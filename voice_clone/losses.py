@@ -84,6 +84,11 @@ def speaker_cosine_loss(
     return (1.0 - cos).mean()
 
 
+def _maybe_spectral_norm(module: nn.Module, use_sn: bool) -> nn.Module:
+    """Optionally wrap a module with spectral normalization."""
+    return nn.utils.spectral_norm(module) if use_sn else module
+
+
 class SLMFeatureDiscriminator(nn.Module):
     """Temporal conv stack on frozen WavLM frame features ``(B, T, C)`` (StyleTTS2-style SLM on features)."""
 
@@ -93,23 +98,28 @@ class SLMFeatureDiscriminator(nn.Module):
         hidden_channels: int = 256,
         num_layers: int = 4,
         kernel_size: int = 7,
+        use_spectral_norm: bool = True,
     ) -> None:
         super().__init__()
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd for same-length conv")
         pad = kernel_size // 2
-        # Normalize on (B, T, C); Conv1d expects (B, C, T) after transpose.
+        sn = use_spectral_norm
         self.input_norm = nn.LayerNorm(in_dim)
         layers: list[nn.Module] = [
-            nn.Conv1d(in_dim, hidden_channels, kernel_size=kernel_size, padding=pad),
+            _maybe_spectral_norm(
+                nn.Conv1d(in_dim, hidden_channels, kernel_size=kernel_size, padding=pad), sn),
             nn.LeakyReLU(0.2, inplace=True),
         ]
         for _ in range(num_layers - 1):
             layers += [
-                nn.Conv1d(hidden_channels, hidden_channels, kernel_size=kernel_size, padding=pad),
+                _maybe_spectral_norm(
+                    nn.Conv1d(hidden_channels, hidden_channels, kernel_size=kernel_size, padding=pad), sn),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
-        layers.append(nn.Conv1d(hidden_channels, 1, kernel_size=kernel_size, padding=pad))
+        layers.append(
+            _maybe_spectral_norm(
+                nn.Conv1d(hidden_channels, 1, kernel_size=kernel_size, padding=pad), sn))
         self.net = nn.Sequential(*layers)
 
     def forward(self, frame_features: torch.Tensor, frame_mask: torch.Tensor) -> torch.Tensor:

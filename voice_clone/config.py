@@ -12,7 +12,7 @@ from huggingface_hub import hf_hub_download
 @dataclass
 class LossWeights:
     lambda_mel: float = 1.0
-    lambda_spk: float = 0.1
+    lambda_spk: float = 0.5
     lambda_slm: float = 0.05
 
 
@@ -33,6 +33,7 @@ class SLMDiscriminatorConfig:
     hidden_channels: int = 256
     num_layers: int = 4
     kernel_size: int = 7
+    use_spectral_norm: bool = True
 
 
 @dataclass
@@ -44,7 +45,7 @@ class TrainConfig:
     mel: MelLossConfig = field(default_factory=MelLossConfig)
     slm_disc: SLMDiscriminatorConfig = field(default_factory=SLMDiscriminatorConfig)
     lr_g: float = 1e-4
-    lr_d: float = 1e-4
+    lr_d: float = 5e-5
     weight_decay_g: float = 0.0
     weight_decay_d: float = 0.0
     grad_clip_g: Optional[float] = 1.0
@@ -54,6 +55,8 @@ class TrainConfig:
     log_interval: int = 1
     checkpoint_interval: int = 10_000
     warmup_steps: int = 200
+    grad_accum_steps: int = 8
+    disc_start_step: int = 500
     slm_d_steps_per_g_step: int = 1
     speed: float = 1.0
 

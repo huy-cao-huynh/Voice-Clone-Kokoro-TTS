@@ -21,3 +21,33 @@ def test_train_config_checkpoint_interval_default() -> None:
     """Checkpoint cadence defaults to 10k steps."""
     cfg = TrainConfig()
     assert cfg.checkpoint_interval == 10_000
+
+
+def test_disc_start_step_default() -> None:
+    """Generator-only warmup phase lasts 500 effective steps before D activates."""
+    cfg = TrainConfig()
+    assert cfg.disc_start_step == 500
+
+
+def test_grad_accum_steps_default() -> None:
+    """Gradient accumulation over 8 micro-steps per effective step."""
+    cfg = TrainConfig()
+    assert cfg.grad_accum_steps == 8
+
+
+def test_lr_d_default() -> None:
+    """Discriminator learning rate uses TTUR (lower than generator)."""
+    cfg = TrainConfig()
+    assert cfg.lr_d == 5e-5
+
+
+def test_lambda_spk_default() -> None:
+    """Speaker loss weight elevated for cross-utterance identity transfer."""
+    cfg = TrainConfig()
+    assert cfg.loss_weights.lambda_spk == 0.5
+
+
+def test_use_spectral_norm_default() -> None:
+    """Spectral normalization enabled by default on discriminator convolutions."""
+    cfg = TrainConfig()
+    assert cfg.slm_disc.use_spectral_norm is True
