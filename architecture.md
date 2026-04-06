@@ -16,6 +16,8 @@ This document matches the current `voice_clone` training and inference code: fro
 
 There is **no ECAPA-TDNN** in this repo; speaker identity for training losses comes from the same frozen **WavLM-SV x-vector head** (512-D), not from a separate ECAPA stack.
 
+For **training and inference on device**, `WavLMSV` (`voice_clone/wavlm_sv.py`) applies **GPU-side preprocessing** that matches Hugging Face `Wav2Vec2FeatureExtractor`: padding to batch max length, attention mask, sampling rate semantics, and optional per-audio normalization when the checkpoint sets `do_normalize`, so tensor waveforms are not sent through the NumPy/CPU extractor on the hot path. The **training loop** (`voice_clone/train_adapters.py`) runs **one** Kokoro `forward_with_tokens` per step on the live generator graph; mel, speaker, and SLM generator losses reuse that waveform, while the SLM discriminator consumes **`pred_wav.detach()`** (see §4 and §6 for shapes and optimizer order).
+
 ---
 
 ## 2. Trainable bottleneck: SegmentGST
@@ -91,6 +93,8 @@ Rough data flow for one training step (batch size **B**):
    - Duration path features stay at hidden width **512** at adapter sites; decoder feature maps use the channel counts in §3.2.
 4. **Synthesis output** `pred_wav`: **(B, T_24k)** mono at **24 kHz**.
 
+During **training**, that Kokoro forward runs **once per step** under the generator graph (WavLM reference → SegmentGST → `forward_with_tokens`). The SLM discriminator sees **`pred_wav.detach()`** (and detached target audio) so **D** does not backprop into Kokoro; mel, speaker, and SLM generator losses still use the **same** `pred_wav` for backward through adapters and GST.
+
 For **SLM / speaker losses**, `pred_wav` is resampled **24 kHz → 16 kHz** (`torchaudio.functional.resample`) before re-entering frozen WavLM so frame tensors stay aligned with the SV model.
 
 ---
@@ -122,8 +126,8 @@ with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.1**, **λ_slm = 0.05
 
 - **Not** a WavLM-as-discriminator setup: a **small trainable conv discriminator** (`voice_clone/losses.py`) runs on **frozen WavLM last-layer frame features** **(B, T, 768)**.
 - **Architecture**: `LayerNorm(768)` → **4** layers of **Conv1d** (kernel **7**, padding 3), hidden **256**, **LeakyReLU(0.2)** → **Conv1d → 1** channel; logits pooled to **one scalar per utterance** via **mask-weighted mean** over time.
-- **D step** (`slm_discriminator_loss_hinge`): hinge loss on **real** (target 16 kHz) vs **fake** (generated 16 kHz, **detached**). Optimizer **AdamW** on discriminator only.
-- **G step** (`slm_generator_loss_hinge`): **−E[D(fake_features)]** (discriminator weights **frozen** / `requires_grad=False` for this forward).
+- **D step** (`slm_discriminator_loss_hinge`): hinge loss on **real** (target 16 kHz) vs **fake** (generated 16 kHz, **detached** from the shared generator forward). Optimizer **AdamW** on discriminator only.
+- **G step** (`slm_generator_loss_hinge`): **−E[D(fake_features)]** (discriminator weights **frozen** / `requires_grad=False` for this forward), using WavLM features of the **same** non-detached `pred_wav` as mel and speaker losses.
 
 **Discriminator hyperparameters** (`SLMDiscriminatorConfig`): `hidden_channels=256`, `num_layers=4`, `kernel_size=7`.
 
@@ -136,7 +140,12 @@ with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.1**, **λ_slm = 0.05
 - **Optimizers**: **AdamW** for both; **lr_g = lr_d = 1e-4**; **weight_decay_g = weight_decay_d = 0** (defaults).
 - **Gradient clipping**: **1.0** L2 norm on generator params and on discriminator params when not `None` (`grad_clip_g`, `grad_clip_d`).
 - **AMP**: optional CUDA autocast + `GradScaler` when `TrainConfig.use_amp=True` (default **False**).
-- **SLM schedule**: **`slm_d_steps_per_g_step = 1`** discriminator update per batch using the **current** generator output from a no-grad forward, then the generator step with fresh forward.
+- **Per-step order** (`train_loop` / `generator_loss_backward_step` in `voice_clone/train_adapters.py`):
+  1. **`opt_g.zero_grad`** once.
+  2. **One differentiable forward**: reference **16 kHz** → frozen WavLM → SegmentGST → **`KModel.forward_with_tokens`** → `pred_wav` (**24 kHz**), under autocast when AMP is on.
+  3. **`slm_d_steps_per_g_step`** times: **D** forward/backward/step on **real vs `pred_wav.detach()`** (WavLM features at 16 kHz); **`opt_d.zero_grad`** inside the D step.
+  4. **G** losses (mel + speaker + SLM generator hinge) from the **same** `pred_wav` tensor, then backward and **`opt_g.step()`** (no second Kokoro forward).
+- **SLM schedule**: **`slm_d_steps_per_g_step`** (default **1**) is how many **D** updates run **after** that shared forward and **before** each **G** update.
 - **Kokoro inference timing**: `speed` default **1.0** (`TrainConfig.speed`), passed into `forward_with_tokens`.
 
 Logging defaults: **`log_interval = 10`**, **`checkpoint_interval = 500`**.

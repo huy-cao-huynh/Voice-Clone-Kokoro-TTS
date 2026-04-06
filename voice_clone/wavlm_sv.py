@@ -14,6 +14,107 @@ from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
 Tensor = torch.Tensor
 
 
+def _waveforms_use_torch_preprocess(
+    waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
+) -> bool:
+    """True for tensor batches: avoids NumPy/HF round-trip and keeps autograd through audio when requested.
+
+    Nested Python lists / non-tensor sequences use the Hugging Face NumPy path instead.
+    """
+    if isinstance(waveforms, Tensor):
+        return True
+    if not isinstance(waveforms, (list, tuple)) or not waveforms:
+        return False
+    if not all(isinstance(x, Tensor) for x in waveforms):
+        return False
+    dev0 = waveforms[0].device
+    return all(x.device == dev0 for x in waveforms)
+
+
+def _zero_mean_unit_var_norm_torch(
+    input_values: Tensor,
+    attention_mask: Tensor,
+    padding_value: float,
+    eps: float = 1e-7,
+) -> Tensor:
+    """Match Hugging Face `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm` (batched, differentiable)."""
+    mask = attention_mask.to(dtype=input_values.dtype)
+    lengths = attention_mask.sum(dim=-1).clamp(min=1)
+    sum_v = (input_values * mask).sum(dim=-1)
+    mean = sum_v / lengths.to(dtype=input_values.dtype)
+    centered = input_values - mean.unsqueeze(-1)
+    var = ((centered * centered) * mask).sum(dim=-1) / lengths.to(dtype=input_values.dtype)
+    normed = centered / torch.sqrt(var.unsqueeze(-1) + eps)
+    inv_mask = 1.0 - mask
+    return normed * mask + inv_mask * padding_value
+
+
+def wav2vec2_preprocess_batch(
+    feature_extractor: Wav2Vec2FeatureExtractor,
+    waveforms: Union[Tensor, Sequence[Tensor]],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    sampling_rate: int,
+) -> Tuple[Tensor, Tensor]:
+    """Pad and optionally normalize waveforms like ``Wav2Vec2FeatureExtractor(..., return_tensors='pt')``.
+
+    Reads ``do_normalize``, ``padding_value``, ``padding_side``, and ``sampling_rate`` from the extractor.
+    Output ``input_values`` uses ``dtype``; ``attention_mask`` is ``torch.long`` (1 = valid, 0 = pad).
+    """
+    if sampling_rate != feature_extractor.sampling_rate:
+        raise ValueError(
+            f"Expected sampling_rate={feature_extractor.sampling_rate} for this feature extractor; "
+            f"got {sampling_rate}"
+        )
+
+    pad_val = float(feature_extractor.padding_value)
+    side = feature_extractor.padding_side
+
+    if isinstance(waveforms, Tensor):
+        w = waveforms
+        if w.dim() == 1:
+            w = w.unsqueeze(0)
+        if w.dim() != 2:
+            raise ValueError("waveforms tensor must be (batch, samples) or (samples,)")
+        rows = [w[i].to(device=device, dtype=dtype) for i in range(w.size(0))]
+    else:
+        rows = []
+        for i, x in enumerate(waveforms):
+            if not isinstance(x, Tensor):
+                raise TypeError(
+                    f"wav2vec2_preprocess_batch expected Tensor entries; got {type(x).__name__} at index {i}"
+                )
+            if x.dim() != 1:
+                raise ValueError(f"waveforms[{i}] must be 1-D, got shape {tuple(x.shape)}")
+            rows.append(x.to(device=device, dtype=dtype))
+
+    if not rows:
+        raise ValueError("Empty waveform batch")
+
+    lengths = [int(r.shape[0]) for r in rows]
+    max_len = max(lengths)
+    b = len(rows)
+    padded = torch.full((b, max_len), pad_val, device=device, dtype=dtype)
+    attention_mask = torch.zeros(b, max_len, device=device, dtype=torch.long)
+
+    for i, r in enumerate(rows):
+        L = lengths[i]
+        if side == "right":
+            padded[i, :L] = r
+            attention_mask[i, :L] = 1
+        elif side == "left":
+            padded[i, -L:] = r
+            attention_mask[i, -L:] = 1
+        else:
+            raise ValueError(f"Unsupported padding_side: {side!r}")
+
+    if feature_extractor.do_normalize:
+        padded = _zero_mean_unit_var_norm_torch(padded, attention_mask, pad_val)
+
+    return padded, attention_mask
+
+
 @dataclass
 class WavLMSVOutput:
     """Outputs from `WavLMSV.forward`."""
@@ -145,38 +246,21 @@ class WavLMSV(nn.Module):
         attention_mask = enc["attention_mask"].to(device=self.device, dtype=torch.long)
         return input_values, attention_mask
 
-    def _extract_inputs_torch(
+    def _prepare_model_inputs(
         self,
-        waveforms: Union[Tensor, Sequence[Tensor]],
+        waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
+        sampling_rate: int,
     ) -> Tuple[Tensor, Tensor]:
-        """Pad mono waveforms like the HF feature extractor (no normalization for this checkpoint)."""
-        if isinstance(waveforms, Tensor):
-            w = waveforms
-            if w.dim() == 1:
-                w = w.unsqueeze(0)
-            if w.dim() != 2:
-                raise ValueError("waveforms tensor must be (batch, samples) or (samples,)")
-            input_values = w.to(device=self.device, dtype=self.dtype)
-            attention_mask = torch.ones(
-                input_values.shape[0], input_values.shape[1], device=self.device, dtype=torch.long
+        """Hugging Face NumPy path for non-tensor inputs; torch path (config-matched padding/mask/norm) for tensors."""
+        if _waveforms_use_torch_preprocess(waveforms):
+            return wav2vec2_preprocess_batch(
+                self.feature_extractor,
+                waveforms,  # type: ignore[arg-type]
+                device=self.device,
+                dtype=self.dtype,
+                sampling_rate=sampling_rate,
             )
-            return input_values, attention_mask
-
-        rows: List[Tensor] = []
-        for i, x in enumerate(waveforms):
-            t = x if isinstance(x, Tensor) else torch.as_tensor(x, dtype=self.dtype)
-            if t.dim() != 1:
-                raise ValueError(f"waveforms[{i}] must be 1-D, got shape {tuple(t.shape)}")
-            rows.append(t.to(device=self.device, dtype=self.dtype))
-        max_len = max(int(t.shape[0]) for t in rows)
-        b = len(rows)
-        padded = torch.zeros(b, max_len, device=self.device, dtype=self.dtype)
-        attention_mask = torch.zeros(b, max_len, device=self.device, dtype=torch.long)
-        for i, t in enumerate(rows):
-            L = t.shape[0]
-            padded[i, :L] = t
-            attention_mask[i, :L] = 1
-        return padded, attention_mask
+        return self._extract_inputs(waveforms, sampling_rate)
 
     def forward(
         self,
@@ -207,10 +291,7 @@ class WavLMSV(nn.Module):
                 f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
             )
 
-        if grad_through_input:
-            input_values, attention_mask = self._extract_inputs_torch(waveforms)
-        else:
-            input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
+        input_values, attention_mask = self._prepare_model_inputs(waveforms, sampling_rate)
         frame_mask = frame_mask_from_sample_mask(attention_mask, self.wavlm_xv.wavlm)
 
         if grad_through_input:
@@ -255,10 +336,7 @@ class WavLMSV(nn.Module):
             raise ValueError(
                 f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
             )
-        if grad_through_input:
-            input_values, attention_mask = self._extract_inputs_torch(waveforms)
-        else:
-            input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
+        input_values, attention_mask = self._prepare_model_inputs(waveforms, sampling_rate)
         if grad_through_input:
             out = self.wavlm_xv(input_values, attention_mask=attention_mask)
         else:
@@ -286,10 +364,7 @@ class WavLMSV(nn.Module):
             raise ValueError(
                 f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
             )
-        if grad_through_input:
-            input_values, attention_mask = self._extract_inputs_torch(waveforms)
-        else:
-            input_values, attention_mask = self._extract_inputs(waveforms, sampling_rate)
+        input_values, attention_mask = self._prepare_model_inputs(waveforms, sampling_rate)
         frame_mask = frame_mask_from_sample_mask(attention_mask, self.wavlm_xv.wavlm)
         if grad_through_input:
             out = self.wavlm_xv(

@@ -31,6 +31,7 @@ from .losses import (
     speaker_cosine_loss,
 )
 from .segment_gst import SegmentGST
+from .train_profiling import BreakdownAggregator, StepStopwatch, build_torch_profiler
 from .wavlm_sv import WavLMSV
 
 
@@ -280,47 +281,39 @@ def slm_discriminator_step(
     return loss_d.detach()
 
 
-def training_step_generator(
+def generator_loss_backward_step(
     kmodel: KModel,
     gst: SegmentGST,
     wavlm: WavLMSV,
     disc: SLMFeatureDiscriminator,
     mel_loss_mod: MelReconstructionLoss,
     opt_g: torch.optim.Optimizer,
-    batch: Dict[str, torch.Tensor],
+    pred_wav: torch.Tensor,
+    ref_pooled_detached: torch.Tensor,
+    tgt_24: torch.Tensor,
     weights: LossWeights,
     *,
-    speed: float,
     grad_clip: Optional[float],
     scaler: Optional[GradScaler],
     use_amp: bool,
 ) -> Dict[str, float]:
-    """Single **G** step: mel + speaker cosine + SLM (D frozen); Kokoro forward is differentiable."""
-    ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(kmodel.device))
-    tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(kmodel.device))
-    input_ids = batch["input_ids"].to(kmodel.device)
-    if input_ids.dim() != 2:
-        raise ValueError("input_ids must be (batch, seq_len)")
+    """Mel + speaker + SLM generator losses, backward, and ``opt_g.step()`` from an existing ``pred_wav`` graph.
 
-    opt_g.zero_grad(set_to_none=True)
-    with _cuda_amp_context(use_amp, ref_16):
-        wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
-        gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
-        ref_s = gst_out.ref_s
-        pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=speed)
-        pred_wav = _ensure_batch_time(pred_wav)
+    ``ref_pooled_detached`` must be ``wavlm(ref_16, ...).pooled_embedding.detach()`` from the same step as
+    ``pred_wav`` (one WavLM forward on reference audio). Generated audio uses a single WavLM forward for
+    both speaker cosine and SLM generator branches.
 
+    Caller must ``opt_g.zero_grad`` before the shared Kokoro forward and must not zero again before this runs.
+    """
+    with _cuda_amp_context(use_amp, pred_wav):
         out_mel = mel_loss_mod(pred_wav, tgt_24)
         l_mel = out_mel.loss
 
         w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
-        emb_gen = wavlm.pooled_embedding(w_gen_16, sampling_rate=16_000, grad_through_input=True)
-        emb_ref = wavlm.pooled_embedding(ref_16, sampling_rate=16_000, grad_through_input=False).detach()
-        l_spk = speaker_cosine_loss(emb_ref, emb_gen)
+        wv_gen = wavlm(w_gen_16, sampling_rate=16_000, grad_through_input=True)
+        l_spk = speaker_cosine_loss(ref_pooled_detached, wv_gen.pooled_embedding)
 
-        f_fake, m_fake, _ = wavlm.frame_hidden_states(
-            w_gen_16, sampling_rate=16_000, grad_through_input=True
-        )
+        f_fake, m_fake = wv_gen.frame_hidden_states, wv_gen.frame_mask
         for p in disc.parameters():
             p.requires_grad_(False)
         l_slm = slm_generator_loss_hinge(disc, f_fake, m_fake)
@@ -446,6 +439,9 @@ def train_loop(
     resume: Optional[Path] = None,
     wandb_run: Optional[Any] = None,
     wandb_num_samples: int = 3,
+    profile_breakdown: bool = False,
+    profile_breakdown_steps: int = 3,
+    torch_profiler_trace: Optional[Path] = None,
 ) -> None:
     kmodel, gst, wavlm, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
     vocab: Dict[str, int] = kokoro_cfg["vocab"]
@@ -470,154 +466,218 @@ def train_loop(
     except ImportError:
         _tqdm_cls = None  # type: ignore[misc, assignment]
 
-    for epoch_idx in range(epochs):
-        epoch_sums = {
-            "loss_g": 0.0,
-            "loss_mel": 0.0,
-            "loss_spk": 0.0,
-            "loss_slm_g": 0.0,
-            "loss_d": 0.0,
-        }
-        epoch_count = 0
-        batches_seen = 0
+    prof: Any = None
+    profile_breakdown_k = max(1, int(profile_breakdown_steps))
+    profile_agg: Optional[BreakdownAggregator] = BreakdownAggregator() if profile_breakdown else None
+    sw: Optional[StepStopwatch] = StepStopwatch(device) if profile_breakdown else None
 
-        # Manual tqdm updates: wrapping ``for batch in tqdm(dataloader)`` and then ``break`` skips the
-        # generator's post-yield update, so the bar can freeze at (N-1)/N.
-        pbar_ctx: Any = contextlib.nullcontext()
-        use_tqdm_pbar = False
-        if _tqdm_cls is not None and expected_batches_per_epoch is not None:
-            n_tqdm = expected_batches_per_epoch
-            if max_steps is not None:
-                n_tqdm = min(expected_batches_per_epoch, max(0, max_steps - global_step))
-            if n_tqdm > 0:
-                use_tqdm_pbar = True
-                pbar_ctx = _tqdm_cls(
-                    total=n_tqdm,
-                    desc=f"train epoch {epoch_idx + 1}/{epochs}",
-                    leave=False,
-                    dynamic_ncols=True,
-                )
+    with contextlib.ExitStack() as _prof_stack:
+        if torch_profiler_trace is not None:
+            prof = build_torch_profiler(torch_profiler_trace, device)
+            _prof_stack.enter_context(prof)
 
-        with pbar_ctx as pbar:
-            for batch in dataloader:
-                global_step += 1
-                batches_seen += 1
-                with torch.no_grad():
+        for epoch_idx in range(epochs):
+            epoch_sums = {
+                "loss_g": 0.0,
+                "loss_mel": 0.0,
+                "loss_spk": 0.0,
+                "loss_slm_g": 0.0,
+                "loss_d": 0.0,
+            }
+            epoch_count = 0
+            batches_seen = 0
+
+            # Manual tqdm updates: wrapping ``for batch in tqdm(dataloader)`` and then ``break`` skips the
+            # generator's post-yield update, so the bar can freeze at (N-1)/N.
+            pbar_ctx: Any = contextlib.nullcontext()
+            use_tqdm_pbar = False
+            if _tqdm_cls is not None and expected_batches_per_epoch is not None:
+                n_tqdm = expected_batches_per_epoch
+                if max_steps is not None:
+                    n_tqdm = min(expected_batches_per_epoch, max(0, max_steps - global_step))
+                if n_tqdm > 0:
+                    use_tqdm_pbar = True
+                    pbar_ctx = _tqdm_cls(
+                        total=n_tqdm,
+                        desc=f"train epoch {epoch_idx + 1}/{epochs}",
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+
+            with pbar_ctx as pbar:
+                batch_iter = iter(dataloader)
+                while True:
+                    if sw is not None:
+                        sw.begin_step()
+                        sw.start("dataloader")
+                    try:
+                        batch = next(batch_iter)
+                    except StopIteration:
+                        if sw is not None:
+                            sw.discard_active()
+                        break
+                    if sw is not None:
+                        sw.end("dataloader", sync_cuda=False)
+
+                    global_step += 1
+                    batches_seen += 1
+
+                    if sw is not None:
+                        sw.start("h2d")
                     ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(device))
                     tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(device))
                     input_ids = batch["input_ids"].to(device)
-                    wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
-                    gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
-                    ref_s = gst_out.ref_s
-                    pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
-                    pred_wav = _ensure_batch_time(pred_wav)
+                    if sw is not None:
+                        sw.end("h2d", sync_cuda=True)
+                    if input_ids.dim() != 2:
+                        raise ValueError("input_ids must be (batch, seq_len)")
 
-                for _ in range(cfg.slm_d_steps_per_g_step):
-                    ld = slm_discriminator_step(
-                        disc,
+                    opt_g.zero_grad(set_to_none=True)
+                    with _cuda_amp_context(cfg.use_amp, ref_16):
+                        if sw is not None:
+                            sw.start("wavlm_ref")
+                        wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
+                        gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
+                        ref_s = gst_out.ref_s
+                        if sw is not None:
+                            sw.end("wavlm_ref", sync_cuda=True)
+
+                        if sw is not None:
+                            sw.start("kokoro_fwd")
+                        pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
+                        pred_wav = _ensure_batch_time(pred_wav)
+                        if sw is not None:
+                            sw.end("kokoro_fwd", sync_cuda=True)
+
+                    if sw is not None:
+                        sw.start("disc")
+                    ld = torch.zeros((), device=device, dtype=torch.float32)
+                    for _ in range(cfg.slm_d_steps_per_g_step):
+                        ld = slm_discriminator_step(
+                            disc,
+                            wavlm,
+                            opt_d,
+                            pred_wav_24k=pred_wav.detach(),
+                            target_wav_24k=tgt_24,
+                            grad_clip=cfg.grad_clip_d,
+                            scaler=scaler,
+                            use_amp=cfg.use_amp,
+                        )
+                    if sw is not None:
+                        sw.end("disc", sync_cuda=True)
+
+                    if sw is not None:
+                        sw.start("gen_backward")
+                    metrics = generator_loss_backward_step(
+                        kmodel,
+                        gst,
                         wavlm,
-                        opt_d,
-                        pred_wav_24k=pred_wav,
-                        target_wav_24k=tgt_24,
-                        grad_clip=cfg.grad_clip_d,
+                        disc,
+                        mel_loss_mod,
+                        opt_g,
+                        pred_wav,
+                        wv_ref.pooled_embedding.detach(),
+                        tgt_24,
+                        cfg.loss_weights,
+                        grad_clip=cfg.grad_clip_g,
                         scaler=scaler,
                         use_amp=cfg.use_amp,
                     )
+                    if sw is not None:
+                        sw.end("gen_backward", sync_cuda=True)
+                    metrics["loss_d"] = float(ld.detach()) if isinstance(ld, torch.Tensor) else float(ld)
 
-                metrics = training_step_generator(
-                    kmodel,
-                    gst,
-                    wavlm,
-                    disc,
-                    mel_loss_mod,
-                    opt_g,
-                    batch,
-                    cfg.loss_weights,
-                    speed=cfg.speed,
-                    grad_clip=cfg.grad_clip_g,
-                    scaler=scaler,
-                    use_amp=cfg.use_amp,
-                )
-                metrics["loss_d"] = float(ld.detach()) if isinstance(ld, torch.Tensor) else float(ld)
+                    epoch_count += 1
+                    for k in epoch_sums:
+                        epoch_sums[k] += metrics[k]
 
-                epoch_count += 1
-                for k in epoch_sums:
-                    epoch_sums[k] += metrics[k]
-
-                if pbar is not None:
-                    pbar.update(1)
-
-                at_log_interval = global_step % cfg.log_interval == 0
-                at_max_stop = max_steps is not None and global_step >= max_steps
-
-                if at_log_interval or at_max_stop:
                     if pbar is not None:
-                        postfix: Dict[str, Any] = {"step": global_step}
-                        postfix.update({k: round(float(v), 4) for k, v in metrics.items()})
-                        pbar.set_postfix(**postfix, refresh=True)
-                    else:
-                        sys.stdout.write("\r" + _terminal_metrics_cr_line(global_step, metrics))
-                        sys.stdout.flush()
-                    if wandb_run is not None:
-                        w = cfg.loss_weights
-                        wandb_run.log(
-                            {
-                                "train/loss_g": metrics["loss_g"],
-                                "train/loss_mel": metrics["loss_mel"],
-                                "train/loss_spk": metrics["loss_spk"],
-                                "train/loss_slm_g": metrics["loss_slm_g"],
-                                "train/loss_d": metrics["loss_d"],
-                                "train/weighted_mel": w.lambda_mel * metrics["loss_mel"],
-                                "train/weighted_spk": w.lambda_spk * metrics["loss_spk"],
-                                "train/weighted_slm": w.lambda_slm * metrics["loss_slm_g"],
-                                "train/epoch": float(epoch_idx + 1),
-                            },
+                        pbar.update(1)
+
+                    at_log_interval = global_step % cfg.log_interval == 0
+                    at_max_stop = max_steps is not None and global_step >= max_steps
+
+                    if at_log_interval or at_max_stop:
+                        if pbar is not None:
+                            postfix: Dict[str, Any] = {"step": global_step}
+                            postfix.update({k: round(float(v), 4) for k, v in metrics.items()})
+                            pbar.set_postfix(**postfix, refresh=True)
+                        else:
+                            sys.stdout.write("\r" + _terminal_metrics_cr_line(global_step, metrics))
+                            sys.stdout.flush()
+                        if wandb_run is not None:
+                            if sw is not None:
+                                sw.start("wandb_log")
+                            w = cfg.loss_weights
+                            wandb_run.log(
+                                {
+                                    "train/loss_g": metrics["loss_g"],
+                                    "train/loss_mel": metrics["loss_mel"],
+                                    "train/loss_spk": metrics["loss_spk"],
+                                    "train/loss_slm_g": metrics["loss_slm_g"],
+                                    "train/loss_d": metrics["loss_d"],
+                                    "train/weighted_mel": w.lambda_mel * metrics["loss_mel"],
+                                    "train/weighted_spk": w.lambda_spk * metrics["loss_spk"],
+                                    "train/weighted_slm": w.lambda_slm * metrics["loss_slm_g"],
+                                    "train/epoch": float(epoch_idx + 1),
+                                },
+                                step=global_step,
+                            )
+                            if sw is not None:
+                                sw.end("wandb_log", sync_cuda=False)
+
+                    if profile_agg is not None and sw is not None:
+                        profile_agg.add_step(sw.finish_step())
+                        if len(profile_agg) >= profile_breakdown_k:
+                            profile_agg.print_summary(skip_first_step=True)
+                            sw = None
+
+                    if ckpt_dir is not None and global_step % cfg.checkpoint_interval == 0:
+                        save_checkpoint(
+                            ckpt_dir / f"checkpoint_{global_step}.pt",
+                            gst=gst,
+                            disc=disc,
+                            kmodel=kmodel,
+                            opt_g=opt_g,
+                            opt_d=opt_d,
                             step=global_step,
+                            cfg=cfg,
                         )
 
-                if ckpt_dir is not None and global_step % cfg.checkpoint_interval == 0:
-                    save_checkpoint(
-                        ckpt_dir / f"checkpoint_{global_step}.pt",
-                        gst=gst,
-                        disc=disc,
-                        kmodel=kmodel,
-                        opt_g=opt_g,
-                        opt_d=opt_d,
-                        step=global_step,
-                        cfg=cfg,
-                    )
+                    if prof is not None:
+                        prof.step()
 
-                if max_steps is not None and global_step >= max_steps:
-                    break
+                    if max_steps is not None and global_step >= max_steps:
+                        break
 
-        if not use_tqdm_pbar:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            if not use_tqdm_pbar:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
 
-        full_epoch = (
-            expected_batches_per_epoch is not None
-            and expected_batches_per_epoch > 0
-            and batches_seen == expected_batches_per_epoch
-        )
-        if wandb_run is not None and epoch_count > 0 and full_epoch:
-            mean_payload = {f"epoch/mean_{k}": epoch_sums[k] / epoch_count for k in epoch_sums}
-            wandb_run.log(mean_payload, step=global_step)
-            _log_wandb_epoch_audio_table(
-                wandb_run,
-                dataset=dataloader.dataset,
-                kmodel=kmodel,
-                gst=gst,
-                wavlm=wavlm,
-                cfg=cfg,
-                device=device,
-                epoch=epoch_idx,
-                global_step=global_step,
-                num_samples=wandb_num_samples,
-                vocab=vocab,
+            full_epoch = (
+                expected_batches_per_epoch is not None
+                and expected_batches_per_epoch > 0
+                and batches_seen == expected_batches_per_epoch
             )
+            if wandb_run is not None and epoch_count > 0 and full_epoch:
+                mean_payload = {f"epoch/mean_{k}": epoch_sums[k] / epoch_count for k in epoch_sums}
+                wandb_run.log(mean_payload, step=global_step)
+                _log_wandb_epoch_audio_table(
+                    wandb_run,
+                    dataset=dataloader.dataset,
+                    kmodel=kmodel,
+                    gst=gst,
+                    wavlm=wavlm,
+                    cfg=cfg,
+                    device=device,
+                    epoch=epoch_idx,
+                    global_step=global_step,
+                    num_samples=wandb_num_samples,
+                    vocab=vocab,
+                )
 
-        if max_steps is not None and global_step >= max_steps:
-            return
+            if max_steps is not None and global_step >= max_steps:
+                return
 
 
 def parse_args() -> argparse.Namespace:
@@ -666,6 +726,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Stop manifest training after this many optimizer steps (across epochs).",
     )
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes (default: 0). On Windows, spawn overhead applies; try 4–8 or use 0 if workers error.",
+    )
+    p.add_argument(
+        "--profile-breakdown",
+        action="store_true",
+        help="Coarse CUDA-synchronized timers per phase; prints aggregate after --profile-breakdown-steps.",
+    )
+    p.add_argument(
+        "--profile-breakdown-steps",
+        type=int,
+        default=3,
+        help="Steps to record before printing [profile-breakdown] summary; timing then stops (default: 3).",
+    )
+    p.add_argument(
+        "--torch-profiler-trace",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Export torch.profiler Chrome trace JSON (open in chrome://tracing). Use max-steps>=4 for default schedule.",
+    )
     return p.parse_args()
 
 
@@ -699,8 +783,12 @@ def main() -> None:
                 "manifest_root": str(args.manifest_root) if args.manifest_root else None,
                 "epochs": args.epochs,
                 "max_steps": args.max_steps,
+                "num_workers": args.num_workers,
                 "resume": str(args.resume) if args.resume else None,
                 "ckpt_dir": str(args.ckpt_dir) if args.ckpt_dir else None,
+                "profile_breakdown": args.profile_breakdown,
+                "profile_breakdown_steps": args.profile_breakdown_steps,
+                "torch_profiler_trace": str(args.torch_profiler_trace) if args.torch_profiler_trace else None,
             }
         )
         init_kw: Dict[str, Any] = {
@@ -736,7 +824,17 @@ def _run_training(
         context_length=ctx,
         manifest_root=args.manifest_root,
     )
-    dl = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_voice_clone_batch)
+    # num_workers>0 uses multiprocessing; on Windows that is spawn-based (extra startup cost vs Linux fork).
+    nw = args.num_workers
+    dl = DataLoader(
+        ds,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=collate_voice_clone_batch,
+        num_workers=nw,
+        persistent_workers=nw > 0,
+        pin_memory=device.type == "cuda",
+    )
     train_loop(
         dl,
         cfg,
@@ -747,6 +845,9 @@ def _run_training(
         resume=args.resume,
         wandb_run=wandb_run,
         wandb_num_samples=args.wandb_samples,
+        profile_breakdown=args.profile_breakdown,
+        profile_breakdown_steps=args.profile_breakdown_steps,
+        torch_profiler_trace=args.torch_profiler_trace,
     )
 
 
