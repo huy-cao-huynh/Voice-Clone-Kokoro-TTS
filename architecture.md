@@ -16,7 +16,7 @@ This document matches the current `voice_clone` training and inference code: fro
 
 There is **no ECAPA-TDNN** in this repo; speaker identity for training losses comes from the same frozen **WavLM-SV x-vector head** (512-D), not from a separate ECAPA stack.
 
-For **training and inference on device**, `WavLMSV` (`voice_clone/wavlm_sv.py`) applies **GPU-side preprocessing** that matches Hugging Face `Wav2Vec2FeatureExtractor`: padding to batch max length, attention mask, sampling rate semantics, and optional per-audio normalization when the checkpoint sets `do_normalize`, so tensor waveforms are not sent through the NumPy/CPU extractor on the hot path. The **training loop** (`voice_clone/train_adapters.py`) runs **one** Kokoro `forward_with_tokens` per step on the live generator graph, then runs **one** WavLM forward on the generated audio (with grad) whose output is shared: the SLM discriminator receives **detached** features while mel, speaker, and SLM generator losses use the **grad-tracked** features for backward through adapters and GST (see §4 and §6 for shapes and optimizer order).
+For **training and inference on device**, `WavLMSV` (`voice_clone/wavlm_sv.py`) applies **GPU-side preprocessing** that matches Hugging Face `Wav2Vec2FeatureExtractor`: padding to batch max length, attention mask, sampling rate semantics, and optional per-audio normalization when the checkpoint sets `do_normalize`, so tensor waveforms are not sent through the NumPy/CPU extractor on the hot path. The normalization function (`_zero_mean_unit_var_norm_torch`) uses **ε = 1e-5** in the variance denominator (matching `LayerNorm` / `InstanceNorm1d` conventions) to limit backward gradient amplification when generated audio has near-zero variance. The **training loop** (`voice_clone/train_adapters.py`) runs **one** Kokoro `forward_with_tokens` per step on the live generator graph, then runs **one** WavLM forward on the generated audio (with grad) whose output is shared: the SLM discriminator receives **detached** features while mel, speaker, and SLM generator losses use the **grad-tracked** features for backward through adapters and GST (see §4 and §6 for shapes and optimizer order).
 
 ---
 
@@ -131,12 +131,13 @@ with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.5**, **λ_slm = 0.05
 
 ### 5.4 Numerical safeguard: ISTFTNet exp clamping
 
-The `Generator` in `kokoro/kokoro/istftnet.py` converts log-magnitude to linear magnitude via `torch.exp()` before the inverse STFT. To prevent overflow (especially under AMP fp16 where `exp(x)` overflows for x > ~11), the exponent input is clamped: `torch.exp(x.clamp(max=30.0))`. This cap is well above any physically meaningful audio magnitude and prevents NaN propagation during early training when adapter perturbations or random style vectors may produce extreme `conv_post` outputs.
+The `Generator` in `kokoro/kokoro/istftnet.py` converts log-magnitude to linear magnitude via `torch.exp()` before the inverse STFT. To prevent overflow (especially under AMP fp16 where `exp(x)` overflows for x > ~11), the exponent input is clamped: `torch.exp(x.clamp(max=15.0))`. `exp(15) ≈ 3.27 M` is well above any physically meaningful STFT magnitude for 24 kHz audio. The conservative cap also limits backward gradient amplification through the exp (compared to a naïve `max=30`, the maximum gradient is reduced by a factor of ~3.3 × 10⁹), which matters during early training when adapter perturbations or random style vectors may produce extreme `conv_post` outputs.
 
 ---
 
 ## 6. Optimization and training loop
 
+- **Frozen Kokoro in eval() mode**: `freeze_kokoro_except_adapters` calls `kmodel.eval()` globally. This deactivates `nn.Dropout` in frozen `TextEncoder` CNN blocks (p=0.2) and `AdainResBlk1d` F0/N/decoder blocks (p=0.1), removing stochastic noise from the frozen path. The trainable L-adapters (`ResidualAdapter`) contain no dropout or batchnorm, so eval() is safe for them.
 - **Generator trainable parameters**: SegmentGST + all Kokoro L-adapters (duration, decoder, generator).
 - **Discriminator trainable parameters**: `SLMFeatureDiscriminator` only.
 - **Optimizers**: **AdamW** for both; **lr_g = 1e-4**, **lr_d = 5e-5** (TTUR — Two Time-scale Update Rule: the discriminator learns at half the generator rate to prevent D from overpowering G early in training); **weight_decay_g = weight_decay_d = 0** (defaults).
@@ -167,7 +168,7 @@ The training loop (`train_loop` in `voice_clone/train_adapters.py`) uses a two-l
   2. **For each micro-step** (N = `grad_accum_steps`):
      1. **WavLM ref** (`wavlm_ref`): reference **16 kHz** → frozen WavLM (no grad) → frame features + pooled x-vector; SegmentGST → `ref_s`.
      2. **Kokoro forward** (`kokoro_fwd`): `KModel.forward_with_tokens(input_ids, ref_s)` → `pred_wav` (**24 kHz**), under autocast when AMP is on.
-     3. **WavLM gen** (`wavlm_gen`): resample `pred_wav` **24 → 16 kHz**, one WavLM forward **with grad** (`grad_through_input=True`) → `wv_gen` (`WavLMSVOutput`). Computed **once**; the same output feeds both D and G losses.
+     3. **WavLM gen** (`wavlm_gen`): resample `pred_wav` **24 → 16 kHz**, one WavLM forward **with grad** (`grad_through_input=True`) → `wv_gen` (`WavLMSVOutput`). Computed **once**; the same output feeds both D and G losses. A **per-tensor gradient clamp hook** (max L2 norm `wavlm_grad_max_norm`, default **1.0**) is registered on `wv_gen.frame_hidden_states` and `wv_gen.pooled_embedding`, preventing extreme upstream gradients from being amplified through the 12-layer WavLM backward pass.
      4. **WavLM tgt** (`wavlm_tgt`): resample `tgt_24` **24 → 16 kHz**, `wavlm.frame_hidden_states(...)` **without grad** → `real_feats`, `real_mask`. Uses the optimized base-encoder-only path (skips the x-vector head).
      5. **D backward** (`disc`): if `global_step >= disc_start_step`, `slm_discriminator_backward` computes hinge loss on **detached** features and calls `.backward()` scaled by `1/N`.
      6. **G backward** (`gen_backward`): `generator_loss_backward` computes mel + speaker + conditional SLM losses, scales by `1/N`, and calls `.backward()`.
@@ -176,6 +177,10 @@ The training loop (`train_loop` in `voice_clone/train_adapters.py`) uses a two-l
   5. **LR scheduler step**: `sched_g.step()` every step; `sched_d.step()` only when `global_step > disc_start_step`.
 
 This gives **3 WavLM forward passes per micro-step** (ref, gen, tgt), because the generated-audio WavLM output is computed once and shared between D (detached) and G (with grad). Partial final accumulation (when the dataloader runs out mid-accumulation) still triggers the optimizer step on whatever gradients were accumulated.
+
+**NaN guard**: after each micro-step's generator losses, the loop checks all loss values with `np.isfinite`. If any component is NaN or Inf, the `nan_detected` flag is set, the remaining micro-steps are skipped, both optimizer gradients are zeroed, and `global_step` advances without an optimizer step. A `train/nan_skips` counter is logged to wandb when active. This prevents a single corrupted sample from poisoning the accumulated gradient.
+
+**Dataset-level audio validation** (`voice_clone/dataset.py`): `load_audio_mono` verifies `torch.isfinite(wav).all()` after resampling; non-finite samples raise `ValueError`. `VoiceCloneManifestDataset.__getitem__` enforces minimum durations: reference audio ≥ 4800 samples at 16 kHz (~0.3 s, enough WavLM frames for a meaningful speaker embedding) and target audio ≥ 4800 samples at 24 kHz (~0.2 s).
 
 - **SLM schedule**: **`slm_d_steps_per_g_step`** (default **1**) is how many **D** backward calls run within each micro-step.
 - **Kokoro inference timing**: `speed` default **1.0** (`TrainConfig.speed`), passed into `forward_with_tokens`.
@@ -206,6 +211,7 @@ Logging defaults: **`log_interval = 1`**, **`checkpoint_interval = 10000`**. Met
 | | `lr_d` | **5e-5** (TTUR) |
 | | `weight_decay_g`, `weight_decay_d` | **0** |
 | | `grad_clip_g`, `grad_clip_d` | **1.0** |
+| | `wavlm_grad_max_norm` | **1.0** (per-tensor hook on WavLM outputs) |
 | | `grad_accum_steps` | **8** |
 | Schedule | `warmup_steps` | **200** |
 | | `disc_start_step` | **500** (G-only warmup) |

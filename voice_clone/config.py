@@ -59,6 +59,7 @@ class TrainConfig:
     disc_start_step: int = 500
     slm_d_steps_per_g_step: int = 1
     speed: float = 1.0
+    wavlm_grad_max_norm: Optional[float] = 1.0
 
 
 def load_kokoro_config(repo_id: str) -> Dict[str, Any]:

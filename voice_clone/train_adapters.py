@@ -85,7 +85,7 @@ def _terminal_metrics_cr_line(global_step: int, metrics: Dict[str, float]) -> st
 
 
 def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
-    kmodel.train()
+    kmodel.eval()
     for p in kmodel.parameters():
         p.requires_grad_(False)
     enc = kmodel.predictor.text_encoder
@@ -116,6 +116,16 @@ def strip_weight_norm_frozen(model: nn.Module) -> None:
 
 def generator_trainable_parameters(kmodel: KModel, gst: SegmentGST) -> List[nn.Parameter]:
     return list(gst.parameters()) + [p for p in kmodel.parameters() if p.requires_grad]
+
+
+def _make_grad_clamp_hook(max_norm: float):
+    """Return a tensor ``register_hook`` callback that per-tensor norm-clamps incoming gradients."""
+    def _hook(grad: torch.Tensor) -> torch.Tensor:
+        norm = grad.norm()
+        if norm > max_norm:
+            return grad * (max_norm / norm)
+        return grad
+    return _hook
 
 
 def _ensure_batch_time(wav: torch.Tensor) -> torch.Tensor:
@@ -625,6 +635,7 @@ def train_loop(
                         "loss_slm_g": 0.0, "loss_d": 0.0,
                     }
                     micros_done = 0
+                    nan_detected = False
 
                     for _micro in range(cfg.grad_accum_steps):
                         if sw is not None:
@@ -672,6 +683,10 @@ def train_loop(
                             sw.start("wavlm_gen")
                         w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
                         wv_gen = wavlm(w_gen_16, sampling_rate=16_000, grad_through_input=True)
+                        if cfg.wavlm_grad_max_norm is not None:
+                            _clamp = _make_grad_clamp_hook(cfg.wavlm_grad_max_norm)
+                            wv_gen.frame_hidden_states.register_hook(_clamp)
+                            wv_gen.pooled_embedding.register_hook(_clamp)
                         if sw is not None:
                             sw.end("wavlm_gen", sync_cuda=True)
 
@@ -723,12 +738,36 @@ def train_loop(
                         if sw is not None:
                             sw.end("gen_backward", sync_cuda=True)
 
+                        if any(not np.isfinite(v) for v in g_metrics.values()):
+                            nan_detected = True
+                            warnings.warn(
+                                f"[step {global_step}] NaN/Inf in generator loss "
+                                f"(micro-step {_micro}); skipping this optimizer step.",
+                                RuntimeWarning,
+                                stacklevel=1,
+                            )
+                            break
+
                         for k in g_metrics:
                             micro_sums[k] += g_metrics[k]
                         micro_sums["loss_d"] += float(ld.detach()) if isinstance(ld, torch.Tensor) else float(ld)
 
                     if micros_done == 0:
                         break
+
+                    if nan_detected:
+                        opt_g.zero_grad(set_to_none=True)
+                        opt_d.zero_grad(set_to_none=True)
+                        if scaler is not None:
+                            scaler.update()
+                        if wandb_run is not None:
+                            wandb_run.log({"train/nan_skips": 1}, step=global_step)
+                        global_step += 1
+                        if pbar is not None:
+                            pbar.update(1)
+                        if max_steps is not None and global_step >= max_steps:
+                            break
+                        continue
 
                     # -- Deferred optimizer steps: unscale, clip, step --
                     if include_slm:

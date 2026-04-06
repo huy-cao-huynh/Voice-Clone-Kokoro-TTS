@@ -101,6 +101,8 @@ def load_audio_mono(path: Union[str, Path], *, target_sr: int) -> torch.Tensor:
     wav = wav.squeeze(0)
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav.unsqueeze(0), sr, target_sr).squeeze(0)
+    if not torch.isfinite(wav).all():
+        raise ValueError(f"Non-finite audio samples (NaN/Inf) in {path}")
     return wav
 
 
@@ -192,6 +194,19 @@ class VoiceCloneManifestDataset(Dataset):
 
         ref_wav = load_audio_mono(ref_path, target_sr=16_000)
         target_wav = load_audio_mono(tgt_path, target_sr=24_000)
+
+        MIN_REF_SAMPLES_16K = 4800  # ~0.3s at 16 kHz
+        MIN_TGT_SAMPLES_24K = 4800  # ~0.2s at 24 kHz
+        if ref_wav.shape[0] < MIN_REF_SAMPLES_16K:
+            raise ValueError(
+                f"Reference audio too short ({ref_wav.shape[0]} samples at 16 kHz, "
+                f"need >= {MIN_REF_SAMPLES_16K}): {ref_path}"
+            )
+        if target_wav.shape[0] < MIN_TGT_SAMPLES_24K:
+            raise ValueError(
+                f"Target audio too short ({target_wav.shape[0]} samples at 24 kHz, "
+                f"need >= {MIN_TGT_SAMPLES_24K}): {tgt_path}"
+            )
 
         if self._phoneme_cache is not None:
             phonemes = self._phoneme_cache[index]
