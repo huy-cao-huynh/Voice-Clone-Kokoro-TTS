@@ -15,6 +15,8 @@ BREAKDOWN_LABELS = (
     "h2d",
     "wavlm_ref",
     "kokoro_fwd",
+    "wavlm_gen",
+    "wavlm_tgt",
     "disc",
     "gen_backward",
     "wandb_log",

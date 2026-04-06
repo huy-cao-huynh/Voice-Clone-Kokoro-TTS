@@ -2,6 +2,8 @@
 # Voice-clone adapter training with Weights & Biases (WSL).
 # Usage: MANIFEST=/path/to/train.jsonl bash scripts/train_wandb.sh
 # Optional: MAX_STEPS=75 for a short smoke run (passed as --max-steps).
+# Optional: CKPT_DIR=/path/to/checkpoints → --ckpt-dir (periodic checkpoint saves).
+# Optional: RESUME=/path/to/checkpoint.pt → --resume (resume training from checkpoint).
 # Profiling: PROFILE_BREAKDOWN=1 for coarse step timers; TORCH_PROFILER_TRACE=./prof/trace.json for Chrome trace
 #   (use MAX_STEPS>=5 with breakdown, MAX_STEPS>=4 with torch profiler default schedule).
 
@@ -11,6 +13,8 @@ set -euo pipefail
 CONDA_ENV="${CONDA_ENV:-voice-kokoro}"                                  # your conda env name
 MANIFEST="${MANIFEST:-manifests/hi_train.jsonl}"                        # required: JSONL manifest path
 MANIFEST_ROOT="${MANIFEST_ROOT:-data/hi}"                               # optional: resolve relative paths in manifest
+CKPT_DIR="${CKPT_DIR:=ckpt}"                                            # optional: directory for training checkpoints
+RESUME="${RESUME:-}"                                                    # optional: checkpoint to resume from
 KOKORO_REPO="${KOKORO_REPO:-hexgrad/Kokoro-82M}"
 EPOCHS="${EPOCHS:-1}"
 MAX_STEPS="${MAX_STEPS:-20}"                                            # optional: e.g. 75 → --max-steps 75 (smoke runs)
@@ -57,6 +61,12 @@ CMD=(
 )
 if [[ -n "${MANIFEST_ROOT}" ]]; then
   CMD+=(--manifest-root "$MANIFEST_ROOT")
+fi
+if [[ -n "${CKPT_DIR}" ]]; then
+  CMD+=(--ckpt-dir "$CKPT_DIR")
+fi
+if [[ -n "${RESUME}" ]]; then
+  CMD+=(--resume "$RESUME")
 fi
 if [[ -n "${MAX_STEPS}" ]]; then
   CMD+=(--max-steps "$MAX_STEPS")

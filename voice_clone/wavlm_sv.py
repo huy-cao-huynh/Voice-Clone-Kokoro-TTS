@@ -366,20 +366,29 @@ class WavLMSV(nn.Module):
             )
         input_values, attention_mask = self._prepare_model_inputs(waveforms, sampling_rate)
         frame_mask = frame_mask_from_sample_mask(attention_mask, self.wavlm_xv.wavlm)
-        if grad_through_input:
-            out = self.wavlm_xv(
-                input_values,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            )
-        else:
-            with torch.no_grad():
+
+        if output_all_hidden_states:
+            if grad_through_input:
                 out = self.wavlm_xv(
                     input_values,
                     attention_mask=attention_mask,
                     output_hidden_states=True,
                 )
-        all_hs: Optional[Tuple[Tensor, ...]] = None
-        if output_all_hidden_states:
-            all_hs = out.hidden_states
-        return out.hidden_states[-1], frame_mask, all_hs
+            else:
+                with torch.no_grad():
+                    out = self.wavlm_xv(
+                        input_values,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                    )
+            return out.hidden_states[-1], frame_mask, out.hidden_states
+
+        # Optimized: base encoder only, skip TDNN x-vector head and
+        # avoid allocating all 13 layer hidden-state tensors.
+        base = self.wavlm_xv.wavlm
+        if grad_through_input:
+            out = base(input_values, attention_mask=attention_mask)
+        else:
+            with torch.no_grad():
+                out = base(input_values, attention_mask=attention_mask)
+        return out.last_hidden_state, frame_mask, None

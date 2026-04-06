@@ -32,7 +32,7 @@ from .losses import (
 )
 from .segment_gst import SegmentGST
 from .train_profiling import BreakdownAggregator, StepStopwatch, build_torch_profiler
-from .wavlm_sv import WavLMSV
+from .wavlm_sv import WavLMSV, WavLMSVOutput
 
 
 def _import_wandb():
@@ -101,6 +101,20 @@ def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
             p.requires_grad_(True)
 
 
+def strip_weight_norm_frozen(model: nn.Module) -> None:
+    """Bake weight_norm decompositions into static parameters.
+
+    Safe on frozen modules where the gradient-normalization benefit of
+    weight_norm is irrelevant, and removing it lets AMP autocast caching
+    work correctly on ROCm (avoids MIOpen 1-D fallback).
+    """
+    from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
+
+    for m in model.modules():
+        if is_parametrized(m, "weight"):
+            remove_parametrizations(m, "weight")
+
+
 def generator_trainable_parameters(kmodel: KModel, gst: SegmentGST) -> List[nn.Parameter]:
     return list(gst.parameters()) + [p for p in kmodel.parameters() if p.requires_grad]
 
@@ -163,6 +177,7 @@ def build_models(
     )
     kmodel = kmodel.to(device)
     freeze_kokoro_except_adapters(kmodel)
+    strip_weight_norm_frozen(kmodel)
 
     gst = SegmentGST(frame_dim=768, embed_dim=256, num_heads=8, ref_dim=256, style_dec_dim=128)
     gst = gst.to(device)
@@ -241,29 +256,19 @@ def load_checkpoint(
 
 def slm_discriminator_step(
     disc: SLMFeatureDiscriminator,
-    wavlm: WavLMSV,
     opt_d: torch.optim.Optimizer,
-    pred_wav_24k: torch.Tensor,
-    target_wav_24k: torch.Tensor,
+    fake_feats: torch.Tensor,
+    fake_mask: torch.Tensor,
+    real_feats: torch.Tensor,
+    real_mask: torch.Tensor,
     *,
     grad_clip: Optional[float],
     scaler: Optional[GradScaler],
     use_amp: bool,
 ) -> torch.Tensor:
-    """Train **D** on frozen WavLM features of real (target) vs fake (generated) 16 kHz audio."""
-    pred_wav_24k = pred_wav_24k.detach()
-    fake_w = resample_mono(pred_wav_24k, 24_000, 16_000)
-    real_w = resample_mono(target_wav_24k.detach(), 24_000, 16_000)
-
-    fake_feats, fake_mask, _ = wavlm.frame_hidden_states(
-        fake_w, sampling_rate=16_000, grad_through_input=False
-    )
-    real_feats, real_mask, _ = wavlm.frame_hidden_states(
-        real_w, sampling_rate=16_000, grad_through_input=False
-    )
-
+    """Train **D** on pre-computed WavLM features of real vs fake audio."""
     opt_d.zero_grad(set_to_none=True)
-    with _cuda_amp_context(use_amp, pred_wav_24k):
+    with _cuda_amp_context(use_amp, fake_feats):
         loss_d = slm_discriminator_loss_hinge(disc, real_feats, fake_feats, real_mask, fake_mask)
 
     if scaler is not None and use_amp:
@@ -284,7 +289,7 @@ def slm_discriminator_step(
 def generator_loss_backward_step(
     kmodel: KModel,
     gst: SegmentGST,
-    wavlm: WavLMSV,
+    wv_gen: WavLMSVOutput,
     disc: SLMFeatureDiscriminator,
     mel_loss_mod: MelReconstructionLoss,
     opt_g: torch.optim.Optimizer,
@@ -299,9 +304,11 @@ def generator_loss_backward_step(
 ) -> Dict[str, float]:
     """Mel + speaker + SLM generator losses, backward, and ``opt_g.step()`` from an existing ``pred_wav`` graph.
 
-    ``ref_pooled_detached`` must be ``wavlm(ref_16, ...).pooled_embedding.detach()`` from the same step as
-    ``pred_wav`` (one WavLM forward on reference audio). Generated audio uses a single WavLM forward for
-    both speaker cosine and SLM generator branches.
+    ``wv_gen`` is a pre-computed ``WavLMSVOutput`` from a single WavLM forward on the generated audio
+    (with ``grad_through_input=True``).  Its ``pooled_embedding`` feeds the speaker cosine loss and its
+    ``frame_hidden_states`` / ``frame_mask`` feed the SLM generator loss.
+
+    ``ref_pooled_detached`` must be ``wavlm(ref_16, ...).pooled_embedding.detach()`` from the same step.
 
     Caller must ``opt_g.zero_grad`` before the shared Kokoro forward and must not zero again before this runs.
     """
@@ -309,8 +316,6 @@ def generator_loss_backward_step(
         out_mel = mel_loss_mod(pred_wav, tgt_24)
         l_mel = out_mel.loss
 
-        w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
-        wv_gen = wavlm(w_gen_16, sampling_rate=16_000, grad_through_input=True)
         l_spk = speaker_cosine_loss(ref_pooled_detached, wv_gen.pooled_embedding)
 
         f_fake, m_fake = wv_gen.frame_hidden_states, wv_gen.frame_mask
@@ -365,21 +370,21 @@ def _caption_from_input_ids(input_ids: torch.Tensor, id_to_char: Dict[int, str],
     return s[:max_chars]
 
 
-def _log_wandb_epoch_audio_table(
+def _log_wandb_validation(
     wandb_run: Any,
     *,
     dataset: Dataset,
     kmodel: KModel,
     gst: SegmentGST,
     wavlm: WavLMSV,
+    mel_loss_mod: MelReconstructionLoss,
     cfg: TrainConfig,
     device: torch.device,
-    epoch: int,
     global_step: int,
     num_samples: int,
     vocab: Dict[str, int],
 ) -> None:
-    """Log a small wandb Table of pred vs target 24 kHz audio at epoch end (eval forward, no grad)."""
+    """Eval forward on the first ``num_samples`` items: ``val/*`` scalars and pred vs target audio table."""
     wb = _import_wandb()
     n = min(int(num_samples), len(dataset))
     if n <= 0:
@@ -393,6 +398,9 @@ def _log_wandb_epoch_audio_table(
     try:
         columns = ["idx", "caption", "pred_audio", "target_audio"]
         rows: List[List[Any]] = []
+        mel_l1_sum = 0.0
+        mel_l2_sum = 0.0
+        spk_sum = 0.0
         for i in range(n):
             sample = dataset[i]
             batch = collate_voice_clone_batch([sample])
@@ -410,6 +418,15 @@ def _log_wandb_epoch_audio_table(
                 pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
                 pred_wav = _ensure_batch_time(pred_wav)
 
+                out_mel = mel_loss_mod(pred_wav, tgt_24)
+                d = out_mel.mel_pred - out_mel.mel_target
+                mel_l1_sum += float(d.abs().mean().item())
+                mel_l2_sum += float((d**2).mean().item())
+
+                w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
+                wv_gen = wavlm(w_gen_16, sampling_rate=16_000, grad_through_input=False)
+                spk_sum += float(speaker_cosine_loss(wv_ref.pooled_embedding, wv_gen.pooled_embedding).item())
+
             pred_np = pred_wav.squeeze(0).detach().float().cpu().numpy().astype(np.float32)
             tgt_np = tgt_24.squeeze(0).detach().float().cpu().numpy().astype(np.float32)
             sr = 24_000
@@ -421,8 +438,17 @@ def _log_wandb_epoch_audio_table(
                     wb.Audio(tgt_np, sample_rate=sr),
                 ]
             )
+        inv_n = 1.0 / float(n)
         table = wb.Table(columns=columns, data=rows)
-        wandb_run.log({f"epoch_audio/epoch_{epoch + 1}": table}, step=global_step)
+        wandb_run.log(
+            {
+                "val/mel_l1": mel_l1_sum * inv_n,
+                "val/mel_l2": mel_l2_sum * inv_n,
+                "val/speaker_loss": spk_sum * inv_n,
+                "val/audio_samples": table,
+            },
+            step=global_step,
+        )
     finally:
         kmodel.train(prev_k_train)
         gst.train(prev_g_train)
@@ -550,15 +576,32 @@ def train_loop(
                             sw.end("kokoro_fwd", sync_cuda=True)
 
                     if sw is not None:
+                        sw.start("wavlm_gen")
+                    w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
+                    wv_gen = wavlm(w_gen_16, sampling_rate=16_000, grad_through_input=True)
+                    if sw is not None:
+                        sw.end("wavlm_gen", sync_cuda=True)
+
+                    if sw is not None:
+                        sw.start("wavlm_tgt")
+                    tgt_16 = resample_mono(tgt_24, 24_000, 16_000)
+                    real_feats, real_mask, _ = wavlm.frame_hidden_states(
+                        tgt_16, sampling_rate=16_000, grad_through_input=False
+                    )
+                    if sw is not None:
+                        sw.end("wavlm_tgt", sync_cuda=True)
+
+                    if sw is not None:
                         sw.start("disc")
                     ld = torch.zeros((), device=device, dtype=torch.float32)
                     for _ in range(cfg.slm_d_steps_per_g_step):
                         ld = slm_discriminator_step(
                             disc,
-                            wavlm,
                             opt_d,
-                            pred_wav_24k=pred_wav.detach(),
-                            target_wav_24k=tgt_24,
+                            wv_gen.frame_hidden_states.detach(),
+                            wv_gen.frame_mask.detach(),
+                            real_feats,
+                            real_mask,
                             grad_clip=cfg.grad_clip_d,
                             scaler=scaler,
                             use_amp=cfg.use_amp,
@@ -571,7 +614,7 @@ def train_loop(
                     metrics = generator_loss_backward_step(
                         kmodel,
                         gst,
-                        wavlm,
+                        wv_gen,
                         disc,
                         mel_loss_mod,
                         opt_g,
@@ -596,6 +639,15 @@ def train_loop(
 
                     at_log_interval = global_step % cfg.log_interval == 0
                     at_max_stop = max_steps is not None and global_step >= max_steps
+                    is_periodic_step = global_step > 0 and global_step % cfg.checkpoint_interval == 0
+                    is_last_step = at_max_stop or (
+                        max_steps is None
+                        and expected_batches_per_epoch is not None
+                        and expected_batches_per_epoch > 0
+                        and epoch_idx == (epochs - 1)
+                        and batches_seen == expected_batches_per_epoch
+                    )
+                    should_save_and_validate = is_periodic_step or is_last_step
 
                     if at_log_interval or at_max_stop:
                         if pbar is not None:
@@ -632,17 +684,32 @@ def train_loop(
                             profile_agg.print_summary(skip_first_step=True)
                             sw = None
 
-                    if ckpt_dir is not None and global_step % cfg.checkpoint_interval == 0:
-                        save_checkpoint(
-                            ckpt_dir / f"checkpoint_{global_step}.pt",
-                            gst=gst,
-                            disc=disc,
-                            kmodel=kmodel,
-                            opt_g=opt_g,
-                            opt_d=opt_d,
-                            step=global_step,
-                            cfg=cfg,
-                        )
+                    if should_save_and_validate:
+                        if ckpt_dir is not None:
+                            save_checkpoint(
+                                ckpt_dir / f"checkpoint_{global_step}.pt",
+                                gst=gst,
+                                disc=disc,
+                                kmodel=kmodel,
+                                opt_g=opt_g,
+                                opt_d=opt_d,
+                                step=global_step,
+                                cfg=cfg,
+                            )
+                        if wandb_run is not None:
+                            _log_wandb_validation(
+                                wandb_run,
+                                dataset=dataloader.dataset,
+                                kmodel=kmodel,
+                                gst=gst,
+                                wavlm=wavlm,
+                                mel_loss_mod=mel_loss_mod,
+                                cfg=cfg,
+                                device=device,
+                                global_step=global_step,
+                                num_samples=wandb_num_samples,
+                                vocab=vocab,
+                            )
 
                     if prof is not None:
                         prof.step()
@@ -662,19 +729,6 @@ def train_loop(
             if wandb_run is not None and epoch_count > 0 and full_epoch:
                 mean_payload = {f"epoch/mean_{k}": epoch_sums[k] / epoch_count for k in epoch_sums}
                 wandb_run.log(mean_payload, step=global_step)
-                _log_wandb_epoch_audio_table(
-                    wandb_run,
-                    dataset=dataloader.dataset,
-                    kmodel=kmodel,
-                    gst=gst,
-                    wavlm=wavlm,
-                    cfg=cfg,
-                    device=device,
-                    epoch=epoch_idx,
-                    global_step=global_step,
-                    num_samples=wandb_num_samples,
-                    vocab=vocab,
-                )
 
             if max_steps is not None and global_step >= max_steps:
                 return
