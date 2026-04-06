@@ -342,7 +342,7 @@ class Generator(nn.Module):
                 x = self.adapters[i](x, z_style)
         x = F.leaky_relu(x)
         x = self.conv_post(x)
-        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
+        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :].clamp(max=30.0))
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
         return self.stft.inverse(spec, phase)
 

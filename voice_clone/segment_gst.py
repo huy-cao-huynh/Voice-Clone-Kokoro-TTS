@@ -72,6 +72,8 @@ class SegmentGST(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
         self.to_ref_s = nn.Linear(embed_dim, ref_dim)
+        nn.init.zeros_(self.to_ref_s.weight)
+        nn.init.zeros_(self.to_ref_s.bias)
 
     def forward(
         self,

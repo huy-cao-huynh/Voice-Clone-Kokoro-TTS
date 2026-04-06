@@ -53,6 +53,7 @@ class TrainConfig:
     # How often to log to W&B and refresh training metrics in the terminal (tqdm postfix or one-line \r).
     log_interval: int = 1
     checkpoint_interval: int = 10_000
+    warmup_steps: int = 200
     slm_d_steps_per_g_step: int = 1
     speed: float = 1.0
 

@@ -74,8 +74,7 @@ def _configure_training_warnings() -> None:
 
 def _terminal_metrics_cr_line(global_step: int, metrics: Dict[str, float]) -> str:
     """Single-line status padded for carriage-return overwrite (no tqdm)."""
-    parts = [f"step {global_step}"] + [f"{k}={v:.4f}" for k, v in metrics.items()]
-    line = " ".join(parts)
+    line = f"step {global_step} loss_g={metrics['loss_g']:.4f}"
     try:
         width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns - 1)
     except OSError:
@@ -277,7 +276,6 @@ def slm_discriminator_step(
         if grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
         scaler.step(opt_d)
-        scaler.update()
     else:
         loss_d.backward()
         if grad_clip is not None:
@@ -334,7 +332,6 @@ def generator_loss_backward_step(
             params = generator_trainable_parameters(kmodel, gst)
             torch.nn.utils.clip_grad_norm_(params, grad_clip)
         scaler.step(opt_g)
-        scaler.update()
     else:
         loss_g.backward()
         if grad_clip is not None:
@@ -476,10 +473,26 @@ def train_loop(
     opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d, weight_decay=cfg.weight_decay_d)
     scaler: Optional[GradScaler] = GradScaler("cuda", enabled=cfg.use_amp) if device.type == "cuda" else None
 
+    sched_g: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+    sched_d: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+    if cfg.warmup_steps > 0:
+        sched_g = torch.optim.lr_scheduler.LinearLR(
+            opt_g, start_factor=1e-3, end_factor=1.0, total_iters=cfg.warmup_steps,
+        )
+        sched_d = torch.optim.lr_scheduler.LinearLR(
+            opt_d, start_factor=1e-3, end_factor=1.0, total_iters=cfg.warmup_steps,
+        )
+
     step = 0
     if resume is not None:
         step = load_checkpoint(resume, gst=gst, disc=disc, kmodel=kmodel, opt_g=opt_g, opt_d=opt_d, device=device)
         print(f"Resumed step {step} from {resume}")
+        if sched_g is not None:
+            for _ in range(step):
+                sched_g.step()
+        if sched_d is not None:
+            for _ in range(step):
+                sched_d.step()
 
     global_step = step
     try:
@@ -628,7 +641,16 @@ def train_loop(
                     )
                     if sw is not None:
                         sw.end("gen_backward", sync_cuda=True)
+
+                    if scaler is not None:
+                        scaler.update()
+
                     metrics["loss_d"] = float(ld.detach()) if isinstance(ld, torch.Tensor) else float(ld)
+
+                    if sched_g is not None:
+                        sched_g.step()
+                    if sched_d is not None:
+                        sched_d.step()
 
                     epoch_count += 1
                     for k in epoch_sums:
@@ -651,30 +673,23 @@ def train_loop(
 
                     if at_log_interval or at_max_stop:
                         if pbar is not None:
-                            postfix: Dict[str, Any] = {"step": global_step}
-                            postfix.update({k: round(float(v), 4) for k, v in metrics.items()})
-                            pbar.set_postfix(**postfix, refresh=True)
+                            pbar.set_postfix(step=global_step, loss_g=round(float(metrics["loss_g"]), 4), refresh=True)
                         else:
                             sys.stdout.write("\r" + _terminal_metrics_cr_line(global_step, metrics))
                             sys.stdout.flush()
                         if wandb_run is not None:
                             if sw is not None:
                                 sw.start("wandb_log")
-                            w = cfg.loss_weights
-                            wandb_run.log(
-                                {
+                            log_payload = {
                                     "train/loss_g": metrics["loss_g"],
                                     "train/loss_mel": metrics["loss_mel"],
                                     "train/loss_spk": metrics["loss_spk"],
                                     "train/loss_slm_g": metrics["loss_slm_g"],
                                     "train/loss_d": metrics["loss_d"],
-                                    "train/weighted_mel": w.lambda_mel * metrics["loss_mel"],
-                                    "train/weighted_spk": w.lambda_spk * metrics["loss_spk"],
-                                    "train/weighted_slm": w.lambda_slm * metrics["loss_slm_g"],
                                     "train/epoch": float(epoch_idx + 1),
-                                },
-                                step=global_step,
-                            )
+                                    "train/lr_g": opt_g.param_groups[0]["lr"],
+                            }
+                            wandb_run.log(log_payload, step=global_step)
                             if sw is not None:
                                 sw.end("wandb_log", sync_cuda=False)
 
@@ -860,7 +875,7 @@ def main() -> None:
         _run_training(args, device=device, cfg=cfg, wandb_run=wandb_run)
     finally:
         if wandb_run is not None:
-            wandb_run.finish()
+            wandb_run.Settings(quiet=True)
 
 
 def _run_training(

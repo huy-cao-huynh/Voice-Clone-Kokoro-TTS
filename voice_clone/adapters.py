@@ -16,6 +16,8 @@ class ResidualAdapter(nn.Module):
         super().__init__()
         self.down = nn.Linear(hidden_dim + style_dim, bottleneck_dim)
         self.up = nn.Linear(bottleneck_dim, hidden_dim)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
 
     def forward(self, h: torch.Tensor, z_style: torch.Tensor) -> torch.Tensor:
         b, _, t = h.shape

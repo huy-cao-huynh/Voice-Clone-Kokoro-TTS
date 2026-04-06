@@ -29,7 +29,7 @@ Implemented in `voice_clone/segment_gst.py`.
 - **Attention**: `nn.MultiheadAttention` with **8 heads**, `batch_first=True`, **keys/values = bank** (expanded per batch). Frame validity is **not** passed as `key_padding_mask`; invalid frames are zeroed out **after** MHA via masked mean pooling.
 - **Post-MHA**: `LayerNorm(256)`, `Dropout(0.1)`.
 - **Pooling**: mask-weighted mean over time → **(B, 256)** `pooled_style`.
-- **Readout**: `Linear(256 → 256)` → **`ref_s`** **(B, 256)**.
+- **Readout**: `Linear(256 → 256)` → **`ref_s`** **(B, 256)**, **zero-initialized** (weight and bias) so `ref_s` starts as a zero vector (neutral AdaIN conditioning) rather than random noise.
 - **Kokoro split** (matches `KModel.forward_with_tokens`):
   - `ref_s[:, :128]` → **decoder AdaIN** style `s` (timbre / decoder conditioning).
   - `ref_s[:, 128:]` → **prosody** path as `s` into duration/F0/N blocks (`style_dim=128` in Kokoro `config.json`).
@@ -67,7 +67,7 @@ h' = h + W_{\text{up}}\bigl(\mathrm{ReLU}(W_{\text{down}}([h \,\|\, z_{\text{sty
 with `h` **(B, C, T)** and `z_style` **(B, 256)** broadcast along **T**. Per adapter:
 
 - `W_down`: **Linear(C + 256 → 64)** (`adapter_bottleneck=64` from `TrainConfig`).
-- `W_up`: **Linear(64 → C)**.
+- `W_up`: **Linear(64 → C)**, **zero-initialized** (weight and bias) so the adapter starts as identity and the pretrained Kokoro behavior is preserved at step 0.
 
 ### 3.2 Where adapters attach (block-level)
 
@@ -129,6 +129,10 @@ with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.1**, **λ_slm = 0.05
 
 **Discriminator hyperparameters** (`SLMDiscriminatorConfig`): `hidden_channels=256`, `num_layers=4`, `kernel_size=7`.
 
+### 5.4 Numerical safeguard: ISTFTNet exp clamping
+
+The `Generator` in `kokoro/kokoro/istftnet.py` converts log-magnitude to linear magnitude via `torch.exp()` before the inverse STFT. To prevent overflow (especially under AMP fp16 where `exp(x)` overflows for x > ~11), the exponent input is clamped: `torch.exp(x.clamp(max=30.0))`. This cap is well above any physically meaningful audio magnitude and prevents NaN propagation during early training when adapter perturbations or random style vectors may produce extreme `conv_post` outputs.
+
 ---
 
 ## 6. Optimization and training loop
@@ -137,7 +141,8 @@ with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.1**, **λ_slm = 0.05
 - **Discriminator trainable parameters**: `SLMFeatureDiscriminator` only.
 - **Optimizers**: **AdamW** for both; **lr_g = lr_d = 1e-4**; **weight_decay_g = weight_decay_d = 0** (defaults).
 - **Gradient clipping**: **1.0** L2 norm on generator params and on discriminator params when not `None` (`grad_clip_g`, `grad_clip_d`).
-- **AMP**: optional CUDA autocast + `GradScaler` when `TrainConfig.use_amp=True` (default **False**).
+- **AMP**: optional CUDA autocast + `GradScaler` when `TrainConfig.use_amp=True` (default **False**). A single `scaler.update()` is called once per step after both D and G optimizer steps, per PyTorch best practice for multi-optimizer AMP.
+- **Learning rate warmup**: `LinearLR` scheduler ramps both `opt_g` and `opt_d` from `1e-3 × lr` to full `lr` over `warmup_steps` (default **200**). When resuming from a checkpoint, schedulers are fast-forwarded to match the resumed step.
 - **Weight-norm stripping**: `strip_weight_norm_frozen` bakes `weight_norm` decompositions in frozen Kokoro `ConvTranspose1d` layers into static parameters at model-build time, avoiding AMP autocast cache misses on ROCm. Safe because the Kokoro model is frozen (`requires_grad=False`).
 - **Per-step order** (`train_loop` in `voice_clone/train_adapters.py`):
   1. **`opt_g.zero_grad`** once.
@@ -147,13 +152,15 @@ with defaults `LossWeights`: **λ_mel = 1.0**, **λ_spk = 0.1**, **λ_slm = 0.05
   5. **WavLM tgt** (`wavlm_tgt`): resample `tgt_24` **24 → 16 kHz**, `wavlm.frame_hidden_states(...)` **without grad** → `real_feats`, `real_mask`. Uses the optimized base-encoder-only path (skips the x-vector head).
   6. **D step** (`disc`): **`slm_d_steps_per_g_step`** times — `slm_discriminator_step` receives **pre-computed, detached** feature tensors (`wv_gen.frame_hidden_states.detach()`, `real_feats`) instead of raw audio. `opt_d.zero_grad` inside.
   7. **G step** (`gen_backward`): `generator_loss_backward_step` receives the **grad-tracked** `wv_gen` directly — `wv_gen.pooled_embedding` for speaker loss, `wv_gen.frame_hidden_states` / `frame_mask` for SLM generator loss, plus mel loss on `pred_wav` vs `tgt_24`. Backward and **`opt_g.step()`** (no second Kokoro forward).
+  8. **`scaler.update()`** (AMP only): single call after both D and G steps.
+  9. **LR scheduler step**: `sched_g.step()` and `sched_d.step()` (during warmup phase).
 
 This gives **3 WavLM forward passes per step** (ref, gen, tgt) instead of the original 4, because the generated-audio WavLM output is computed once and shared between D (detached) and G (with grad).
 
 - **SLM schedule**: **`slm_d_steps_per_g_step`** (default **1**) is how many **D** updates run **after** the shared WavLM forwards and **before** each **G** update.
 - **Kokoro inference timing**: `speed` default **1.0** (`TrainConfig.speed`), passed into `forward_with_tokens`.
 
-Logging defaults: **`log_interval = 10`**, **`checkpoint_interval = 500`**.
+Logging defaults: **`log_interval = 1`**, **`checkpoint_interval = 10000`**.
 
 ---
 
@@ -177,10 +184,11 @@ Logging defaults: **`log_interval = 10`**, **`checkpoint_interval = 500`**.
 | Optim | `lr_g`, `lr_d` | **1e-4** |
 | | `weight_decay_g`, `weight_decay_d` | **0** |
 | | `grad_clip_g`, `grad_clip_d` | **1.0** |
-| Schedule | `slm_d_steps_per_g_step` | **1** |
+| Schedule | `warmup_steps` | **200** |
+| | `slm_d_steps_per_g_step` | **1** |
 | | `speed` | **1.0** |
 | Run | `use_amp` | **False** |
-| | `log_interval` | **10** |
-| | `checkpoint_interval` | **500** |
+| | `log_interval` | **1** |
+| | `checkpoint_interval` | **10000** |
 
 CLI overrides (e.g. `--kokoro-repo`, `--amp`) patch `TrainConfig` in `voice_clone/train_adapters.py` and should be treated as run-time changes to the table above.
