@@ -12,7 +12,7 @@ from huggingface_hub import hf_hub_download
 @dataclass
 class LossWeights:
     lambda_mel: float = 1.0
-    lambda_spk: float = 0.5
+    lambda_spk: float = 1.0
     lambda_slm: float = 0.05
 
 
@@ -53,13 +53,15 @@ class TrainConfig:
     use_amp: bool = False
     # How often to log to W&B and refresh training metrics in the terminal (tqdm postfix or one-line \r).
     log_interval: int = 1
-    checkpoint_interval: int = 10_000
-    warmup_steps: int = 200
+    checkpoint_interval: int = 1000
+    warmup_steps: int = 50
     grad_accum_steps: int = 8
     disc_start_step: int = 500
     slm_d_steps_per_g_step: int = 1
     speed: float = 1.0
     wavlm_grad_max_norm: Optional[float] = 1.0
+    lr_min_g: float = 1e-6
+    lr_min_d: float = 1e-7
 
 
 def load_kokoro_config(repo_id: str) -> Dict[str, Any]:

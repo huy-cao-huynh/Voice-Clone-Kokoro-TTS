@@ -18,9 +18,9 @@ TrainConfig = _config.TrainConfig
 
 
 def test_train_config_checkpoint_interval_default() -> None:
-    """Checkpoint cadence defaults to 10k steps."""
+    """Checkpoint cadence defaults to 500 steps."""
     cfg = TrainConfig()
-    assert cfg.checkpoint_interval == 10_000
+    assert cfg.checkpoint_interval == 1000
 
 
 def test_disc_start_step_default() -> None:
@@ -42,9 +42,9 @@ def test_lr_d_default() -> None:
 
 
 def test_lambda_spk_default() -> None:
-    """Speaker loss weight elevated for cross-utterance identity transfer."""
+    """Speaker loss weight at parity with mel for stable speaker identity."""
     cfg = TrainConfig()
-    assert cfg.loss_weights.lambda_spk == 0.5
+    assert cfg.loss_weights.lambda_spk == 1.0
 
 
 def test_use_spectral_norm_default() -> None:

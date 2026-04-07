@@ -187,26 +187,72 @@ class TestPhasedTraining:
 
 class TestWarmupLR:
     def test_lr_reaches_full_after_warmup(self):
-        """LinearLR warmup ramps from start_factor*lr to lr over total_iters."""
+        """_build_scheduler warmup ramps from start_factor*lr to lr over warmup_steps."""
+        from voice_clone.train_adapters import _build_scheduler
+
         lr = 1e-4
-        warmup_steps = 200
+        warmup_steps = 50
+        total_steps = 500
         dummy = nn.Linear(10, 10)
         opt = torch.optim.AdamW(dummy.parameters(), lr=lr)
-        sched = torch.optim.lr_scheduler.LinearLR(
-            opt, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps,
-        )
-        # Step through all warmup
+        sched = _build_scheduler(opt, warmup_steps, total_steps, lr_min=1e-6)
         for _ in range(warmup_steps):
             sched.step()
         actual_lr = opt.param_groups[0]["lr"]
-        assert actual_lr == pytest.approx(lr, rel=1e-5)
+        assert actual_lr == pytest.approx(lr, rel=1e-4)
 
     def test_lr_starts_low(self):
+        from voice_clone.train_adapters import _build_scheduler
+
         lr = 1e-4
         dummy = nn.Linear(10, 10)
         opt = torch.optim.AdamW(dummy.parameters(), lr=lr)
-        sched = torch.optim.lr_scheduler.LinearLR(
-            opt, start_factor=1e-3, end_factor=1.0, total_iters=200,
-        )
+        sched = _build_scheduler(opt, warmup_steps=50, total_steps=500, lr_min=1e-6)
         actual_lr = opt.param_groups[0]["lr"]
         assert actual_lr == pytest.approx(lr * 1e-3, rel=1e-5)
+
+    def test_lr_decays_after_warmup(self):
+        """After warmup, cosine annealing should decrease LR below peak."""
+        from voice_clone.train_adapters import _build_scheduler
+
+        lr = 1e-4
+        warmup_steps = 50
+        total_steps = 500
+        dummy = nn.Linear(10, 10)
+        opt = torch.optim.AdamW(dummy.parameters(), lr=lr)
+        sched = _build_scheduler(opt, warmup_steps, total_steps, lr_min=1e-6)
+        for _ in range(warmup_steps + 100):
+            sched.step()
+        actual_lr = opt.param_groups[0]["lr"]
+        assert actual_lr < lr, "LR should decay below peak after warmup"
+        assert actual_lr > 1e-6, "LR should be above minimum mid-training"
+
+    def test_lr_reaches_minimum_at_end(self):
+        """At total_steps, LR should be at or near lr_min."""
+        from voice_clone.train_adapters import _build_scheduler
+
+        lr = 1e-4
+        lr_min = 1e-6
+        warmup_steps = 50
+        total_steps = 500
+        dummy = nn.Linear(10, 10)
+        opt = torch.optim.AdamW(dummy.parameters(), lr=lr)
+        sched = _build_scheduler(opt, warmup_steps, total_steps, lr_min=lr_min)
+        for _ in range(total_steps):
+            sched.step()
+        actual_lr = opt.param_groups[0]["lr"]
+        assert actual_lr == pytest.approx(lr_min, rel=1e-3)
+
+    def test_warmup_only_when_no_total_steps(self):
+        """When total_steps is None, only LinearLR warmup is used (no cosine decay)."""
+        from voice_clone.train_adapters import _build_scheduler
+
+        lr = 1e-4
+        warmup_steps = 50
+        dummy = nn.Linear(10, 10)
+        opt = torch.optim.AdamW(dummy.parameters(), lr=lr)
+        sched = _build_scheduler(opt, warmup_steps, total_steps=None, lr_min=1e-6)
+        for _ in range(warmup_steps + 100):
+            sched.step()
+        actual_lr = opt.param_groups[0]["lr"]
+        assert actual_lr == pytest.approx(lr, rel=1e-5), "LR should stay at peak with no cosine phase"

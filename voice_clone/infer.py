@@ -116,6 +116,7 @@ def infer_waveform(
         gst_out, _ = gst(wv.frame_hidden_states, wv.frame_mask)
         ref_s = gst_out.ref_s
         audio, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=sp)
+        audio = audio.clamp(-1.0, 1.0)
     return audio.squeeze(0).detach().float().cpu()
 
 

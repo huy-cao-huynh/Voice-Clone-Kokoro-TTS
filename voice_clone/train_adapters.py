@@ -85,7 +85,8 @@ def _terminal_metrics_cr_line(global_step: int, metrics: Dict[str, float]) -> st
 
 
 def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
-    kmodel.eval()
+    # Keep training mode for MIOpen RNN backward; freezing is controlled by requires_grad.
+    kmodel.train()
     for p in kmodel.parameters():
         p.requires_grad_(False)
     enc = kmodel.predictor.text_encoder
@@ -112,6 +113,28 @@ def strip_weight_norm_frozen(model: nn.Module) -> None:
     for m in model.modules():
         if is_parametrized(m, "weight"):
             remove_parametrizations(m, "weight")
+
+
+def _build_scheduler(
+    opt: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: Optional[int],
+    lr_min: float,
+    *,
+    start_factor: float = 1e-3,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """LinearLR warmup, then CosineAnnealingLR decay when *total_steps* is known."""
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        opt, start_factor=start_factor, end_factor=1.0, total_iters=warmup_steps,
+    )
+    if total_steps is not None and total_steps > warmup_steps:
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=total_steps - warmup_steps, eta_min=lr_min,
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            opt, schedulers=[warmup, cosine], milestones=[warmup_steps],
+        )
+    return warmup
 
 
 def generator_trainable_parameters(kmodel: KModel, gst: SegmentGST) -> List[nn.Parameter]:
@@ -216,6 +239,8 @@ def save_checkpoint(
     opt_d: torch.optim.Optimizer,
     step: int,
     cfg: TrainConfig,
+    scaler_g: Optional[GradScaler] = None,
+    scaler_d: Optional[GradScaler] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: Dict[str, Any] = {
@@ -234,6 +259,8 @@ def save_checkpoint(
         else None,
         "optimizer_g": opt_g.state_dict(),
         "optimizer_d": opt_d.state_dict(),
+        "scaler_g": scaler_g.state_dict() if scaler_g is not None else None,
+        "scaler_d": scaler_d.state_dict() if scaler_d is not None else None,
     }
     torch.save(payload, path)
 
@@ -247,10 +274,12 @@ def load_checkpoint(
     opt_g: torch.optim.Optimizer,
     opt_d: torch.optim.Optimizer,
     device: torch.device,
+    scaler_g: Optional[GradScaler] = None,
+    scaler_d: Optional[GradScaler] = None,
 ) -> int:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     gst.load_state_dict(ckpt["segment_gst"])
-    disc.load_state_dict(ckpt["slm_discriminator"], strict=False)
+    disc.load_state_dict(ckpt["slm_discriminator"])
     if ckpt.get("duration_adapters") and kmodel.predictor.text_encoder.adapters is not None:
         kmodel.predictor.text_encoder.adapters.load_state_dict(ckpt["duration_adapters"])
     if ckpt.get("decoder_adapters") and kmodel.decoder.decoder_adapters is not None:
@@ -261,6 +290,10 @@ def load_checkpoint(
         opt_g.load_state_dict(ckpt["optimizer_g"])
     if ckpt.get("optimizer_d"):
         opt_d.load_state_dict(ckpt["optimizer_d"])
+    if ckpt.get("scaler_g") and scaler_g is not None:
+        scaler_g.load_state_dict(ckpt["scaler_g"])
+    if ckpt.get("scaler_d") and scaler_d is not None:
+        scaler_d.load_state_dict(ckpt["scaler_d"])
     return int(ckpt.get("step", 0))
 
 
@@ -452,10 +485,12 @@ def _log_wandb_validation(
     global_step: int,
     num_samples: int,
     vocab: Dict[str, int],
+    val_dataset: Optional[Dataset] = None,
 ) -> None:
     """Eval forward on the first ``num_samples`` items: ``val/*`` scalars and pred vs target audio table."""
     wb = _import_wandb()
-    n = min(int(num_samples), len(dataset))
+    eval_ds = val_dataset if val_dataset is not None else dataset
+    n = min(int(num_samples), len(eval_ds))
     if n <= 0:
         return
 
@@ -471,7 +506,7 @@ def _log_wandb_validation(
         mel_l2_sum = 0.0
         spk_sum = 0.0
         for i in range(n):
-            sample = dataset[i]
+            sample = eval_ds[i]
             batch = collate_voice_clone_batch([sample])
             ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(device))
             tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(device))
@@ -486,6 +521,7 @@ def _log_wandb_validation(
                 ref_s = gst_out.ref_s
                 pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
                 pred_wav = _ensure_batch_time(pred_wav)
+                pred_wav = pred_wav.clamp(-1.0, 1.0)
 
                 out_mel = mel_loss_mod(pred_wav, tgt_24)
                 d = out_mel.mel_pred - out_mel.mel_target
@@ -537,27 +573,41 @@ def train_loop(
     profile_breakdown: bool = False,
     profile_breakdown_steps: int = 3,
     torch_profiler_trace: Optional[Path] = None,
+    val_dataset: Optional[Dataset] = None,
 ) -> None:
     kmodel, gst, wavlm, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
     vocab: Dict[str, int] = kokoro_cfg["vocab"]
     params_g = generator_trainable_parameters(kmodel, gst)
     opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g, weight_decay=cfg.weight_decay_g)
     opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d, weight_decay=cfg.weight_decay_d)
-    scaler: Optional[GradScaler] = GradScaler("cuda", enabled=cfg.use_amp) if device.type == "cuda" else None
+    scaler_g: Optional[GradScaler] = GradScaler("cuda", enabled=cfg.use_amp) if device.type == "cuda" else None
+    scaler_d: Optional[GradScaler] = GradScaler("cuda", enabled=cfg.use_amp) if device.type == "cuda" else None
+
+    try:
+        expected_batches_per_epoch = len(dataloader)
+    except TypeError:
+        expected_batches_per_epoch = None
+
+    # Compute total effective steps for scheduler horizon.
+    total_steps_g: Optional[int] = max_steps
+    if total_steps_g is None and expected_batches_per_epoch is not None:
+        total_steps_g = -(-expected_batches_per_epoch // cfg.grad_accum_steps) * epochs
+    total_steps_d: Optional[int] = None
+    if total_steps_g is not None:
+        total_steps_d = max(0, total_steps_g - cfg.disc_start_step)
 
     sched_g: Optional[torch.optim.lr_scheduler.LRScheduler] = None
     sched_d: Optional[torch.optim.lr_scheduler.LRScheduler] = None
-    if cfg.warmup_steps > 0:
-        sched_g = torch.optim.lr_scheduler.LinearLR(
-            opt_g, start_factor=1e-3, end_factor=1.0, total_iters=cfg.warmup_steps,
-        )
-        sched_d = torch.optim.lr_scheduler.LinearLR(
-            opt_d, start_factor=1e-3, end_factor=1.0, total_iters=cfg.warmup_steps,
-        )
+    if cfg.warmup_steps > 0 or total_steps_g is not None:
+        sched_g = _build_scheduler(opt_g, cfg.warmup_steps, total_steps_g, cfg.lr_min_g)
+        sched_d = _build_scheduler(opt_d, cfg.warmup_steps, total_steps_d, cfg.lr_min_d)
 
     step = 0
     if resume is not None:
-        step = load_checkpoint(resume, gst=gst, disc=disc, kmodel=kmodel, opt_g=opt_g, opt_d=opt_d, device=device)
+        step = load_checkpoint(
+            resume, gst=gst, disc=disc, kmodel=kmodel, opt_g=opt_g, opt_d=opt_d,
+            device=device, scaler_g=scaler_g, scaler_d=scaler_d,
+        )
         print(f"Resumed step {step} from {resume}")
         if sched_g is not None:
             for _ in range(step):
@@ -568,10 +618,6 @@ def train_loop(
                 sched_d.step()
 
     global_step = step
-    try:
-        expected_batches_per_epoch = len(dataloader)
-    except TypeError:
-        expected_batches_per_epoch = None
 
     try:
         from tqdm.auto import tqdm as _tqdm_cls
@@ -676,6 +722,7 @@ def train_loop(
                                 sw.start("kokoro_fwd")
                             pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
                             pred_wav = _ensure_batch_time(pred_wav)
+                            pred_wav = pred_wav.clamp(-1.0, 1.0)
                             if sw is not None:
                                 sw.end("kokoro_fwd", sync_cuda=True)
 
@@ -710,7 +757,7 @@ def train_loop(
                                     wv_gen.frame_mask.detach(),
                                     real_feats,
                                     real_mask,
-                                    scaler=scaler,
+                                    scaler=scaler_d,
                                     use_amp=cfg.use_amp,
                                     scale_factor=inv_accum,
                                 )
@@ -730,7 +777,7 @@ def train_loop(
                             wv_ref.pooled_embedding.detach(),
                             tgt_24,
                             cfg.loss_weights,
-                            scaler=scaler,
+                            scaler=scaler_g,
                             use_amp=cfg.use_amp,
                             scale_factor=inv_accum,
                             include_slm=include_slm,
@@ -758,8 +805,8 @@ def train_loop(
                     if nan_detected:
                         opt_g.zero_grad(set_to_none=True)
                         opt_d.zero_grad(set_to_none=True)
-                        if scaler is not None:
-                            scaler.update()
+                        # Important: GradScaler.update() expects inf checks recorded via scaler.step(...).
+                        # When we skip the optimizer step entirely, there are no inf checks to consume.
                         if wandb_run is not None:
                             wandb_run.log({"train/nan_skips": 1}, step=global_step)
                         global_step += 1
@@ -770,35 +817,51 @@ def train_loop(
                         continue
 
                     # -- Deferred optimizer steps: unscale, clip, step --
+                    d_stepped = include_slm
                     if include_slm:
-                        if scaler is not None and cfg.use_amp:
-                            scaler.unscale_(opt_d)
+                        if scaler_d is not None and cfg.use_amp:
+                            scaler_d.unscale_(opt_d)
                         if cfg.grad_clip_d is not None:
                             torch.nn.utils.clip_grad_norm_(disc.parameters(), cfg.grad_clip_d)
-                        if scaler is not None and cfg.use_amp:
-                            scaler.step(opt_d)
+                        if scaler_d is not None and cfg.use_amp:
+                            scaler_d.step(opt_d)
                         else:
                             opt_d.step()
 
-                    if scaler is not None and cfg.use_amp:
-                        scaler.unscale_(opt_g)
+                    if scaler_g is not None and cfg.use_amp:
+                        scaler_g.unscale_(opt_g)
                     if cfg.grad_clip_g is not None:
                         torch.nn.utils.clip_grad_norm_(params_g, cfg.grad_clip_g)
-                    if scaler is not None and cfg.use_amp:
-                        scaler.step(opt_g)
+                    if scaler_g is not None and cfg.use_amp:
+                        scaler_g.step(opt_g)
                     else:
                         opt_g.step()
 
-                    if scaler is not None:
-                        scaler.update()
+                    g_stepped = True
+                    if scaler_g is not None and cfg.use_amp:
+                        _old_scale_g = float(scaler_g.get_scale())
+                        scaler_g.update()
+                        if float(scaler_g.get_scale()) < _old_scale_g:
+                            g_stepped = False
+                    elif scaler_g is not None:
+                        scaler_g.update()
+
+                    if include_slm:
+                        if scaler_d is not None and cfg.use_amp:
+                            _old_scale_d = float(scaler_d.get_scale())
+                            scaler_d.update()
+                            if float(scaler_d.get_scale()) < _old_scale_d:
+                                d_stepped = False
+                        elif scaler_d is not None:
+                            scaler_d.update()
 
                     global_step += 1
 
                     metrics = {k: v / micros_done for k, v in micro_sums.items()}
 
-                    if sched_g is not None:
+                    if sched_g is not None and g_stepped:
                         sched_g.step()
-                    if sched_d is not None and global_step > cfg.disc_start_step:
+                    if sched_d is not None and global_step > cfg.disc_start_step and d_stepped:
                         sched_d.step()
 
                     epoch_count += 1
@@ -863,6 +926,8 @@ def train_loop(
                                 opt_d=opt_d,
                                 step=global_step,
                                 cfg=cfg,
+                                scaler_g=scaler_g,
+                                scaler_d=scaler_d,
                             )
                         if wandb_run is not None:
                             _log_wandb_validation(
@@ -877,6 +942,7 @@ def train_loop(
                                 global_step=global_step,
                                 num_samples=wandb_num_samples,
                                 vocab=vocab,
+                                val_dataset=val_dataset,
                             )
 
                     if prof is not None:
@@ -921,6 +987,19 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Directory for resolving relative paths in the manifest (default: manifest file's parent).",
+    )
+    p.add_argument(
+        "--val-manifest",
+        type=Path,
+        default=None,
+        help="Optional JSONL validation manifest (same format as --manifest). When provided, "
+        "validation metrics and audio samples are computed from this set instead of the training set.",
+    )
+    p.add_argument(
+        "--val-manifest-root",
+        type=Path,
+        default=None,
+        help="Directory for resolving relative paths in the validation manifest (default: val manifest's parent).",
     )
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases (requires wandb package).")
     p.add_argument(
@@ -1011,6 +1090,7 @@ def main() -> None:
                 "profile_breakdown": args.profile_breakdown,
                 "profile_breakdown_steps": args.profile_breakdown_steps,
                 "torch_profiler_trace": str(args.torch_profiler_trace) if args.torch_profiler_trace else None,
+                "val_manifest": str(args.val_manifest) if args.val_manifest else None,
             }
         )
         init_kw: Dict[str, Any] = {
@@ -1047,7 +1127,17 @@ def _run_training(
         context_length=ctx,
         manifest_root=args.manifest_root,
     )
-    # num_workers>0 uses multiprocessing; on Windows that is spawn-based (extra startup cost vs Linux fork).
+
+    val_ds: Optional[Dataset] = None
+    if args.val_manifest is not None:
+        val_ds = VoiceCloneManifestDataset(
+            args.val_manifest,
+            kokoro_repo_id=cfg.kokoro_repo_id,
+            vocab=vocab,
+            context_length=ctx,
+            manifest_root=args.val_manifest_root,
+        )
+
     nw = args.num_workers
     dl = DataLoader(
         ds,
@@ -1071,6 +1161,7 @@ def _run_training(
         profile_breakdown=args.profile_breakdown,
         profile_breakdown_steps=args.profile_breakdown_steps,
         torch_profiler_trace=args.torch_profiler_trace,
+        val_dataset=val_ds,
     )
 
 

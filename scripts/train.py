@@ -19,6 +19,8 @@ Override any of them before invoking the script:
     NUM_WORKERS       auto                       dataloader workers (auto = cpu_count or 0 on Windows)
     WANDB_PROJECT     Voice-Clone-Kokoro-TTS
     WANDB_RUN_NAME    hi-train-<timestamp>
+    VAL_MANIFEST      manifests/hi_val.jsonl      validation JSONL manifest (skipped if missing)
+    VAL_MANIFEST_ROOT data/hi                    resolve relative val manifest paths
     PROFILE_BREAKDOWN       0                    1 to enable coarse step timers
     PROFILE_BREAKDOWN_STEPS 3                    steps before printing timing summary
     TORCH_PROFILER_TRACE    (empty)              path for Chrome trace JSON
@@ -51,11 +53,16 @@ def main() -> None:
     resume = os.environ.get("RESUME", "")
     kokoro_repo = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
     epochs = os.environ.get("EPOCHS", "1")
-    max_steps = os.environ.get("MAX_STEPS", "2000")
+    max_steps = os.environ.get("MAX_STEPS", "")
     device = os.environ.get("DEVICE", "cuda")
     num_workers = os.environ.get("NUM_WORKERS", str(_default_num_workers()))
     wandb_project = os.environ.get("WANDB_PROJECT", "Voice-Clone-Kokoro-TTS")
     wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"hi-train-{timestamp}")
+    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/hi_val.jsonl")
+    val_manifest_root = os.environ.get("VAL_MANIFEST_ROOT", "data/hi")
+    if val_manifest and not (REPO_ROOT / val_manifest).is_file():
+        val_manifest = ""
+        val_manifest_root = ""
     profile_breakdown = os.environ.get("PROFILE_BREAKDOWN", "0")
     profile_breakdown_steps = os.environ.get("PROFILE_BREAKDOWN_STEPS", "3")
     torch_profiler_trace = os.environ.get("TORCH_PROFILER_TRACE", "")
@@ -75,6 +82,10 @@ def main() -> None:
 
     if manifest_root:
         cmd += ["--manifest-root", manifest_root]
+    if val_manifest:
+        cmd += ["--val-manifest", val_manifest]
+    if val_manifest_root:
+        cmd += ["--val-manifest-root", val_manifest_root]
     if ckpt_dir:
         cmd += ["--ckpt-dir", ckpt_dir]
     if resume:
