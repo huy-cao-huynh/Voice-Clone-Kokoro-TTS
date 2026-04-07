@@ -35,7 +35,7 @@ def _zero_mean_unit_var_norm_torch(
     input_values: Tensor,
     attention_mask: Tensor,
     padding_value: float,
-    eps: float = 1e-5,
+    eps: float = 1e-7,
 ) -> Tensor:
     """Match Hugging Face `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm` (batched, differentiable)."""
     mask = attention_mask.to(dtype=input_values.dtype)
