@@ -1,4 +1,4 @@
-"""Train SegmentGST + Kokoro L-adapters + SLM discriminator (Kokoro and WavLM frozen)."""
+"""Train SegmentGST + Kokoro L-adapters + waveform discriminator (Kokoro and XLS-R frozen)."""
 
 from __future__ import annotations
 
@@ -25,14 +25,15 @@ from .config import LossWeights, MelLossConfig, TrainConfig, kokoro_vocab_and_co
 from .dataset import VoiceCloneManifestDataset, collate_voice_clone_batch
 from .losses import (
     MelReconstructionLoss,
-    SLMFeatureDiscriminator,
-    slm_discriminator_loss_hinge,
-    slm_generator_loss_hinge,
+    discriminator_loss_lsgan,
+    feature_matching_loss,
+    generator_loss_lsgan,
     speaker_cosine_loss,
 )
 from .segment_gst import SegmentGST
 from .train_profiling import BreakdownAggregator, StepStopwatch, build_torch_profiler
-from .wavlm_sv import WavLMSV, WavLMSVOutput
+from .xlsr_sv import XLSRSV, XLSRSVOutput
+from .discriminators.hifigan import HiFiGANMPDMSDDiscriminator
 
 
 def _import_wandb():
@@ -189,7 +190,7 @@ def build_mel_loss(kokoro_cfg: Dict[str, Any], mel_cfg: MelLossConfig, device: t
 def build_models(
     cfg: TrainConfig,
     device: torch.device,
-) -> Tuple[KModel, SegmentGST, WavLMSV, SLMFeatureDiscriminator, MelReconstructionLoss, Dict[str, Any]]:
+) -> Tuple[KModel, SegmentGST, XLSRSV, HiFiGANMPDMSDDiscriminator, MelReconstructionLoss, Dict[str, Any]]:
     kokoro_cfg = load_kokoro_config(cfg.kokoro_repo_id)
     istft = kokoro_cfg["istftnet"]
     registry = AdapterRegistry.from_dims(
@@ -211,29 +212,27 @@ def build_models(
     freeze_kokoro_except_adapters(kmodel)
     strip_weight_norm_frozen(kmodel)
 
-    gst = SegmentGST(frame_dim=768, embed_dim=256, num_heads=8, ref_dim=256, style_dec_dim=128)
+    gst = SegmentGST(frame_dim=1024, embed_dim=256, num_heads=8, ref_dim=256, style_dec_dim=128)
     gst = gst.to(device)
 
-    wavlm = WavLMSV(cfg.wavlm_model_id, device=device, dtype=None)
+    xlsr = XLSRSV.from_pretrained(
+        cfg.xlsr_model_id,
+        layer_idx=cfg.xlsr_layer_idx,
+        device=device,
+        dtype=None,
+    )
 
-    slm_cfg = cfg.slm_disc
-    disc = SLMFeatureDiscriminator(
-        in_dim=768,
-        hidden_channels=slm_cfg.hidden_channels,
-        num_layers=slm_cfg.num_layers,
-        kernel_size=slm_cfg.kernel_size,
-        use_spectral_norm=slm_cfg.use_spectral_norm,
-    ).to(device)
+    disc = HiFiGANMPDMSDDiscriminator().to(device)
 
     mel_loss = build_mel_loss(kokoro_cfg, cfg.mel, device)
-    return kmodel, gst, wavlm, disc, mel_loss, kokoro_cfg
+    return kmodel, gst, xlsr, disc, mel_loss, kokoro_cfg
 
 
 def save_checkpoint(
     path: Path,
     *,
     gst: SegmentGST,
-    disc: SLMFeatureDiscriminator,
+    disc: nn.Module,
     kmodel: KModel,
     opt_g: torch.optim.Optimizer,
     opt_d: torch.optim.Optimizer,
@@ -247,7 +246,7 @@ def save_checkpoint(
         "step": step,
         "train_config": asdict(cfg),
         "segment_gst": gst.state_dict(),
-        "slm_discriminator": disc.state_dict(),
+        "waveform_discriminator": disc.state_dict(),
         "duration_adapters": kmodel.predictor.text_encoder.adapters.state_dict()
         if kmodel.predictor.text_encoder.adapters is not None
         else None,
@@ -269,7 +268,7 @@ def load_checkpoint(
     path: Path,
     *,
     gst: SegmentGST,
-    disc: SLMFeatureDiscriminator,
+    disc: nn.Module,
     kmodel: KModel,
     opt_g: torch.optim.Optimizer,
     opt_d: torch.optim.Optimizer,
@@ -279,7 +278,10 @@ def load_checkpoint(
 ) -> int:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     gst.load_state_dict(ckpt["segment_gst"])
-    disc.load_state_dict(ckpt["slm_discriminator"])
+    # Backward compatibility: fall back to old discriminator key if present.
+    disc_state = ckpt.get("waveform_discriminator") or ckpt.get("slm_discriminator")
+    if disc_state is not None:
+        disc.load_state_dict(disc_state)
     if ckpt.get("duration_adapters") and kmodel.predictor.text_encoder.adapters is not None:
         kmodel.predictor.text_encoder.adapters.load_state_dict(ckpt["duration_adapters"])
     if ckpt.get("decoder_adapters") and kmodel.decoder.decoder_adapters is not None:
@@ -297,85 +299,27 @@ def load_checkpoint(
     return int(ckpt.get("step", 0))
 
 
-def slm_discriminator_backward(
-    disc: SLMFeatureDiscriminator,
-    fake_feats: torch.Tensor,
-    fake_mask: torch.Tensor,
-    real_feats: torch.Tensor,
-    real_mask: torch.Tensor,
-    *,
-    scaler: Optional[GradScaler],
-    use_amp: bool,
-    scale_factor: float = 1.0,
-) -> torch.Tensor:
-    """Compute discriminator hinge loss and call ``.backward()`` only (no zero_grad/step).
-
-    ``scale_factor`` multiplies the loss before backward (use ``1/N`` for gradient accumulation
-    over *N* micro-steps).  Returns the **unscaled** loss value (detached).
-    """
-    with _cuda_amp_context(use_amp, fake_feats):
-        loss_d = slm_discriminator_loss_hinge(disc, real_feats, fake_feats, real_mask, fake_mask)
-
-    scaled = loss_d * scale_factor
-    if scaler is not None and use_amp:
-        scaler.scale(scaled).backward()
-    else:
-        scaled.backward()
-    return loss_d.detach()
-
-
-def slm_discriminator_step(
-    disc: SLMFeatureDiscriminator,
-    opt_d: torch.optim.Optimizer,
-    fake_feats: torch.Tensor,
-    fake_mask: torch.Tensor,
-    real_feats: torch.Tensor,
-    real_mask: torch.Tensor,
-    *,
-    grad_clip: Optional[float],
-    scaler: Optional[GradScaler],
-    use_amp: bool,
-) -> torch.Tensor:
-    """Convenience wrapper: zero_grad + backward + unscale + clip + step."""
-    opt_d.zero_grad(set_to_none=True)
-    loss_d = slm_discriminator_backward(
-        disc, fake_feats, fake_mask, real_feats, real_mask,
-        scaler=scaler, use_amp=use_amp,
-    )
-    if scaler is not None and use_amp:
-        scaler.unscale_(opt_d)
-        if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
-        scaler.step(opt_d)
-    else:
-        if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
-        opt_d.step()
-    return loss_d
-
-
 def generator_loss_backward(
     kmodel: KModel,
     gst: SegmentGST,
-    wv_gen: WavLMSVOutput,
-    disc: SLMFeatureDiscriminator,
     mel_loss_mod: MelReconstructionLoss,
     opt_g: torch.optim.Optimizer,
     pred_wav: torch.Tensor,
     ref_pooled_detached: torch.Tensor,
+    gen_pooled: torch.Tensor,
     tgt_24: torch.Tensor,
-    weights: LossWeights,
     *,
+    disc_waveform: HiFiGANMPDMSDDiscriminator,
+    real_disc_features: Optional[List[List[torch.Tensor]]],
+    weights: LossWeights,
     scaler: Optional[GradScaler],
     use_amp: bool,
     scale_factor: float = 1.0,
-    include_slm: bool = True,
 ) -> Dict[str, float]:
-    """Compute mel + speaker + (optional) SLM generator losses and call ``.backward()`` only.
+    """Compute mel + speaker + (optional) GAN losses and call ``.backward()`` only.
 
     ``scale_factor`` multiplies the total loss before backward (use ``1/N`` for gradient
-    accumulation over *N* micro-steps).  When ``include_slm`` is False the SLM generator
-    term is omitted (generator-only warmup phase).
+    accumulation over *N* micro-steps).
 
     Returns per-component loss values (**unscaled**, detached) for logging.
     """
@@ -383,21 +327,26 @@ def generator_loss_backward(
         out_mel = mel_loss_mod(pred_wav, tgt_24)
         l_mel = out_mel.loss
 
-        l_spk = speaker_cosine_loss(ref_pooled_detached, wv_gen.pooled_embedding)
+        l_spk = speaker_cosine_loss(ref_pooled_detached, gen_pooled)
 
-        if include_slm:
-            f_fake, m_fake = wv_gen.frame_hidden_states, wv_gen.frame_mask
-            for p in disc.parameters():
-                p.requires_grad_(False)
-            l_slm = slm_generator_loss_hinge(disc, f_fake, m_fake)
-            for p in disc.parameters():
-                p.requires_grad_(True)
-        else:
-            l_slm = torch.zeros((), device=pred_wav.device, dtype=pred_wav.dtype)
+        # Optional GAN losses: only active when real_disc_features is provided (after disc_start_step).
+        l_g_adv = torch.zeros((), device=pred_wav.device, dtype=pred_wav.dtype)
+        l_fm = torch.zeros((), device=pred_wav.device, dtype=pred_wav.dtype)
+        if real_disc_features is not None:
+            fake_logits, fake_feats = disc_waveform(pred_wav)
+            l_g_adv = generator_loss_lsgan(fake_logits)
+            # Detach real features so generator step does not backprop into D.
+            real_feats_detached: List[List[torch.Tensor]] = [
+                [f.detach() for f in per_disc] for per_disc in real_disc_features
+            ]
+            l_fm = feature_matching_loss(real_feats_detached, fake_feats)
 
-        loss_g = weights.lambda_mel * l_mel + weights.lambda_spk * l_spk
-        if include_slm:
-            loss_g = loss_g + weights.lambda_slm * l_slm
+        loss_g = (
+            weights.lambda_mel * l_mel
+            + weights.lambda_spk * l_spk
+            + weights.lambda_adv * l_g_adv
+            + weights.lambda_fm * l_fm
+        )
 
     scaled = loss_g * scale_factor
     if scaler is not None and use_amp:
@@ -409,47 +358,9 @@ def generator_loss_backward(
         "loss_g": float(loss_g.detach()),
         "loss_mel": float(l_mel.detach()),
         "loss_spk": float(l_spk.detach()),
-        "loss_slm_g": float(l_slm.detach()),
+        "loss_adv_g": float(l_g_adv.detach()),
+        "loss_fm": float(l_fm.detach()),
     }
-
-
-def generator_loss_backward_step(
-    kmodel: KModel,
-    gst: SegmentGST,
-    wv_gen: WavLMSVOutput,
-    disc: SLMFeatureDiscriminator,
-    mel_loss_mod: MelReconstructionLoss,
-    opt_g: torch.optim.Optimizer,
-    pred_wav: torch.Tensor,
-    ref_pooled_detached: torch.Tensor,
-    tgt_24: torch.Tensor,
-    weights: LossWeights,
-    *,
-    grad_clip: Optional[float],
-    scaler: Optional[GradScaler],
-    use_amp: bool,
-) -> Dict[str, float]:
-    """Convenience wrapper: backward + unscale + clip + step.
-
-    Caller must ``opt_g.zero_grad`` before the shared Kokoro forward.
-    """
-    metrics = generator_loss_backward(
-        kmodel, gst, wv_gen, disc, mel_loss_mod, opt_g,
-        pred_wav, ref_pooled_detached, tgt_24, weights,
-        scaler=scaler, use_amp=use_amp,
-    )
-    if scaler is not None and use_amp:
-        scaler.unscale_(opt_g)
-        if grad_clip is not None:
-            params = generator_trainable_parameters(kmodel, gst)
-            torch.nn.utils.clip_grad_norm_(params, grad_clip)
-        scaler.step(opt_g)
-    else:
-        if grad_clip is not None:
-            params = generator_trainable_parameters(kmodel, gst)
-            torch.nn.utils.clip_grad_norm_(params, grad_clip)
-        opt_g.step()
-    return metrics
 
 
 def _kokoro_id_to_char_map(vocab: Dict[str, int]) -> Dict[int, str]:
@@ -478,7 +389,7 @@ def _log_wandb_validation(
     dataset: Dataset,
     kmodel: KModel,
     gst: SegmentGST,
-    wavlm: WavLMSV,
+    xlsr: XLSRSV,
     mel_loss_mod: MelReconstructionLoss,
     cfg: TrainConfig,
     device: torch.device,
@@ -516,7 +427,7 @@ def _log_wandb_validation(
                 caption = _caption_from_input_ids(batch["input_ids"].squeeze(0), id_to_char)
 
             with torch.no_grad():
-                wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
+                wv_ref: XLSRSVOutput = xlsr(ref_16, sampling_rate=16_000, grad_through_input=False)
                 gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
                 ref_s = gst_out.ref_s
                 pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
@@ -529,7 +440,7 @@ def _log_wandb_validation(
                 mel_l2_sum += float((d**2).mean().item())
 
                 w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
-                wv_gen = wavlm(w_gen_16, sampling_rate=16_000, grad_through_input=False)
+                wv_gen: XLSRSVOutput = xlsr(w_gen_16, sampling_rate=16_000, grad_through_input=False)
                 spk_sum += float(speaker_cosine_loss(wv_ref.pooled_embedding, wv_gen.pooled_embedding).item())
 
             pred_np = pred_wav.squeeze(0).detach().float().cpu().numpy().astype(np.float32)
@@ -575,7 +486,7 @@ def train_loop(
     torch_profiler_trace: Optional[Path] = None,
     val_dataset: Optional[Dataset] = None,
 ) -> None:
-    kmodel, gst, wavlm, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, xlsr, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
     vocab: Dict[str, int] = kokoro_cfg["vocab"]
     params_g = generator_trainable_parameters(kmodel, gst)
     opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g, weight_decay=cfg.weight_decay_g)
@@ -639,7 +550,8 @@ def train_loop(
                 "loss_g": 0.0,
                 "loss_mel": 0.0,
                 "loss_spk": 0.0,
-                "loss_slm_g": 0.0,
+                "loss_adv_g": 0.0,
+                "loss_fm": 0.0,
                 "loss_d": 0.0,
             }
             epoch_count = 0
@@ -674,11 +586,15 @@ def train_loop(
 
                     opt_g.zero_grad(set_to_none=True)
                     opt_d.zero_grad(set_to_none=True)
-                    include_slm = (global_step >= cfg.disc_start_step)
+                    include_gan = (global_step >= cfg.disc_start_step)
 
                     micro_sums: Dict[str, float] = {
-                        "loss_g": 0.0, "loss_mel": 0.0, "loss_spk": 0.0,
-                        "loss_slm_g": 0.0, "loss_d": 0.0,
+                        "loss_g": 0.0,
+                        "loss_mel": 0.0,
+                        "loss_spk": 0.0,
+                        "loss_adv_g": 0.0,
+                        "loss_fm": 0.0,
+                        "loss_d": 0.0,
                     }
                     micros_done = 0
                     nan_detected = False
@@ -709,15 +625,21 @@ def train_loop(
                         if input_ids.dim() != 2:
                             raise ValueError("input_ids must be (batch, seq_len)")
 
+                        # Reference SSL forward (no grad) -> GST conditioning.
                         with _cuda_amp_context(cfg.use_amp, ref_16):
                             if sw is not None:
-                                sw.start("wavlm_ref")
-                            wv_ref = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
+                                sw.start("xlsr_ref")
+                            wv_ref: XLSRSVOutput = xlsr(
+                                ref_16,
+                                sampling_rate=16_000,
+                                grad_through_input=False,
+                            )
                             gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
                             ref_s = gst_out.ref_s
                             if sw is not None:
-                                sw.end("wavlm_ref", sync_cuda=True)
+                                sw.end("xlsr_ref", sync_cuda=True)
 
+                            # Kokoro generator forward (24 kHz waveform).
                             if sw is not None:
                                 sw.start("kokoro_fwd")
                             pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
@@ -726,61 +648,60 @@ def train_loop(
                             if sw is not None:
                                 sw.end("kokoro_fwd", sync_cuda=True)
 
+                        # Generated audio SSL forward (with grad) for speaker loss.
                         if sw is not None:
-                            sw.start("wavlm_gen")
+                            sw.start("xlsr_gen")
                         w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
-                        wv_gen = wavlm(w_gen_16, sampling_rate=16_000, grad_through_input=True)
-                        if cfg.wavlm_grad_max_norm is not None:
-                            _clamp = _make_grad_clamp_hook(cfg.wavlm_grad_max_norm)
+                        wv_gen: XLSRSVOutput = xlsr(
+                            w_gen_16,
+                            sampling_rate=16_000,
+                            grad_through_input=True,
+                        )
+                        if cfg.ssl_grad_max_norm is not None:
+                            _clamp = _make_grad_clamp_hook(cfg.ssl_grad_max_norm)
                             wv_gen.frame_hidden_states.register_hook(_clamp)
                             wv_gen.pooled_embedding.register_hook(_clamp)
                         if sw is not None:
-                            sw.end("wavlm_gen", sync_cuda=True)
+                            sw.end("xlsr_gen", sync_cuda=True)
 
-                        if sw is not None:
-                            sw.start("wavlm_tgt")
-                        tgt_16 = resample_mono(tgt_24, 24_000, 16_000)
-                        real_feats, real_mask, _ = wavlm.frame_hidden_states(
-                            tgt_16, sampling_rate=16_000, grad_through_input=False
-                        )
-                        if sw is not None:
-                            sw.end("wavlm_tgt", sync_cuda=True)
-
+                        # Waveform discriminator on real vs fake (D-step).
                         if sw is not None:
                             sw.start("disc")
                         ld = torch.zeros((), device=device, dtype=torch.float32)
-                        if include_slm:
-                            for _ in range(cfg.slm_d_steps_per_g_step):
-                                ld = slm_discriminator_backward(
-                                    disc,
-                                    wv_gen.frame_hidden_states.detach(),
-                                    wv_gen.frame_mask.detach(),
-                                    real_feats,
-                                    real_mask,
-                                    scaler=scaler_d,
-                                    use_amp=cfg.use_amp,
-                                    scale_factor=inv_accum,
-                                )
+                        real_disc_features: Optional[List[List[torch.Tensor]]] = None
+                        if include_gan:
+                            # Real path.
+                            real_logits, real_feats = disc(tgt_24)
+                            # Fake (detached) path for D-step only.
+                            fake_logits_detached, _ = disc(pred_wav.detach())
+                            ld = discriminator_loss_lsgan(real_logits, fake_logits_detached)
+                            scaled_ld = ld * inv_accum
+                            if scaler_d is not None and cfg.use_amp:
+                                scaler_d.scale(scaled_ld).backward()
+                            else:
+                                scaled_ld.backward()
+                            real_disc_features = real_feats
                         if sw is not None:
                             sw.end("disc", sync_cuda=True)
 
+                        # Generator backward: mel + speaker + optional GAN (adv + FM).
                         if sw is not None:
                             sw.start("gen_backward")
                         g_metrics = generator_loss_backward(
                             kmodel,
                             gst,
-                            wv_gen,
-                            disc,
                             mel_loss_mod,
                             opt_g,
                             pred_wav,
                             wv_ref.pooled_embedding.detach(),
+                            wv_gen.pooled_embedding,
                             tgt_24,
-                            cfg.loss_weights,
+                            disc_waveform=disc,
+                            real_disc_features=real_disc_features,
+                            weights=cfg.loss_weights,
                             scaler=scaler_g,
                             use_amp=cfg.use_amp,
                             scale_factor=inv_accum,
-                            include_slm=include_slm,
                         )
                         if sw is not None:
                             sw.end("gen_backward", sync_cuda=True)
@@ -817,8 +738,8 @@ def train_loop(
                         continue
 
                     # -- Deferred optimizer steps: unscale, clip, step --
-                    d_stepped = include_slm
-                    if include_slm:
+                    d_stepped = include_gan
+                    if include_gan:
                         if scaler_d is not None and cfg.use_amp:
                             scaler_d.unscale_(opt_d)
                         if cfg.grad_clip_d is not None:
@@ -846,7 +767,7 @@ def train_loop(
                     elif scaler_g is not None:
                         scaler_g.update()
 
-                    if include_slm:
+                    if include_gan:
                         if scaler_d is not None and cfg.use_amp:
                             _old_scale_d = float(scaler_d.get_scale())
                             scaler_d.update()
@@ -899,7 +820,8 @@ def train_loop(
                                     "train/loss_g": metrics["loss_g"],
                                     "train/loss_mel": metrics["loss_mel"],
                                     "train/loss_spk": metrics["loss_spk"],
-                                    "train/loss_slm_g": metrics["loss_slm_g"],
+                                    "train/loss_adv_g": metrics["loss_adv_g"],
+                                    "train/loss_fm": metrics["loss_fm"],
                                     "train/loss_d": metrics["loss_d"],
                                     "train/epoch": float(epoch_idx + 1),
                                     "train/lr_g": opt_g.param_groups[0]["lr"],
@@ -935,7 +857,7 @@ def train_loop(
                                 dataset=dataloader.dataset,
                                 kmodel=kmodel,
                                 gst=gst,
-                                wavlm=wavlm,
+                                xlsr=xlsr,
                                 mel_loss_mod=mel_loss_mod,
                                 cfg=cfg,
                                 device=device,
@@ -969,7 +891,7 @@ def train_loop(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train voice-clone GST + adapters + SLM discriminator.")
+    p = argparse.ArgumentParser(description="Train voice-clone GST + adapters + waveform discriminator.")
     p.add_argument("--device", type=str, default=None, help="cuda | cpu | mps (default: auto)")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--ckpt-dir", type=Path, default=None)

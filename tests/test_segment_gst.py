@@ -6,7 +6,7 @@ import pytest
 import torch
 
 
-B, T, FRAME_DIM = 2, 30, 768
+B, T, FRAME_DIM = 2, 30, 1024
 
 
 class TestSegmentGSTOutputShapes:

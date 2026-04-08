@@ -47,7 +47,7 @@ def test_lambda_spk_default() -> None:
     assert cfg.loss_weights.lambda_spk == 1.0
 
 
-def test_use_spectral_norm_default() -> None:
-    """Spectral normalization enabled by default on discriminator convolutions."""
+def test_xlsr_layer_idx_default() -> None:
+    """XLS-R intermediate layer index defaults to 12."""
     cfg = TrainConfig()
-    assert cfg.slm_disc.use_spectral_norm is True
+    assert cfg.xlsr_layer_idx == 12

@@ -13,7 +13,8 @@ from huggingface_hub import hf_hub_download
 class LossWeights:
     lambda_mel: float = 1.0
     lambda_spk: float = 1.0
-    lambda_slm: float = 0.05
+    lambda_adv: float = 0.1
+    lambda_fm: float = 1.0
 
 
 @dataclass
@@ -29,37 +30,28 @@ class MelLossConfig:
 
 
 @dataclass
-class SLMDiscriminatorConfig:
-    hidden_channels: int = 256
-    num_layers: int = 4
-    kernel_size: int = 7
-    use_spectral_norm: bool = True
-
-
-@dataclass
 class TrainConfig:
     kokoro_repo_id: str = "hexgrad/Kokoro-82M"
-    wavlm_model_id: str = "microsoft/wavlm-base-plus-sv"
+    xlsr_model_id: str = "facebook/wav2vec2-xls-r-300m"
+    xlsr_layer_idx: int = 12
     adapter_bottleneck: int = 64
     loss_weights: LossWeights = field(default_factory=LossWeights)
     mel: MelLossConfig = field(default_factory=MelLossConfig)
-    slm_disc: SLMDiscriminatorConfig = field(default_factory=SLMDiscriminatorConfig)
     lr_g: float = 1e-4
     lr_d: float = 5e-5
     weight_decay_g: float = 0.0
     weight_decay_d: float = 0.0
     grad_clip_g: Optional[float] = 1.0
     grad_clip_d: Optional[float] = 1.0
-    use_amp: bool = False
+    use_amp: bool = True
     # How often to log to W&B and refresh training metrics in the terminal (tqdm postfix or one-line \r).
     log_interval: int = 1
-    checkpoint_interval: int = 1000
+    checkpoint_interval: int = 250
     warmup_steps: int = 50
     grad_accum_steps: int = 8
-    disc_start_step: int = 500
-    slm_d_steps_per_g_step: int = 1
+    disc_start_step: int = 250
     speed: float = 1.0
-    wavlm_grad_max_norm: Optional[float] = 1.0
+    ssl_grad_max_norm: Optional[float] = 1.0
     lr_min_g: float = 1e-6
     lr_min_d: float = 1e-7
 

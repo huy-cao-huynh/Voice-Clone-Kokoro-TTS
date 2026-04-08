@@ -50,6 +50,14 @@ def losses_mod():
     return _load_module("voice_clone.losses", "voice_clone/losses.py")
 
 
+@pytest.fixture(scope="module")
+def hifigan_mod():
+    return _load_module(
+        "voice_clone.discriminators.hifigan",
+        "voice_clone/discriminators/hifigan.py",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Adapter with extreme inputs
 # ---------------------------------------------------------------------------
@@ -79,7 +87,7 @@ class TestSegmentGSTZeroMask:
         """clamp(min=1e-6) in denom prevents division by zero."""
         gst = segment_gst_mod.SegmentGST()
         gst.eval()
-        frames = torch.randn(1, 10, 768)
+        frames = torch.randn(1, 10, 1024)
         mask = torch.zeros(1, 10)
         with torch.no_grad():
             out, _ = gst(frames, mask)
@@ -89,7 +97,7 @@ class TestSegmentGSTZeroMask:
     def test_single_valid_frame(self, segment_gst_mod):
         gst = segment_gst_mod.SegmentGST()
         gst.eval()
-        frames = torch.randn(1, 10, 768)
+        frames = torch.randn(1, 10, 1024)
         mask = torch.zeros(1, 10)
         mask[0, 0] = 1.0
         with torch.no_grad():
@@ -149,20 +157,18 @@ class TestSpeakerCosineZeroVectors:
 
 
 # ---------------------------------------------------------------------------
-# SLMFeatureDiscriminator with all-zero mask
+# HiFiGANMPDMSDDiscriminator with all-zero waveform
 # ---------------------------------------------------------------------------
 
-class TestDiscriminatorZeroMask:
-    def test_zero_mask_finite(self, losses_mod):
-        disc = losses_mod.SLMFeatureDiscriminator(
-            in_dim=768, hidden_channels=64, num_layers=2, kernel_size=3,
-        )
+class TestWaveformDiscriminatorZeroInput:
+    def test_zero_wav_finite(self, hifigan_mod):
+        disc = hifigan_mod.HiFiGANMPDMSDDiscriminator()
         disc.eval()
-        feats = torch.randn(1, 10, 768)
-        mask = torch.zeros(1, 10)
+        wav = torch.zeros(1, 24_000)
         with torch.no_grad():
-            out = disc(feats, mask)
-        assert torch.isfinite(out).all()
+            logits, _feats = disc(wav)
+        for l in logits:
+            assert torch.isfinite(l).all()
 
 
 # ---------------------------------------------------------------------------
@@ -196,27 +202,30 @@ class TestResampleDifferentiability:
 
 class TestLossCompositionFiniteness:
     def test_weighted_sum_finite_and_gradable(self, losses_mod):
-        """lambda_mel * mel + lambda_spk * spk + lambda_slm * slm should be finite."""
+        """lambda_mel * mel + lambda_spk * spk + lambda_adv * adv + lambda_fm * fm should be finite."""
         mel_val = torch.tensor(2.5, requires_grad=True)
         spk_val = torch.tensor(0.8, requires_grad=True)
-        slm_val = torch.tensor(0.3, requires_grad=True)
+        adv_val = torch.tensor(0.3, requires_grad=True)
+        fm_val = torch.tensor(0.7, requires_grad=True)
 
-        loss = 1.0 * mel_val + 0.5 * spk_val + 0.05 * slm_val
+        loss = 1.0 * mel_val + 0.5 * spk_val + 0.1 * adv_val + 1.0 * fm_val
         assert torch.isfinite(loss)
         loss.backward()
         assert torch.isfinite(mel_val.grad)
         assert torch.isfinite(spk_val.grad)
-        assert torch.isfinite(slm_val.grad)
+        assert torch.isfinite(adv_val.grad)
+        assert torch.isfinite(fm_val.grad)
 
     def test_large_loss_values_finite(self, losses_mod):
         """Even large individual losses should compose to a finite total."""
         mel_val = torch.tensor(1e5, requires_grad=True)
         spk_val = torch.tensor(1e5, requires_grad=True)
-        slm_val = torch.tensor(1e5, requires_grad=True)
-        loss = 1.0 * mel_val + 0.5 * spk_val + 0.05 * slm_val
+        adv_val = torch.tensor(1e5, requires_grad=True)
+        fm_val = torch.tensor(1e5, requires_grad=True)
+        loss = 1.0 * mel_val + 0.5 * spk_val + 0.1 * adv_val + 1.0 * fm_val
         assert torch.isfinite(loss)
         loss.backward()
-        for g in (mel_val.grad, spk_val.grad, slm_val.grad):
+        for g in (mel_val.grad, spk_val.grad, adv_val.grad, fm_val.grad):
             assert torch.isfinite(g)
 
 

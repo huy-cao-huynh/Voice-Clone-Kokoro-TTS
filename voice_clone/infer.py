@@ -1,4 +1,4 @@
-"""Inference: reference wav + text + language → audio (Kokoro + trained SegmentGST / L-adapters, frozen WavLM-SV)."""
+"""Inference: reference wav + text + language → audio (Kokoro + trained SegmentGST / L-adapters, frozen XLS-R-SV)."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ import torchaudio
 from kokoro.model import KModel
 from kokoro.pipeline import KPipeline
 
-from .config import LossWeights, MelLossConfig, SLMDiscriminatorConfig, TrainConfig, kokoro_vocab_and_context_length
+from .config import LossWeights, MelLossConfig, TrainConfig, kokoro_vocab_and_context_length
 from .dataset import load_audio_mono, normalize_lang_code, phonemes_to_input_ids, text_to_phonemes
 from .segment_gst import SegmentGST
 from .train_adapters import build_models
-from .wavlm_sv import WavLMSV
+from .xlsr_sv import XLSRSV
 
 KOKORO_OUTPUT_SR = 24_000
 
@@ -29,8 +29,6 @@ def train_config_from_checkpoint_dict(d: Dict[str, Any]) -> TrainConfig:
         d["loss_weights"] = LossWeights(**d["loss_weights"])
     if "mel" in d and isinstance(d["mel"], dict):
         d["mel"] = MelLossConfig(**d["mel"])
-    if "slm_disc" in d and isinstance(d["slm_disc"], dict):
-        d["slm_disc"] = SLMDiscriminatorConfig(**d["slm_disc"])
     valid = {f.name for f in fields(TrainConfig)}
     filtered = {k: v for k, v in d.items() if k in valid}
     return TrainConfig(**filtered)
@@ -55,10 +53,10 @@ def apply_voice_clone_checkpoint(
 def build_stack_for_inference(
     cfg: TrainConfig,
     device: torch.device,
-) -> Tuple[KModel, SegmentGST, WavLMSV]:
-    """Construct Kokoro (with adapter slots), SegmentGST, and frozen WavLM-SV (discriminator unused)."""
-    kmodel, gst, wavlm, _disc, _mel, _kokoro_cfg = build_models(cfg, device)
-    return kmodel, gst, wavlm
+) -> Tuple[KModel, SegmentGST, XLSRSV]:
+    """Construct Kokoro (with adapter slots), SegmentGST, and frozen XLS-R-SV (discriminator unused)."""
+    kmodel, gst, xlsr, _disc, _mel, _kokoro_cfg = build_models(cfg, device)
+    return kmodel, gst, xlsr
 
 
 def infer_waveform(
@@ -96,7 +94,7 @@ def infer_waveform(
     if kokoro_repo_id is not None:
         cfg = replace(cfg, kokoro_repo_id=kokoro_repo_id)
 
-    kmodel, gst, wavlm = build_stack_for_inference(cfg, device)
+    kmodel, gst, xlsr = build_stack_for_inference(cfg, device)
     apply_voice_clone_checkpoint(ckpt, gst=gst, kmodel=kmodel)
 
     lang = normalize_lang_code(lang_code)
@@ -109,10 +107,10 @@ def infer_waveform(
     sp = speed if speed is not None else cfg.speed
 
     gst.eval()
-    wavlm.eval()
+    xlsr.eval()
     kmodel.eval()
     with torch.inference_mode():
-        wv = wavlm(ref_16, sampling_rate=16_000, grad_through_input=False)
+        wv = xlsr(ref_16, sampling_rate=16_000, grad_through_input=False)
         gst_out, _ = gst(wv.frame_hidden_states, wv.frame_mask)
         ref_s = gst_out.ref_s
         audio, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=sp)
@@ -123,7 +121,7 @@ def infer_waveform(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Voice-clone inference: ref wav + text + lang → WAV (24 kHz).")
     p.add_argument("--checkpoint", type=Path, required=True, help="Training checkpoint (.pt) with GST + adapters.")
-    p.add_argument("--ref-wav", type=Path, required=True, help="Reference speaker audio (any rate; resampled to 16 kHz for WavLM).")
+    p.add_argument("--ref-wav", type=Path, required=True, help="Reference speaker audio (any rate; resampled to 16 kHz for XLS-R).")
     p.add_argument("--text", type=str, required=True)
     p.add_argument("--lang", type=str, required=True, help="Kokoro lang code or alias (e.g. a, en-us, z).")
     p.add_argument("--out", type=Path, required=True, help="Output WAV path.")

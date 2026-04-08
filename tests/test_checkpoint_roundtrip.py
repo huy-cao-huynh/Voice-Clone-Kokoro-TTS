@@ -32,13 +32,14 @@ def stack_and_opts():
 
     device = torch.device("cpu")
     cfg = TrainConfig()
-    kmodel, gst, wavlm, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, xlsr, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
     params_g = generator_trainable_parameters(kmodel, gst)
     opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g)
     opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d)
     return {
         "kmodel": kmodel,
         "gst": gst,
+        "xlsr": xlsr,
         "disc": disc,
         "opt_g": opt_g,
         "opt_d": opt_d,
@@ -59,6 +60,9 @@ class TestSaveLoadRoundtrip:
             ckpt_path, gst=s["gst"], disc=s["disc"], kmodel=s["kmodel"],
             opt_g=s["opt_g"], opt_d=s["opt_d"], step=42, cfg=s["cfg"],
         )
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        assert "waveform_discriminator" in ckpt
 
         device = s["device"]
         cfg2 = TrainConfig()
@@ -112,21 +116,21 @@ class TestSaveLoadRoundtrip:
 
 class TestTrainConfigFromCheckpointDict:
     def test_reconstructs_config_from_asdict(self):
-        from voice_clone.config import TrainConfig, LossWeights, MelLossConfig, SLMDiscriminatorConfig
+        from voice_clone.config import TrainConfig, LossWeights, MelLossConfig
         from voice_clone.infer import train_config_from_checkpoint_dict
 
         cfg = TrainConfig(
             lr_g=2e-4,
-            loss_weights=LossWeights(lambda_mel=2.0, lambda_spk=0.3, lambda_slm=0.1),
+            loss_weights=LossWeights(lambda_mel=2.0, lambda_spk=0.3, lambda_adv=0.2, lambda_fm=1.5),
             mel=MelLossConfig(n_fft=2048),
-            slm_disc=SLMDiscriminatorConfig(hidden_channels=128),
         )
         d = asdict(cfg)
         restored = train_config_from_checkpoint_dict(d)
         assert restored.lr_g == 2e-4
         assert restored.loss_weights.lambda_mel == 2.0
+        assert restored.loss_weights.lambda_adv == 0.2
+        assert restored.loss_weights.lambda_fm == 1.5
         assert restored.mel.n_fft == 2048
-        assert restored.slm_disc.hidden_channels == 128
 
     def test_ignores_unknown_keys(self):
         from voice_clone.config import TrainConfig

@@ -1,4 +1,8 @@
-"""Frozen Hugging Face `microsoft/wavlm-base-plus-sv` for SV embeddings and encoder frames."""
+"""Frozen Hugging Face `facebook/wav2vec2-xls-r-300m` for SV-like embeddings and encoder frames.
+
+Exposes intermediate-layer frame hidden states (configurable layer index), a frame mask, and a
+normalized pooled embedding, all at 16 kHz input.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
 
 
 Tensor = torch.Tensor
@@ -17,10 +21,7 @@ Tensor = torch.Tensor
 def _waveforms_use_torch_preprocess(
     waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
 ) -> bool:
-    """True for tensor batches: avoids NumPy/HF round-trip and keeps autograd through audio when requested.
-
-    Nested Python lists / non-tensor sequences use the Hugging Face NumPy path instead.
-    """
+    """True for tensor batches; keeps preprocessing on-device and autograd-safe."""
     if isinstance(waveforms, Tensor):
         return True
     if not isinstance(waveforms, (list, tuple)) or not waveforms:
@@ -37,7 +38,7 @@ def _zero_mean_unit_var_norm_torch(
     padding_value: float,
     eps: float = 1e-7,
 ) -> Tensor:
-    """Match Hugging Face `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm` (batched, differentiable)."""
+    """Match Hugging Face `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm` (batched)."""
     mask = attention_mask.to(dtype=input_values.dtype)
     lengths = attention_mask.sum(dim=-1).clamp(min=1)
     sum_v = (input_values * mask).sum(dim=-1)
@@ -57,11 +58,7 @@ def wav2vec2_preprocess_batch(
     dtype: torch.dtype,
     sampling_rate: int,
 ) -> Tuple[Tensor, Tensor]:
-    """Pad and optionally normalize waveforms like ``Wav2Vec2FeatureExtractor(..., return_tensors='pt')``.
-
-    Reads ``do_normalize``, ``padding_value``, ``padding_side``, and ``sampling_rate`` from the extractor.
-    Output ``input_values`` uses ``dtype``; ``attention_mask`` is ``torch.long`` (1 = valid, 0 = pad).
-    """
+    """Pad/normalize waveforms like `Wav2Vec2FeatureExtractor(..., return_tensors='pt')`."""
     if sampling_rate != feature_extractor.sampling_rate:
         raise ValueError(
             f"Expected sampling_rate={feature_extractor.sampling_rate} for this feature extractor; "
@@ -99,13 +96,13 @@ def wav2vec2_preprocess_batch(
     attention_mask = torch.zeros(b, max_len, device=device, dtype=torch.long)
 
     for i, r in enumerate(rows):
-        L = lengths[i]
+        n = lengths[i]
         if side == "right":
-            padded[i, :L] = r
-            attention_mask[i, :L] = 1
+            padded[i, :n] = r
+            attention_mask[i, :n] = 1
         elif side == "left":
-            padded[i, -L:] = r
-            attention_mask[i, -L:] = 1
+            padded[i, -n:] = r
+            attention_mask[i, -n:] = 1
         else:
             raise ValueError(f"Unsupported padding_side: {side!r}")
 
@@ -115,43 +112,12 @@ def wav2vec2_preprocess_batch(
     return padded, attention_mask
 
 
-@dataclass
-class WavLMSVOutput:
-    """Outputs from `WavLMSV.forward`."""
-
-    pooled_embedding: Tensor
-    """L2-normalized x-vector embeddings, shape `(batch, 512)`."""
-
-    frame_hidden_states: Tensor
-    """Last encoder layer hidden states (before the x-vector head), shape `(batch, time, 768)`."""
-
-    frame_mask: Tensor
-    """Float mask with `1.0` for valid frames and `0.0` for padding, shape `(batch, time)`.
-
-    `time` matches `frame_hidden_states.size(1)` (max frames in the batch after CNN subsampling).
-    """
-
-    attention_mask: Tensor
-    """Sample-level mask from the feature extractor (`1` = valid audio sample), shape `(batch, audio_len)`."""
-
-    all_hidden_states: Optional[Tuple[Tensor, ...]] = None
-    """If requested, tuple of encoder layer outputs (each `(batch, time, 768)`), index `0` = first layer."""
-
-
-def frame_mask_from_sample_mask(attention_mask: Tensor, wavlm_core: nn.Module) -> Tensor:
-    """Build frame-level mask from feature-extractor sample `attention_mask`.
-
-    Args:
-        attention_mask: Long tensor `(batch, audio_len)`, `1` for valid samples.
-        wavlm_core: `WavLMForXVector.wavlm` (provides `_get_feat_extract_output_lengths`).
-
-    Returns:
-        Float tensor `(batch, max_frames)` with `1.0` for valid frames.
-    """
+def frame_mask_from_sample_mask(attention_mask: Tensor, wav2vec2_feature_extractor: nn.Module) -> Tensor:
+    """Build frame-level mask from sample-level attention mask."""
     if attention_mask.dtype != torch.long:
         attention_mask = attention_mask.long()
     lengths = attention_mask.sum(dim=-1).clamp(min=1)
-    frame_lengths = wavlm_core._get_feat_extract_output_lengths(lengths)
+    frame_lengths = wav2vec2_feature_extractor._get_feat_extract_output_lengths(lengths)
     max_frames = int(frame_lengths.max().item())
     b = frame_lengths.shape[0]
     idx = torch.arange(max_frames, device=frame_lengths.device, dtype=frame_lengths.dtype).expand(
@@ -182,52 +148,83 @@ def _waveform_rows_for_extractor(
     return rows
 
 
-class WavLMSV(nn.Module):
-    """Frozen `WavLMForXVector` + feature extractor: pooled SV embedding and encoder frame states."""
+@dataclass
+class XLSRSVOutput:
+    """Outputs from `XLSRSV.forward`."""
 
-    default_model_id = "microsoft/wavlm-base-plus-sv"
+    pooled_embedding: Tensor
+    """L2-normalized pooled embeddings from a chosen encoder layer, shape `(batch, 1024)`."""
+
+    frame_hidden_states: Tensor
+    """Hidden states from the chosen encoder layer, shape `(batch, time, 1024)`."""
+
+    frame_mask: Tensor
+    """Float mask with `1.0` for valid frames and `0.0` for padding, shape `(batch, time)`."""
+
+    attention_mask: Tensor
+    """Sample-level mask from the feature extractor (`1` = valid audio sample), shape `(batch, audio_len)`."""
+
+    all_hidden_states: Optional[Tuple[Tensor, ...]] = None
+    """If requested, tuple of encoder layer outputs (each `(batch, time, 1024)`), index `0` = first layer."""
+
+
+class XLSRSV(nn.Module):
+    """Frozen `Wav2Vec2Model` (XLS-R) + feature extractor.
+
+    Provides:
+    - frame_hidden_states from an intermediate encoder layer (configurable layer index)
+    - frame_mask derived from the feature extractor lengths
+    - pooled_embedding: masked mean over time from the same layer, L2-normalized
+    """
+
+    default_model_id = "facebook/wav2vec2-xls-r-300m"
 
     def __init__(
         self,
-        model_id: str = "microsoft/wavlm-base-plus-sv",
+        model_id: str = default_model_id,
         *,
+        layer_idx: int = 12,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
         self.model_id = model_id
+        self.layer_idx = layer_idx
+
         self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_id)
-        model = WavLMForXVector.from_pretrained(model_id)
+        model = Wav2Vec2Model.from_pretrained(model_id)
         model.requires_grad_(False)
         model.eval()
         if dtype is not None:
             model = model.to(dtype=dtype)
         if device is not None:
             model = model.to(device=device)
-        self.wavlm_xv = model
+        self.wav2vec2 = model
 
-    def train(self, mode: bool = True) -> "WavLMSV":
+    def train(self, mode: bool = True) -> "XLSRSV":
         super().train(mode)
-        self.wavlm_xv.eval()
+        # Keep XLS-R frozen regardless of train/eval toggles.
+        self.wav2vec2.eval()
         return self
 
     @property
     def device(self) -> torch.device:
-        return next(self.wavlm_xv.parameters()).device
+        return next(self.wav2vec2.parameters()).device
 
     @property
     def dtype(self) -> torch.dtype:
-        return next(self.wavlm_xv.parameters()).dtype
+        return next(self.wav2vec2.parameters()).dtype
 
     @classmethod
     def from_pretrained(
         cls,
         model_id: Optional[str] = None,
         *,
+        layer_idx: int = 12,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
-    ) -> "WavLMSV":
-        return cls(model_id or cls.default_model_id, device=device, dtype=dtype)
+    ) -> "XLSRSV":
+        return cls(model_id or cls.default_model_id, layer_idx=layer_idx, device=device, dtype=dtype)
 
     def _extract_inputs(
         self,
@@ -267,55 +264,65 @@ class WavLMSV(nn.Module):
         waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
         *,
         sampling_rate: int = 16_000,
+        layer_idx: Optional[int] = None,
         normalize_embeddings: bool = True,
-        output_hidden_states: bool = False,
         grad_through_input: bool = False,
-    ) -> WavLMSVOutput:
-        """Run frozen WavLM-SV on mono waveforms (default **16 kHz** per model card).
+        output_hidden_states: bool = False,
+    ) -> XLSRSVOutput:
+        """Run frozen XLS-R on mono waveforms (16 kHz).
 
         Args:
             waveforms: Batch of shape `(batch, samples)`, or list of 1-D waveforms (variable length).
-            sampling_rate: Input sample rate; must be 16_000 for this checkpoint.
-            normalize_embeddings: If True, L2-normalize `pooled_embedding` (speaker cosine loss).
+            sampling_rate: Input sample rate; must be 16_000 for XLS-R.
+            layer_idx: Optional override for the encoder layer index to tap (default: `self.layer_idx`).
+            normalize_embeddings: If True, L2-normalize `pooled_embedding`.
+            grad_through_input: If True, run the forward *without* `torch.no_grad()` so gradients
+                can flow into `waveforms` (weights stay frozen).
             output_hidden_states: If True, `all_hidden_states` is set on the output (tuple of every
-                encoder layer) for multi-layer SLM / analysis. Frames always use the last layer.
-            grad_through_input: If True, run the forward **without** `torch.no_grad()` so gradients
-                can flow into `waveforms` (weights stay frozen). Use for generated audio in speaker
-                / SLM generator losses.
-
-        Returns:
-            `WavLMSVOutput` with pooled embedding, last-layer frame features, and masks.
+                encoder layer).
         """
         if sampling_rate != 16_000:
             raise ValueError(
-                f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
+                f"XLS-R expects 16 kHz audio; got sampling_rate={sampling_rate}"
             )
 
         input_values, attention_mask = self._prepare_model_inputs(waveforms, sampling_rate)
-        frame_mask = frame_mask_from_sample_mask(attention_mask, self.wavlm_xv.wavlm)
+        frame_mask = frame_mask_from_sample_mask(attention_mask, self.wav2vec2.feature_extractor)
+
+        use_layer_idx = self.layer_idx if layer_idx is None else layer_idx
 
         if grad_through_input:
-            out = self.wavlm_xv(
+            out = self.wav2vec2(
                 input_values,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
         else:
             with torch.no_grad():
-                out = self.wavlm_xv(
+                out = self.wav2vec2(
                     input_values,
                     attention_mask=attention_mask,
                     output_hidden_states=True,
                 )
 
-        frames = out.hidden_states[-1]
-        emb = out.embeddings
-        if normalize_embeddings:
-            emb = F.normalize(emb, dim=-1)
+        hidden_states: Tuple[Tensor, ...] = out.hidden_states  # type: ignore[assignment]
+        num_layers = len(hidden_states)
+        if not (0 <= use_layer_idx < num_layers):
+            raise ValueError(
+                f"layer_idx={use_layer_idx} is out of range for XLS-R hidden_states (len={num_layers})"
+            )
 
-        all_hs: Optional[Tuple[Tensor, ...]] = out.hidden_states if output_hidden_states else None
+        frames = hidden_states[use_layer_idx]
 
-        return WavLMSVOutput(
+        m = frame_mask.to(dtype=frames.dtype, device=frames.device).unsqueeze(-1)
+        denom = m.sum(dim=1).clamp(min=1e-6)
+        pooled = (frames * m).sum(dim=1) / denom
+
+        emb = F.normalize(pooled, dim=-1) if normalize_embeddings else pooled
+
+        all_hs: Optional[Tuple[Tensor, ...]] = hidden_states if output_hidden_states else None
+
+        return XLSRSVOutput(
             pooled_embedding=emb,
             frame_hidden_states=frames,
             frame_mask=frame_mask,
@@ -323,72 +330,3 @@ class WavLMSV(nn.Module):
             all_hidden_states=all_hs,
         )
 
-    def pooled_embedding(
-        self,
-        waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
-        *,
-        sampling_rate: int = 16_000,
-        normalize: bool = True,
-        grad_through_input: bool = False,
-    ) -> Tensor:
-        """X-vector embeddings only, shape `(batch, 512)`."""
-        if sampling_rate != 16_000:
-            raise ValueError(
-                f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
-            )
-        input_values, attention_mask = self._prepare_model_inputs(waveforms, sampling_rate)
-        if grad_through_input:
-            out = self.wavlm_xv(input_values, attention_mask=attention_mask)
-        else:
-            with torch.no_grad():
-                out = self.wavlm_xv(input_values, attention_mask=attention_mask)
-        emb = out.embeddings
-        return F.normalize(emb, dim=-1) if normalize else emb
-
-    def frame_hidden_states(
-        self,
-        waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
-        *,
-        sampling_rate: int = 16_000,
-        output_all_hidden_states: bool = False,
-        grad_through_input: bool = False,
-    ) -> Tuple[Tensor, Tensor, Optional[Tuple[Tensor, ...]]]:
-        """Encoder frame states and frame mask (and optionally all layer states).
-
-        Returns:
-            `frame_hidden` `(batch, time, hidden)`, `frame_mask` `(batch, time)`, and optionally
-            `all_hidden_states` (tuple of `(batch, time, hidden)` per layer) if
-            `output_all_hidden_states` is True.
-        """
-        if sampling_rate != 16_000:
-            raise ValueError(
-                f"microsoft/wavlm-base-plus-sv expects 16 kHz audio; got sampling_rate={sampling_rate}"
-            )
-        input_values, attention_mask = self._prepare_model_inputs(waveforms, sampling_rate)
-        frame_mask = frame_mask_from_sample_mask(attention_mask, self.wavlm_xv.wavlm)
-
-        if output_all_hidden_states:
-            if grad_through_input:
-                out = self.wavlm_xv(
-                    input_values,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                )
-            else:
-                with torch.no_grad():
-                    out = self.wavlm_xv(
-                        input_values,
-                        attention_mask=attention_mask,
-                        output_hidden_states=True,
-                    )
-            return out.hidden_states[-1], frame_mask, out.hidden_states
-
-        # Optimized: base encoder only, skip TDNN x-vector head and
-        # avoid allocating all 13 layer hidden-state tensors.
-        base = self.wavlm_xv.wavlm
-        if grad_through_input:
-            out = base(input_values, attention_mask=attention_mask)
-        else:
-            with torch.no_grad():
-                out = base(input_values, attention_mask=attention_mask)
-        return out.last_hidden_state, frame_mask, None

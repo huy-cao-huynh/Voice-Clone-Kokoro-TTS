@@ -1,4 +1,4 @@
-"""Voice-clone training and inference (Kokoro + frozen WavLM-SV)."""
+"""Voice-clone training and inference (Kokoro + frozen XLS-R speaker frontend)."""
 
 from .adapters import (
     AdapterRegistry,
@@ -9,7 +9,6 @@ from .adapters import (
 from .config import (
     LossWeights,
     MelLossConfig,
-    SLMDiscriminatorConfig,
     TrainConfig,
     kokoro_vocab_and_context_length,
     load_kokoro_config,
@@ -22,12 +21,13 @@ from .dataset import (
     phonemes_to_input_ids,
     text_to_phonemes,
 )
+from .discriminators import HiFiGANMPDMSDDiscriminator
 from .losses import (
     MelReconstructionLoss,
-    SLMFeatureDiscriminator,
-    slm_discriminator_loss_hinge,
-    slm_generator_loss_hinge,
+    discriminator_loss_lsgan,
+    feature_matching_loss,
     speaker_cosine_loss,
+    generator_loss_lsgan,
 )
 
 __all__ = [
@@ -37,7 +37,6 @@ __all__ = [
     "build_duration_encoder_adapters",
     "LossWeights",
     "MelLossConfig",
-    "SLMDiscriminatorConfig",
     "TrainConfig",
     "kokoro_vocab_and_context_length",
     "load_kokoro_config",
@@ -48,8 +47,9 @@ __all__ = [
     "phonemes_to_input_ids",
     "text_to_phonemes",
     "MelReconstructionLoss",
-    "SLMFeatureDiscriminator",
-    "slm_discriminator_loss_hinge",
-    "slm_generator_loss_hinge",
+    "HiFiGANMPDMSDDiscriminator",
+    "discriminator_loss_lsgan",
+    "generator_loss_lsgan",
+    "feature_matching_loss",
     "speaker_cosine_loss",
 ]

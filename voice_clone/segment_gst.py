@@ -1,4 +1,4 @@
-"""SegmentGST: MHA over a learnable bank with WavLM frame queries → Kokoro `ref_s` (256 = 128|128)."""
+"""SegmentGST: MHA over a learnable bank with XLS-R frame queries → Kokoro `ref_s` (256 = 128|128)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ class SegmentGSTOutput:
 
 
 class SegmentGST(nn.Module):
-    """Multi-head attention from frozen WavLM frames (queries) into a learnable bank `B` (keys/values).
+    """Multi-head attention from frozen XLS-R frames (queries) into a learnable bank `B` (keys/values).
 
     Matches the plan: bank `B ∈ R^{N×d}`, queries from the frame sequence (masked), pooled regularized
     style, then linear to 256 with Kokoro's split `ref_s = cat(style_dec_128, style_pred_128)`.
@@ -38,7 +38,7 @@ class SegmentGST(nn.Module):
         *,
         num_bases: int = 512,
         embed_dim: int = 256,
-        frame_dim: int = 768,
+        frame_dim: int = 1024,
         num_heads: int = 8,
         ref_dim: int = 256,
         style_dec_dim: int = 128,
@@ -82,10 +82,10 @@ class SegmentGST(nn.Module):
         *,
         need_weights: bool = False,
     ) -> Tuple[SegmentGSTOutput, Optional[torch.Tensor]]:
-        """Compute `ref_s` from WavLM encoder frames.
+        """Compute `ref_s` from XLS-R encoder frames.
 
         Args:
-            frame_hidden_states: `(batch, time, frame_dim)` e.g. WavLM last hidden states.
+            frame_hidden_states: `(batch, time, frame_dim)` e.g. XLS-R layer hidden states.
             frame_mask: `(batch, time)` with `1.0` for valid frames and `0.0` for padding.
             need_weights: If True, also return average attention weights over heads `(batch, time, N)`.
 

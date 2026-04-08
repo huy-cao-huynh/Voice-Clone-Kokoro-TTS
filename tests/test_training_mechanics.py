@@ -23,15 +23,14 @@ def full_stack():
         generator_trainable_parameters,
     )
     from voice_clone.segment_gst import SegmentGST
-    from voice_clone.losses import SLMFeatureDiscriminator
 
     device = torch.device("cpu")
     cfg = TrainConfig()
-    kmodel, gst, wavlm, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, xlsr, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
     return {
         "kmodel": kmodel,
         "gst": gst,
-        "wavlm": wavlm,
+        "xlsr": xlsr,
         "disc": disc,
         "mel_loss": mel_loss,
         "kokoro_cfg": kokoro_cfg,
@@ -63,10 +62,10 @@ class TestFreezeKokoroExceptAdapters:
         for name, p in gst.named_parameters():
             assert p.requires_grad, f"GST param {name} should be trainable"
 
-    def test_wavlm_all_frozen(self, full_stack):
-        wavlm = full_stack["wavlm"]
-        for name, p in wavlm.named_parameters():
-            assert not p.requires_grad, f"WavLM param {name} should be frozen"
+    def test_xlsr_all_frozen(self, full_stack):
+        xlsr = full_stack["xlsr"]
+        for name, p in xlsr.named_parameters():
+            assert not p.requires_grad, f"XLS-R param {name} should be frozen"
 
 
 class TestGeneratorTrainableParameters:
@@ -92,11 +91,9 @@ class TestGeneratorTrainableParameters:
 
 
 class TestPhasedTraining:
-    def test_no_slm_during_warmup(self, full_stack):
-        """generator_loss_backward with include_slm=False gives loss_slm_g=0."""
+    def test_no_gan_terms_during_warmup(self, full_stack):
+        """When `real_disc_features=None`, generator_loss_backward returns zero adv/fm."""
         from voice_clone.train_adapters import generator_loss_backward
-        from voice_clone.wavlm_sv import WavLMSVOutput
-        from voice_clone.config import LossWeights
 
         device = full_stack["device"]
         kmodel = full_stack["kmodel"]
@@ -105,41 +102,39 @@ class TestPhasedTraining:
         mel_loss = full_stack["mel_loss"]
         cfg = full_stack["cfg"]
 
-        # Synthetic WavLM-like output
-        fake_pooled = torch.randn(1, 512)
-        fake_frames = torch.randn(1, 20, 768, requires_grad=True)
-        fake_mask = torch.ones(1, 20)
-        fake_attn_mask = torch.ones(1, 24_000)
-        wv_gen = WavLMSVOutput(
-            pooled_embedding=fake_pooled,
-            frame_hidden_states=fake_frames,
-            frame_mask=fake_mask,
-            attention_mask=fake_attn_mask,
-        )
-
         opt_g = torch.optim.AdamW(
             [p for p in list(gst.parameters()) + list(kmodel.parameters()) if p.requires_grad],
             lr=1e-4,
         )
-        opt_g.zero_grad()
+        opt_g.zero_grad(set_to_none=True)
 
         pred_wav = torch.randn(1, 24_000, requires_grad=True)
-        ref_pooled = torch.randn(1, 512)
+        ref_pooled = torch.randn(1, 1024)
+        gen_pooled = torch.randn(1, 1024, requires_grad=True)
         tgt_24 = torch.randn(1, 24_000)
 
         metrics = generator_loss_backward(
-            kmodel, gst, wv_gen, disc, mel_loss, opt_g,
-            pred_wav, ref_pooled, tgt_24,
-            cfg.loss_weights,
-            scaler=None, use_amp=False,
-            include_slm=False,
+            kmodel,
+            gst,
+            mel_loss,
+            opt_g,
+            pred_wav,
+            ref_pooled,
+            gen_pooled,
+            tgt_24,
+            disc_waveform=disc,
+            real_disc_features=None,  # warmup: waveform D disabled
+            weights=cfg.loss_weights,
+            scaler=None,
+            use_amp=False,
+            scale_factor=1.0,
         )
-        assert metrics["loss_slm_g"] == 0.0
+        assert metrics["loss_adv_g"] == 0.0
+        assert metrics["loss_fm"] == 0.0
 
-    def test_disc_params_frozen_during_g_step(self, full_stack):
-        """During generator_loss_backward with include_slm=True, disc requires_grad is toggled off then restored."""
+    def test_disc_requires_grad_unchanged_during_g_step(self, full_stack):
+        """generator_loss_backward should not toggle discriminator requires_grad flags."""
         from voice_clone.train_adapters import generator_loss_backward
-        from voice_clone.wavlm_sv import WavLMSVOutput
 
         device = full_stack["device"]
         kmodel = full_stack["kmodel"]
@@ -151,38 +146,43 @@ class TestPhasedTraining:
         for p in disc.parameters():
             assert p.requires_grad, "D should start trainable"
 
-        fake_pooled = torch.randn(1, 512)
-        fake_frames = torch.randn(1, 20, 768, requires_grad=True)
-        fake_mask = torch.ones(1, 20)
-        fake_attn_mask = torch.ones(1, 24_000)
-        wv_gen = WavLMSVOutput(
-            pooled_embedding=fake_pooled,
-            frame_hidden_states=fake_frames,
-            frame_mask=fake_mask,
-            attention_mask=fake_attn_mask,
-        )
-
         opt_g = torch.optim.AdamW(
             [p for p in list(gst.parameters()) + list(kmodel.parameters()) if p.requires_grad],
             lr=1e-4,
         )
-        opt_g.zero_grad()
+        opt_g.zero_grad(set_to_none=True)
 
         pred_wav = torch.randn(1, 24_000, requires_grad=True)
-        ref_pooled = torch.randn(1, 512)
+        ref_pooled = torch.randn(1, 1024)
+        gen_pooled = torch.randn(1, 1024, requires_grad=True)
         tgt_24 = torch.randn(1, 24_000)
 
+        with torch.no_grad():
+            _real_logits, real_feats = disc(tgt_24)
+
+        before = [p.requires_grad for p in disc.parameters()]
+
         generator_loss_backward(
-            kmodel, gst, wv_gen, disc, mel_loss, opt_g,
-            pred_wav, ref_pooled, tgt_24,
-            cfg.loss_weights,
-            scaler=None, use_amp=False,
-            include_slm=True,
+            kmodel,
+            gst,
+            mel_loss,
+            opt_g,
+            pred_wav,
+            ref_pooled,
+            gen_pooled,
+            tgt_24,
+            disc_waveform=disc,
+            real_disc_features=real_feats,
+            weights=cfg.loss_weights,
+            scaler=None,
+            use_amp=False,
+            scale_factor=1.0,
         )
 
-        # After the call, disc requires_grad should be restored
+        after = [p.requires_grad for p in disc.parameters()]
+        assert before == after
         for p in disc.parameters():
-            assert p.requires_grad, "D requires_grad should be restored after G step"
+            assert p.requires_grad, "D requires_grad should remain enabled after G step"
 
 
 class TestWarmupLR:

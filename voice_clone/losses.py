@@ -1,9 +1,9 @@
-"""Mel reconstruction, speaker cosine (WavLM-SV), and SLM feature GAN (D on encoder frames only)."""
+"""Mel reconstruction, speaker cosine, and waveform-GAN helper losses."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -84,83 +84,120 @@ def speaker_cosine_loss(
     return (1.0 - cos).mean()
 
 
-def _maybe_spectral_norm(module: nn.Module, use_sn: bool) -> nn.Module:
-    """Optionally wrap a module with spectral normalization."""
-    return nn.utils.spectral_norm(module) if use_sn else module
+def _as_list(x: Union[torch.Tensor, Sequence[torch.Tensor]]) -> List[torch.Tensor]:
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    return [x]
 
 
-class SLMFeatureDiscriminator(nn.Module):
-    """Temporal conv stack on frozen WavLM frame features ``(B, T, C)`` (StyleTTS2-style SLM on features)."""
-
-    def __init__(
-        self,
-        in_dim: int = 768,
-        hidden_channels: int = 256,
-        num_layers: int = 4,
-        kernel_size: int = 7,
-        use_spectral_norm: bool = True,
-    ) -> None:
-        super().__init__()
-        if kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be odd for same-length conv")
-        pad = kernel_size // 2
-        sn = use_spectral_norm
-        self.input_norm = nn.LayerNorm(in_dim)
-        layers: list[nn.Module] = [
-            _maybe_spectral_norm(
-                nn.Conv1d(in_dim, hidden_channels, kernel_size=kernel_size, padding=pad), sn),
-            nn.LeakyReLU(0.2, inplace=True),
-        ]
-        for _ in range(num_layers - 1):
-            layers += [
-                _maybe_spectral_norm(
-                    nn.Conv1d(hidden_channels, hidden_channels, kernel_size=kernel_size, padding=pad), sn),
-                nn.LeakyReLU(0.2, inplace=True),
-            ]
-        layers.append(
-            _maybe_spectral_norm(
-                nn.Conv1d(hidden_channels, 1, kernel_size=kernel_size, padding=pad), sn))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, frame_features: torch.Tensor, frame_mask: torch.Tensor) -> torch.Tensor:
-        """Returns a **scalar logit per batch item** (masked mean over time).
-
-        Args:
-            frame_features: ``(batch, time, in_dim)``
-            frame_mask: ``(batch, time)`` with ``1`` / ``0`` (or float weights).
-        """
-        if frame_features.dim() != 3:
-            raise ValueError("frame_features must be (batch, time, dim)")
-        x = self.input_norm(frame_features).transpose(1, 2)
-        logits_t = self.net(x).squeeze(1)
-        m = frame_mask.to(dtype=logits_t.dtype, device=logits_t.device)
-        if m.dim() != 2:
-            raise ValueError("frame_mask must be (batch, time)")
-        w = m.sum(dim=1).clamp(min=1e-6)
-        pooled = (logits_t * m).sum(dim=1) / w
-        return pooled
+def _crop_logits_to_min_last_dim(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Crop `(B, N)` logits tensors to the minimum last-dim length.
+    """
+    if a.dim() != b.dim():
+        raise ValueError(f"a and b must have the same dim, got {a.dim()} and {b.dim()}")
+    n = min(a.size(-1), b.size(-1))
+    if a.size(-1) != n:
+        a = a[..., :n]
+    if b.size(-1) != n:
+        b = b[..., :n]
+    return a, b
 
 
-def slm_discriminator_loss_hinge(
-    disc: SLMFeatureDiscriminator,
-    real_feats: torch.Tensor,
-    fake_feats: torch.Tensor,
-    real_mask: torch.Tensor,
-    fake_mask: torch.Tensor,
+def _crop_to_min_shape(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Crop `a` and `b` to the minimum size along each spatial dimension.
+    Keeps batch/channel dims intact.
+    """
+    if a.dim() != b.dim():
+        raise ValueError(f"a and b must have the same dim, got {a.dim()} and {b.dim()}")
+    out_a = a
+    out_b = b
+    for dim in range(2, a.dim()):
+        n = min(out_a.size(dim), out_b.size(dim))
+        if out_a.size(dim) != n:
+            out_a = out_a.narrow(dim, 0, n)
+        if out_b.size(dim) != n:
+            out_b = out_b.narrow(dim, 0, n)
+    return out_a, out_b
+
+
+def discriminator_loss_lsgan(
+    real_logits: Union[torch.Tensor, Sequence[torch.Tensor]],
+    fake_logits: Union[torch.Tensor, Sequence[torch.Tensor]],
 ) -> torch.Tensor:
-    """Hinge loss training **D** only on WavLM frame tensors (already detached from G when needed)."""
-    d_real = disc(real_feats, real_mask)
-    d_fake = disc(fake_feats, fake_mask)
-    loss_real = F.relu(1.0 - d_real).mean()
-    loss_fake = F.relu(1.0 + d_fake).mean()
-    return loss_real + loss_fake
+    """
+    LSGAN discriminator loss for HiFi-GAN style discriminators.
+
+    Supports either a single logits tensor or a list/tuple of logits tensors.
+    """
+    r_list = _as_list(real_logits)
+    f_list = _as_list(fake_logits)
+    n = min(len(r_list), len(f_list))
+    if n == 0:
+        raise ValueError("real_logits and fake_logits must be non-empty")
+
+    losses: List[torch.Tensor] = []
+    for i in range(n):
+        r, f = _crop_logits_to_min_last_dim(r_list[i], f_list[i])
+        losses.append(((r - 1.0) ** 2).mean() + (f**2).mean())
+    return sum(losses) / len(losses)
 
 
-def slm_generator_loss_hinge(
-    disc: SLMFeatureDiscriminator,
-    fake_feats: torch.Tensor,
-    fake_mask: torch.Tensor,
+def generator_loss_lsgan(
+    fake_logits: Union[torch.Tensor, Sequence[torch.Tensor]],
 ) -> torch.Tensor:
-    """Generator side: encourage **D** to output positive on generated features."""
-    d_fake = disc(fake_feats, fake_mask)
-    return (-d_fake).mean()
+    """
+    LSGAN generator loss for HiFi-GAN style discriminators.
+    Encourages fake logits to match the "real" target (= 1).
+    """
+    f_list = _as_list(fake_logits)
+    if len(f_list) == 0:
+        raise ValueError("fake_logits must be non-empty")
+    losses: List[torch.Tensor] = []
+    for f in f_list:
+        # If logits come in mismatched shapes, we only have one tensor here.
+        losses.append(((f - 1.0) ** 2).mean())
+    return sum(losses) / len(losses)
+
+
+def feature_matching_loss(
+    real_features: Sequence[Union[torch.Tensor, Sequence[torch.Tensor]]],
+    fake_features: Sequence[Union[torch.Tensor, Sequence[torch.Tensor]]],
+) -> torch.Tensor:
+    """
+    Feature matching (HiFi-GAN style) using intermediate discriminator feature maps.
+
+    Expected structure:
+      - `real_features` and `fake_features` are lists over discriminators/sub-discriminators
+      - each item is a list of layer feature maps.
+
+    The function also tolerates a "single discriminator" case where you pass a flat list
+    of tensors instead of a nested list (it will be treated as a 1-element outer list).
+    """
+
+    def _normalize_feats(feats: Sequence[Union[torch.Tensor, Sequence[torch.Tensor]]]):
+        if len(feats) == 0:
+            return []
+        first = feats[0]
+        if isinstance(first, torch.Tensor):
+            # Flat list: [T1, T2, ...] -> [[T1, T2, ...]]
+            return [list(feats)]  # type: ignore[list-item]
+        # Nested list: [[...], [...], ...]
+        return [list(inner) for inner in feats]  # type: ignore[arg-type]
+
+    r_feats = _normalize_feats(real_features)
+    f_feats = _normalize_feats(fake_features)
+    if len(r_feats) == 0 or len(f_feats) == 0:
+        raise ValueError("real_features and fake_features must be non-empty")
+
+    disc_n = min(len(r_feats), len(f_feats))
+    losses: List[torch.Tensor] = []
+    for di in range(disc_n):
+        r_layers = r_feats[di]
+        f_layers = f_feats[di]
+        layer_n = min(len(r_layers), len(f_layers))
+        for li in range(layer_n):
+            r, f = _crop_to_min_shape(r_layers[li], f_layers[li])
+            losses.append((r - f).abs().mean())
+    return sum(losses) / len(losses)

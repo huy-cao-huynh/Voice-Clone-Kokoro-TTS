@@ -15,6 +15,7 @@ data/
 manifests/
 ckpt/
 scripts/build_common_voice_manifest.py
+scripts/sanity_base_kokoro_hindi_val.py
 # Python
 .pytest_cache/
 __pycache__/
