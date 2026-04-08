@@ -1,4 +1,4 @@
-"""Inference: reference wav + text + language → audio (Kokoro + trained SegmentGST / L-adapters, frozen XLS-R-SV)."""
+"""Inference: reference wav + text + language -> audio (Kokoro + trained SegmentGST / L-adapters, frozen WeSpeaker-SV)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .config import LossWeights, MelLossConfig, TrainConfig, kokoro_vocab_and_co
 from .dataset import load_audio_mono, normalize_lang_code, phonemes_to_input_ids, text_to_phonemes
 from .segment_gst import SegmentGST
 from .train_adapters import build_models
-from .xlsr_sv import XLSRSV
+from .wespeaker_sv import WeSpeakerSV
 
 KOKORO_OUTPUT_SR = 24_000
 
@@ -53,10 +53,10 @@ def apply_voice_clone_checkpoint(
 def build_stack_for_inference(
     cfg: TrainConfig,
     device: torch.device,
-) -> Tuple[KModel, SegmentGST, XLSRSV]:
-    """Construct Kokoro (with adapter slots), SegmentGST, and frozen XLS-R-SV (discriminator unused)."""
-    kmodel, gst, xlsr, _disc, _mel, _kokoro_cfg = build_models(cfg, device)
-    return kmodel, gst, xlsr
+) -> Tuple[KModel, SegmentGST, WeSpeakerSV]:
+    """Construct Kokoro (with adapter slots), SegmentGST, and frozen WeSpeaker-SV."""
+    kmodel, gst, sv_model, _disc, _mel, _kokoro_cfg = build_models(cfg, device)
+    return kmodel, gst, sv_model
 
 
 def infer_waveform(
@@ -94,7 +94,7 @@ def infer_waveform(
     if kokoro_repo_id is not None:
         cfg = replace(cfg, kokoro_repo_id=kokoro_repo_id)
 
-    kmodel, gst, xlsr = build_stack_for_inference(cfg, device)
+    kmodel, gst, sv_model = build_stack_for_inference(cfg, device)
     apply_voice_clone_checkpoint(ckpt, gst=gst, kmodel=kmodel)
 
     lang = normalize_lang_code(lang_code)
@@ -107,11 +107,19 @@ def infer_waveform(
     sp = speed if speed is not None else cfg.speed
 
     gst.eval()
-    xlsr.eval()
+    sv_model.eval()
     kmodel.eval()
     with torch.inference_mode():
-        wv = xlsr(ref_16, sampling_rate=16_000, grad_through_input=False)
-        gst_out, _ = gst(wv.frame_hidden_states, wv.frame_mask)
+        wv = sv_model(ref_16, sampling_rate=cfg.wespeaker_sample_rate, grad_through_input=False)
+        if wv.frame_features is None:
+            raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
+        frame_mask = torch.ones(
+            wv.frame_features.size(0),
+            wv.frame_features.size(1),
+            device=wv.frame_features.device,
+            dtype=wv.frame_features.dtype,
+        )
+        gst_out, _ = gst(wv.frame_features, frame_mask)
         ref_s = gst_out.ref_s
         audio, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=sp)
         audio = audio.clamp(-1.0, 1.0)
@@ -121,7 +129,7 @@ def infer_waveform(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Voice-clone inference: ref wav + text + lang → WAV (24 kHz).")
     p.add_argument("--checkpoint", type=Path, required=True, help="Training checkpoint (.pt) with GST + adapters.")
-    p.add_argument("--ref-wav", type=Path, required=True, help="Reference speaker audio (any rate; resampled to 16 kHz for XLS-R).")
+    p.add_argument("--ref-wav", type=Path, required=True, help="Reference speaker audio (any rate; resampled to 16 kHz for WeSpeaker).")
     p.add_argument("--text", type=str, required=True)
     p.add_argument("--lang", type=str, required=True, help="Kokoro lang code or alias (e.g. a, en-us, z).")
     p.add_argument("--out", type=Path, required=True, help="Output WAV path.")

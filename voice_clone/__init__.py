@@ -1,4 +1,4 @@
-"""Voice-clone training and inference (Kokoro + frozen XLS-R speaker frontend)."""
+"""Voice-clone training and inference (Kokoro + frozen WeSpeaker frontend)."""
 
 from .adapters import (
     AdapterRegistry,
@@ -29,6 +29,7 @@ from .losses import (
     speaker_cosine_loss,
     generator_loss_lsgan,
 )
+from .wespeaker_sv import WeSpeakerSV, WeSpeakerSVOutput
 
 __all__ = [
     "AdapterRegistry",
@@ -52,4 +53,6 @@ __all__ = [
     "generator_loss_lsgan",
     "feature_matching_loss",
     "speaker_cosine_loss",
+    "WeSpeakerSV",
+    "WeSpeakerSVOutput",
 ]

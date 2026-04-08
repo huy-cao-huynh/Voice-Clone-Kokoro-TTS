@@ -18,9 +18,9 @@ TrainConfig = _config.TrainConfig
 
 
 def test_train_config_checkpoint_interval_default() -> None:
-    """Checkpoint cadence defaults to 500 steps."""
+    """Checkpoint cadence defaults to 250 steps."""
     cfg = TrainConfig()
-    assert cfg.checkpoint_interval == 1000
+    assert cfg.checkpoint_interval == 250
 
 
 def test_disc_start_step_default() -> None:
@@ -47,7 +47,13 @@ def test_lambda_spk_default() -> None:
     assert cfg.loss_weights.lambda_spk == 1.0
 
 
-def test_xlsr_layer_idx_default() -> None:
-    """XLS-R intermediate layer index defaults to 12."""
+def test_wespeaker_sample_rate_default() -> None:
+    """WeSpeaker sample rate defaults to 16 kHz."""
     cfg = TrainConfig()
-    assert cfg.xlsr_layer_idx == 12
+    assert cfg.wespeaker_sample_rate == 16_000
+
+
+def test_universal_style_vector_path_default() -> None:
+    """Universal style vector path points to the canonical checkpoint."""
+    cfg = TrainConfig()
+    assert cfg.universal_style_vector_path == "voice_clone/universal_style_vector.pt"

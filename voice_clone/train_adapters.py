@@ -1,4 +1,4 @@
-"""Train SegmentGST + Kokoro L-adapters + waveform discriminator (Kokoro and XLS-R frozen)."""
+"""Train SegmentGST + Kokoro L-adapters + waveform discriminator (Kokoro and WeSpeaker frozen)."""
 
 from __future__ import annotations
 
@@ -28,11 +28,12 @@ from .losses import (
     discriminator_loss_lsgan,
     feature_matching_loss,
     generator_loss_lsgan,
+    speaker_input_mel_from_waveform,
     speaker_cosine_loss,
 )
 from .segment_gst import SegmentGST
 from .train_profiling import BreakdownAggregator, StepStopwatch, build_torch_profiler
-from .xlsr_sv import XLSRSV, XLSRSVOutput
+from .wespeaker_sv import WeSpeakerSV, WeSpeakerSVOutput
 from .discriminators.hifigan import HiFiGANMPDMSDDiscriminator
 
 
@@ -86,8 +87,8 @@ def _terminal_metrics_cr_line(global_step: int, metrics: Dict[str, float]) -> st
 
 
 def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
-    # Keep training mode for MIOpen RNN backward; freezing is controlled by requires_grad.
-    kmodel.train()
+    # Prefer eval for frozen backbone determinism; fallback to train + zero-dropout if backend needs it.
+    kmodel.eval()
     for p in kmodel.parameters():
         p.requires_grad_(False)
     enc = kmodel.predictor.text_encoder
@@ -100,6 +101,26 @@ def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
     if kmodel.decoder.generator.adapters is not None:
         for p in kmodel.decoder.generator.adapters.parameters():
             p.requires_grad_(True)
+
+
+def apply_kokoro_freeze_mode_policy(kmodel: KModel, policy: str) -> None:
+    if policy != "eval_then_fallback_train_dropout_zero":
+        raise ValueError(f"Unsupported kokoro_eval_mode policy: {policy}")
+    try:
+        kmodel.eval()
+        # ROCm/MIOpen requires RNN modules to run in training mode for backward().
+        # Keep the rest of Kokoro in eval, but flip only RNN blocks and disable their dropout.
+        if getattr(torch.version, "hip", None):
+            for m in kmodel.modules():
+                if isinstance(m, nn.RNNBase):
+                    m.train(True)
+                    if hasattr(m, "dropout"):
+                        m.dropout = 0.0
+    except Exception:
+        kmodel.train()
+        for m in kmodel.modules():
+            if isinstance(m, nn.Dropout):
+                m.p = 0.0
 
 
 def strip_weight_norm_frozen(model: nn.Module) -> None:
@@ -142,16 +163,6 @@ def generator_trainable_parameters(kmodel: KModel, gst: SegmentGST) -> List[nn.P
     return list(gst.parameters()) + [p for p in kmodel.parameters() if p.requires_grad]
 
 
-def _make_grad_clamp_hook(max_norm: float):
-    """Return a tensor ``register_hook`` callback that per-tensor norm-clamps incoming gradients."""
-    def _hook(grad: torch.Tensor) -> torch.Tensor:
-        norm = grad.norm()
-        if norm > max_norm:
-            return grad * (max_norm / norm)
-        return grad
-    return _hook
-
-
 def _ensure_batch_time(wav: torch.Tensor) -> torch.Tensor:
     if wav.dim() == 1:
         return wav.unsqueeze(0)
@@ -190,7 +201,7 @@ def build_mel_loss(kokoro_cfg: Dict[str, Any], mel_cfg: MelLossConfig, device: t
 def build_models(
     cfg: TrainConfig,
     device: torch.device,
-) -> Tuple[KModel, SegmentGST, XLSRSV, HiFiGANMPDMSDDiscriminator, MelReconstructionLoss, Dict[str, Any]]:
+) -> Tuple[KModel, SegmentGST, WeSpeakerSV, HiFiGANMPDMSDDiscriminator, MelReconstructionLoss, Dict[str, Any]]:
     kokoro_cfg = load_kokoro_config(cfg.kokoro_repo_id)
     istft = kokoro_cfg["istftnet"]
     registry = AdapterRegistry.from_dims(
@@ -210,22 +221,39 @@ def build_models(
     )
     kmodel = kmodel.to(device)
     freeze_kokoro_except_adapters(kmodel)
+    apply_kokoro_freeze_mode_policy(kmodel, cfg.kokoro_eval_mode)
     strip_weight_norm_frozen(kmodel)
 
-    gst = SegmentGST(frame_dim=1024, embed_dim=256, num_heads=8, ref_dim=256, style_dec_dim=128)
-    gst = gst.to(device)
-
-    xlsr = XLSRSV.from_pretrained(
-        cfg.xlsr_model_id,
-        layer_idx=cfg.xlsr_layer_idx,
+    sv_model = WeSpeakerSV.from_checkpoint(
+        cfg.wespeaker_checkpoint_path,
+        embedding_dim=cfg.wespeaker_embedding_dim,
+        sample_rate=cfg.wespeaker_sample_rate,
         device=device,
         dtype=None,
     )
+    with torch.no_grad():
+        probe_mel = torch.zeros(1, 80, 8, device=device, dtype=sv_model.dtype)
+        probe_out = sv_model.forward_from_mel(
+            probe_mel,
+            grad_through_input=False,
+            return_frame_features=True,
+        )
+        if probe_out.frame_features is None:
+            raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
+        inferred_frame_dim = int(probe_out.frame_features.shape[-1])
+    gst = SegmentGST(
+        frame_dim=inferred_frame_dim,
+        embed_dim=256,
+        num_heads=8,
+        ref_dim=256,
+        style_dec_dim=128,
+    )
+    gst = gst.to(device)
 
     disc = HiFiGANMPDMSDDiscriminator().to(device)
 
     mel_loss = build_mel_loss(kokoro_cfg, cfg.mel, device)
-    return kmodel, gst, xlsr, disc, mel_loss, kokoro_cfg
+    return kmodel, gst, sv_model, disc, mel_loss, kokoro_cfg
 
 
 def save_checkpoint(
@@ -389,7 +417,7 @@ def _log_wandb_validation(
     dataset: Dataset,
     kmodel: KModel,
     gst: SegmentGST,
-    xlsr: XLSRSV,
+    sv_model: WeSpeakerSV,
     mel_loss_mod: MelReconstructionLoss,
     cfg: TrainConfig,
     device: torch.device,
@@ -427,8 +455,16 @@ def _log_wandb_validation(
                 caption = _caption_from_input_ids(batch["input_ids"].squeeze(0), id_to_char)
 
             with torch.no_grad():
-                wv_ref: XLSRSVOutput = xlsr(ref_16, sampling_rate=16_000, grad_through_input=False)
-                gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
+                wv_ref: WeSpeakerSVOutput = sv_model(ref_16, sampling_rate=cfg.wespeaker_sample_rate, grad_through_input=False)
+                if wv_ref.frame_features is None:
+                    raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
+                frame_mask = torch.ones(
+                    wv_ref.frame_features.size(0),
+                    wv_ref.frame_features.size(1),
+                    device=wv_ref.frame_features.device,
+                    dtype=wv_ref.frame_features.dtype,
+                )
+                gst_out, _ = gst(wv_ref.frame_features, frame_mask)
                 ref_s = gst_out.ref_s
                 pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
                 pred_wav = _ensure_batch_time(pred_wav)
@@ -439,8 +475,17 @@ def _log_wandb_validation(
                 mel_l1_sum += float(d.abs().mean().item())
                 mel_l2_sum += float((d**2).mean().item())
 
-                w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
-                wv_gen: XLSRSVOutput = xlsr(w_gen_16, sampling_rate=16_000, grad_through_input=False)
+                mel_gen = speaker_input_mel_from_waveform(
+                    pred_wav,
+                    mel_transform=sv_model._waveforms_to_mel,
+                    amp_enabled=cfg.use_amp,
+                    disable_amp_for_stft=cfg.disable_amp_for_stft,
+                )
+                wv_gen: WeSpeakerSVOutput = sv_model.forward_from_mel(
+                    mel_gen,
+                    grad_through_input=False,
+                    return_frame_features=False,
+                )
                 spk_sum += float(speaker_cosine_loss(wv_ref.pooled_embedding, wv_gen.pooled_embedding).item())
 
             pred_np = pred_wav.squeeze(0).detach().float().cpu().numpy().astype(np.float32)
@@ -486,7 +531,7 @@ def train_loop(
     torch_profiler_trace: Optional[Path] = None,
     val_dataset: Optional[Dataset] = None,
 ) -> None:
-    kmodel, gst, xlsr, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, sv_model, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
     vocab: Dict[str, int] = kokoro_cfg["vocab"]
     params_g = generator_trainable_parameters(kmodel, gst)
     opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g, weight_decay=cfg.weight_decay_g)
@@ -628,16 +673,24 @@ def train_loop(
                         # Reference SSL forward (no grad) -> GST conditioning.
                         with _cuda_amp_context(cfg.use_amp, ref_16):
                             if sw is not None:
-                                sw.start("xlsr_ref")
-                            wv_ref: XLSRSVOutput = xlsr(
+                                sw.start("sv_ref")
+                            wv_ref: WeSpeakerSVOutput = sv_model(
                                 ref_16,
-                                sampling_rate=16_000,
+                                sampling_rate=cfg.wespeaker_sample_rate,
                                 grad_through_input=False,
                             )
-                            gst_out, _ = gst(wv_ref.frame_hidden_states, wv_ref.frame_mask)
+                            if wv_ref.frame_features is None:
+                                raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
+                            frame_mask = torch.ones(
+                                wv_ref.frame_features.size(0),
+                                wv_ref.frame_features.size(1),
+                                device=wv_ref.frame_features.device,
+                                dtype=wv_ref.frame_features.dtype,
+                            )
+                            gst_out, _ = gst(wv_ref.frame_features, frame_mask)
                             ref_s = gst_out.ref_s
                             if sw is not None:
-                                sw.end("xlsr_ref", sync_cuda=True)
+                                sw.end("sv_ref", sync_cuda=True)
 
                             # Kokoro generator forward (24 kHz waveform).
                             if sw is not None:
@@ -650,19 +703,20 @@ def train_loop(
 
                         # Generated audio SSL forward (with grad) for speaker loss.
                         if sw is not None:
-                            sw.start("xlsr_gen")
-                        w_gen_16 = resample_mono(pred_wav, 24_000, 16_000)
-                        wv_gen: XLSRSVOutput = xlsr(
-                            w_gen_16,
-                            sampling_rate=16_000,
-                            grad_through_input=True,
+                            sw.start("sv_gen")
+                        mel_gen = speaker_input_mel_from_waveform(
+                            pred_wav,
+                            mel_transform=sv_model._waveforms_to_mel,
+                            amp_enabled=cfg.use_amp,
+                            disable_amp_for_stft=cfg.disable_amp_for_stft,
                         )
-                        if cfg.ssl_grad_max_norm is not None:
-                            _clamp = _make_grad_clamp_hook(cfg.ssl_grad_max_norm)
-                            wv_gen.frame_hidden_states.register_hook(_clamp)
-                            wv_gen.pooled_embedding.register_hook(_clamp)
+                        wv_gen: WeSpeakerSVOutput = sv_model.forward_from_mel(
+                            mel_gen,
+                            grad_through_input=True,
+                            return_frame_features=False,
+                        )
                         if sw is not None:
-                            sw.end("xlsr_gen", sync_cuda=True)
+                            sw.end("sv_gen", sync_cuda=True)
 
                         # Waveform discriminator on real vs fake (D-step).
                         if sw is not None:
@@ -737,13 +791,11 @@ def train_loop(
                             break
                         continue
 
-                    # -- Deferred optimizer steps: unscale, clip, step --
+                    # -- Deferred optimizer steps: unscale, step --
                     d_stepped = include_gan
                     if include_gan:
                         if scaler_d is not None and cfg.use_amp:
                             scaler_d.unscale_(opt_d)
-                        if cfg.grad_clip_d is not None:
-                            torch.nn.utils.clip_grad_norm_(disc.parameters(), cfg.grad_clip_d)
                         if scaler_d is not None and cfg.use_amp:
                             scaler_d.step(opt_d)
                         else:
@@ -751,8 +803,6 @@ def train_loop(
 
                     if scaler_g is not None and cfg.use_amp:
                         scaler_g.unscale_(opt_g)
-                    if cfg.grad_clip_g is not None:
-                        torch.nn.utils.clip_grad_norm_(params_g, cfg.grad_clip_g)
                     if scaler_g is not None and cfg.use_amp:
                         scaler_g.step(opt_g)
                     else:
@@ -857,7 +907,7 @@ def train_loop(
                                 dataset=dataloader.dataset,
                                 kmodel=kmodel,
                                 gst=gst,
-                                xlsr=xlsr,
+                                sv_model=sv_model,
                                 mel_loss_mod=mel_loss_mod,
                                 cfg=cfg,
                                 device=device,

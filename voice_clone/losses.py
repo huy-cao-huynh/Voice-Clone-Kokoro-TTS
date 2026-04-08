@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 
 
 @dataclass
@@ -21,6 +23,25 @@ def _min_time_crop(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torc
     """Crop last dim to ``min(a.size(-1), b.size(-1))``."""
     n = min(a.shape[-1], b.shape[-1])
     return a[..., :n], b[..., :n]
+
+
+def speaker_input_mel_from_waveform(
+    waveforms: torch.Tensor,
+    *,
+    mel_transform: nn.Module,
+    amp_enabled: bool,
+    disable_amp_for_stft: bool,
+) -> torch.Tensor:
+    """Compute mel input for frozen speaker frontend while preserving gradients to waveform."""
+    if waveforms.dim() != 2:
+        raise ValueError(f"waveforms must be `(batch, time)`, got {tuple(waveforms.shape)}")
+    if disable_amp_for_stft and waveforms.is_cuda:
+        with autocast("cuda", enabled=False):
+            mel = mel_transform(waveforms.float())
+        return mel.to(dtype=waveforms.dtype)
+    ctx = autocast("cuda", enabled=amp_enabled) if waveforms.is_cuda else contextlib.nullcontext()
+    with ctx:
+        return mel_transform(waveforms)
 
 
 class MelReconstructionLoss(nn.Module):

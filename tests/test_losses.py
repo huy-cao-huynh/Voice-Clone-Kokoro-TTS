@@ -103,3 +103,55 @@ class TestSpeakerCosineLoss:
         assert loss.item() >= 0.0
 
 
+class TestSpeakerBackpropPath:
+    def test_speaker_path_backprops_to_pred_wav(self, losses_mod):
+        pytest.importorskip("torchaudio", reason="speaker mel path requires torchaudio")
+        import torchaudio
+
+        class TinyFrozenSpeaker(torch.nn.Module):
+            def __init__(self, n_mels: int, emb_dim: int) -> None:
+                super().__init__()
+                self.proj = torch.nn.Linear(n_mels, emb_dim, bias=False)
+                for p in self.parameters():
+                    p.requires_grad_(False)
+
+            def forward(self, mel: torch.Tensor) -> torch.Tensor:
+                # mel: (B, n_mels, T)
+                pooled = mel.mean(dim=-1)
+                return self.proj(pooled)
+
+        mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=24_000,
+            n_fft=1024,
+            hop_length=256,
+            win_length=1024,
+            n_mels=80,
+            power=1.0,
+        )
+        pred_wav = torch.randn(2, 24_000, requires_grad=True)
+        ref_wav = torch.randn(2, 24_000)
+        speaker = TinyFrozenSpeaker(n_mels=80, emb_dim=256)
+
+        mel_pred = losses_mod.speaker_input_mel_from_waveform(
+            pred_wav,
+            mel_transform=mel_transform,
+            amp_enabled=False,
+            disable_amp_for_stft=True,
+        )
+        mel_ref = losses_mod.speaker_input_mel_from_waveform(
+            ref_wav,
+            mel_transform=mel_transform,
+            amp_enabled=False,
+            disable_amp_for_stft=True,
+        )
+        emb_pred = speaker(mel_pred)
+        with torch.no_grad():
+            emb_ref = speaker(mel_ref)
+
+        loss = losses_mod.speaker_cosine_loss(emb_ref, emb_pred)
+        loss.backward()
+
+        assert pred_wav.grad is not None
+        assert pred_wav.grad.abs().sum() > 0
+
+

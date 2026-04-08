@@ -1,0 +1,37 @@
+flowchart TD
+  A[JSONL Manifest] --> B[VoiceCloneManifestDataset]
+  B -->|ref_wav @16k| C[WeSpeakerSV Frozen]
+  B -->|target_wav @24k| TGT[Target waveform]
+  B -->|text/lang -> phonemes -> input_ids| TOK[Token IDs]
+
+  C -->|frame_features| D[SegmentGST]
+  C -->|pooled_embedding ref| EREF[Ref speaker embedding]
+
+  D -->|ref_s style vector 256d| K[Kokoro KModel]
+  TOK --> K
+  K -->|pred_wav @24k| PRED[Pred waveform]
+
+  PRED --> MEL[MelReconstructionLoss]
+  TGT --> MEL
+
+  PRED --> MELSV[speaker_input_mel_from_waveform]
+  MELSV --> C2[WeSpeakerSV Frozen]
+  C2 -->|pooled_embedding gen| EGEN[Gen speaker embedding]
+  EREF --> SPK[speaker_cosine_loss]
+  EGEN --> SPK
+
+  TGT --> DISC[HiFiGAN MPD+MSD Discriminator]
+  PRED -->|detach for D-step| DISC
+  DISC --> DLOSS[discriminator_loss_lsgan]
+
+  PRED --> DISC2[Discriminator for G-step]
+  DISC2 --> GADV[generator_loss_lsgan]
+  DISC2 --> FM[feature_matching_loss vs real features]
+
+  MEL --> SUM[Generator total loss]
+  SPK --> SUM
+  GADV --> SUM
+  FM --> SUM
+
+  SUM --> OPTG[AdamW Generator]
+  DLOSS --> OPTD[AdamW Discriminator]

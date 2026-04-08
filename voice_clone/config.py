@@ -32,8 +32,12 @@ class MelLossConfig:
 @dataclass
 class TrainConfig:
     kokoro_repo_id: str = "hexgrad/Kokoro-82M"
-    xlsr_model_id: str = "facebook/wav2vec2-xls-r-300m"
-    xlsr_layer_idx: int = 12
+    wespeaker_checkpoint_path: str = "wespeaker/models/avg_model"
+    wespeaker_embedding_dim: int = 256
+    wespeaker_sample_rate: int = 16_000
+    universal_style_vector_path: str = "voice_clone/universal_style_vector.pt"
+    kokoro_eval_mode: str = "eval_then_fallback_train_dropout_zero"
+    disable_amp_for_stft: bool = True
     adapter_bottleneck: int = 64
     loss_weights: LossWeights = field(default_factory=LossWeights)
     mel: MelLossConfig = field(default_factory=MelLossConfig)
@@ -41,17 +45,14 @@ class TrainConfig:
     lr_d: float = 5e-5
     weight_decay_g: float = 0.0
     weight_decay_d: float = 0.0
-    grad_clip_g: Optional[float] = 1.0
-    grad_clip_d: Optional[float] = 1.0
     use_amp: bool = True
     # How often to log to W&B and refresh training metrics in the terminal (tqdm postfix or one-line \r).
     log_interval: int = 1
     checkpoint_interval: int = 250
     warmup_steps: int = 50
     grad_accum_steps: int = 8
-    disc_start_step: int = 250
+    disc_start_step: int = 500
     speed: float = 1.0
-    ssl_grad_max_norm: Optional[float] = 1.0
     lr_min_g: float = 1e-6
     lr_min_d: float = 1e-7
 

@@ -1,4 +1,4 @@
-"""SegmentGST: MHA over a learnable bank with XLS-R frame queries → Kokoro `ref_s` (256 = 128|128)."""
+"""SegmentGST: MHA over a learnable bank with frame queries -> Kokoro `ref_s` (256 = 128|128)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-
 
 @dataclass
 class SegmentGSTOutput:
@@ -27,7 +26,7 @@ class SegmentGSTOutput:
 
 
 class SegmentGST(nn.Module):
-    """Multi-head attention from frozen XLS-R frames (queries) into a learnable bank `B` (keys/values).
+    """Multi-head attention from speaker-frame queries into a learnable bank `B` (keys/values).
 
     Matches the plan: bank `B ∈ R^{N×d}`, queries from the frame sequence (masked), pooled regularized
     style, then linear to 256 with Kokoro's split `ref_s = cat(style_dec_128, style_pred_128)`.
@@ -43,6 +42,7 @@ class SegmentGST(nn.Module):
         ref_dim: int = 256,
         style_dec_dim: int = 128,
         dropout: float = 0.1,
+        universal_style_vector: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         if ref_dim != style_dec_dim * 2:
@@ -75,6 +75,21 @@ class SegmentGST(nn.Module):
         nn.init.zeros_(self.to_ref_s.weight)
         nn.init.zeros_(self.to_ref_s.bias)
 
+        if universal_style_vector is None:
+            u = torch.zeros(ref_dim, dtype=self.to_ref_s.weight.dtype)
+        else:
+            if universal_style_vector.dim() != 1:
+                raise ValueError(
+                    "universal_style_vector must be 1-D with shape `(ref_dim,)`, "
+                    f"got {tuple(universal_style_vector.shape)}"
+                )
+            if int(universal_style_vector.numel()) != ref_dim:
+                raise ValueError(
+                    f"universal_style_vector length {int(universal_style_vector.numel())} != ref_dim {ref_dim}"
+                )
+            u = universal_style_vector.detach().to(dtype=self.to_ref_s.weight.dtype)
+        self.register_buffer("universal_style_vector", u, persistent=True)
+
     def forward(
         self,
         frame_hidden_states: torch.Tensor,
@@ -82,10 +97,10 @@ class SegmentGST(nn.Module):
         *,
         need_weights: bool = False,
     ) -> Tuple[SegmentGSTOutput, Optional[torch.Tensor]]:
-        """Compute `ref_s` from XLS-R encoder frames.
+        """Compute `ref_s` from speaker encoder frames.
 
         Args:
-            frame_hidden_states: `(batch, time, frame_dim)` e.g. XLS-R layer hidden states.
+            frame_hidden_states: `(batch, time, frame_dim)` from frozen speaker frontend.
             frame_mask: `(batch, time)` with `1.0` for valid frames and `0.0` for padding.
             need_weights: If True, also return average attention weights over heads `(batch, time, N)`.
 
@@ -131,7 +146,16 @@ class SegmentGST(nn.Module):
         denom = m.sum(dim=1).clamp(min=1e-6)
         pooled = (attn_out * m).sum(dim=1) / denom
 
-        ref_s = self.to_ref_s(pooled)
+        delta_ref_s = self.to_ref_s(pooled)
+        if self.universal_style_vector.dim() != 1 or self.universal_style_vector.numel() != self.ref_dim:
+            raise RuntimeError(
+                "SegmentGST.universal_style_vector must have shape `(ref_dim,)`; "
+                f"got {tuple(self.universal_style_vector.shape)}"
+            )
+        ref_s = delta_ref_s + self.universal_style_vector.to(
+            device=delta_ref_s.device,
+            dtype=delta_ref_s.dtype,
+        ).unsqueeze(0).expand(b, -1)
         style_dec = ref_s[:, : self.style_dec_dim]
         style_pred = ref_s[:, self.style_dec_dim :]
 

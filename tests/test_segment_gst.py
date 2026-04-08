@@ -45,15 +45,17 @@ class TestSegmentGSTZeroInit:
         assert (gst.to_ref_s.weight == 0).all()
         assert (gst.to_ref_s.bias == 0).all()
 
-    def test_ref_s_is_zero_at_init(self, segment_gst_mod):
-        """With zero-init readout, ref_s is zero regardless of input."""
-        gst = segment_gst_mod.SegmentGST()
+    def test_ref_s_equals_universal_style_at_init(self, segment_gst_mod):
+        """With zero-init readout, ref_s equals the universal style vector."""
+        u = torch.linspace(-1.0, 1.0, 256)
+        gst = segment_gst_mod.SegmentGST(universal_style_vector=u)
         gst.eval()
         frames = torch.randn(B, T, FRAME_DIM)
         mask = torch.ones(B, T)
         with torch.no_grad():
             out, _ = gst(frames, mask)
-        torch.testing.assert_close(out.ref_s, torch.zeros(B, 256))
+        expected = u.unsqueeze(0).expand(B, -1)
+        torch.testing.assert_close(out.ref_s, expected)
 
 
 class TestSegmentGSTKokoroSplit:
@@ -97,6 +99,10 @@ class TestSegmentGSTMaskHandling:
 
 
 class TestSegmentGSTValidation:
+    def test_universal_style_vector_length_mismatch_raises(self, segment_gst_mod):
+        with pytest.raises(ValueError, match="length .* != ref_dim"):
+            segment_gst_mod.SegmentGST(universal_style_vector=torch.zeros(255))
+
     def test_ref_dim_mismatch_raises(self, segment_gst_mod):
         with pytest.raises(ValueError, match="ref_dim must equal 2"):
             segment_gst_mod.SegmentGST(ref_dim=300, style_dec_dim=128)
@@ -153,6 +159,15 @@ class TestSegmentGSTAttentionWeights:
 
 
 class TestSegmentGSTGradientFlow:
+    def test_grad_flows_to_to_ref_s_through_residual_path(self, segment_gst_mod):
+        gst = segment_gst_mod.SegmentGST(universal_style_vector=torch.randn(256))
+        frames = torch.randn(B, T, FRAME_DIM)
+        mask = torch.ones(B, T)
+        out, _ = gst(frames, mask)
+        out.ref_s.sum().backward()
+        assert gst.to_ref_s.weight.grad is not None
+        assert gst.to_ref_s.weight.grad.abs().sum() > 0
+
     def test_grad_flows_to_bank(self, segment_gst_mod):
         gst = segment_gst_mod.SegmentGST()
         with torch.no_grad():

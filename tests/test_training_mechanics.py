@@ -26,11 +26,11 @@ def full_stack():
 
     device = torch.device("cpu")
     cfg = TrainConfig()
-    kmodel, gst, xlsr, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, sv_model, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
     return {
         "kmodel": kmodel,
         "gst": gst,
-        "xlsr": xlsr,
+        "sv_model": sv_model,
         "disc": disc,
         "mel_loss": mel_loss,
         "kokoro_cfg": kokoro_cfg,
@@ -62,10 +62,10 @@ class TestFreezeKokoroExceptAdapters:
         for name, p in gst.named_parameters():
             assert p.requires_grad, f"GST param {name} should be trainable"
 
-    def test_xlsr_all_frozen(self, full_stack):
-        xlsr = full_stack["xlsr"]
-        for name, p in xlsr.named_parameters():
-            assert not p.requires_grad, f"XLS-R param {name} should be frozen"
+    def test_wespeaker_all_frozen(self, full_stack):
+        sv_model = full_stack["sv_model"]
+        for name, p in sv_model.named_parameters():
+            assert not p.requires_grad, f"WeSpeaker param {name} should be frozen"
 
 
 class TestGeneratorTrainableParameters:

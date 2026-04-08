@@ -32,14 +32,14 @@ def stack_and_opts():
 
     device = torch.device("cpu")
     cfg = TrainConfig()
-    kmodel, gst, xlsr, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, sv_model, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
     params_g = generator_trainable_parameters(kmodel, gst)
     opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g)
     opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d)
     return {
         "kmodel": kmodel,
         "gst": gst,
-        "xlsr": xlsr,
+        "sv_model": sv_model,
         "disc": disc,
         "opt_g": opt_g,
         "opt_d": opt_d,
