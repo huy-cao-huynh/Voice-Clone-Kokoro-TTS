@@ -117,6 +117,11 @@ def _crop_logits_to_min_last_dim(a: torch.Tensor, b: torch.Tensor) -> Tuple[torc
     """
     if a.dim() != b.dim():
         raise ValueError(f"a and b must have the same dim, got {a.dim()} and {b.dim()}")
+    if a.shape[:-1] != b.shape[:-1]:
+        raise ValueError(
+            "a and b must match on all non-time dims before cropping, "
+            f"got {tuple(a.shape)} and {tuple(b.shape)}"
+        )
     n = min(a.size(-1), b.size(-1))
     if a.size(-1) != n:
         a = a[..., :n]
@@ -132,6 +137,11 @@ def _crop_to_min_shape(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, 
     """
     if a.dim() != b.dim():
         raise ValueError(f"a and b must have the same dim, got {a.dim()} and {b.dim()}")
+    if a.shape[:2] != b.shape[:2]:
+        raise ValueError(
+            "a and b must match on batch/channel dims before cropping, "
+            f"got {tuple(a.shape)} and {tuple(b.shape)}"
+        )
     out_a = a
     out_b = b
     for dim in range(2, a.dim()):
@@ -154,12 +164,16 @@ def discriminator_loss_lsgan(
     """
     r_list = _as_list(real_logits)
     f_list = _as_list(fake_logits)
-    n = min(len(r_list), len(f_list))
-    if n == 0:
+    if len(r_list) == 0 or len(f_list) == 0:
         raise ValueError("real_logits and fake_logits must be non-empty")
+    if len(r_list) != len(f_list):
+        raise ValueError(
+            "real_logits and fake_logits must have the same number of discriminator outputs, "
+            f"got {len(r_list)} and {len(f_list)}"
+        )
 
     losses: List[torch.Tensor] = []
-    for i in range(n):
+    for i in range(len(r_list)):
         r, f = _crop_logits_to_min_last_dim(r_list[i], f_list[i])
         losses.append(((r - 1.0) ** 2).mean() + (f**2).mean())
     return sum(losses) / len(losses)
@@ -211,14 +225,24 @@ def feature_matching_loss(
     f_feats = _normalize_feats(fake_features)
     if len(r_feats) == 0 or len(f_feats) == 0:
         raise ValueError("real_features and fake_features must be non-empty")
+    if len(r_feats) != len(f_feats):
+        raise ValueError(
+            "real_features and fake_features must have the same number of discriminators, "
+            f"got {len(r_feats)} and {len(f_feats)}"
+        )
 
-    disc_n = min(len(r_feats), len(f_feats))
     losses: List[torch.Tensor] = []
-    for di in range(disc_n):
+    for di in range(len(r_feats)):
         r_layers = r_feats[di]
         f_layers = f_feats[di]
-        layer_n = min(len(r_layers), len(f_layers))
-        for li in range(layer_n):
+        if len(r_layers) != len(f_layers):
+            raise ValueError(
+                "real_features and fake_features must have the same number of layers per discriminator, "
+                f"got {len(r_layers)} and {len(f_layers)} for discriminator index {di}"
+            )
+        for li in range(len(r_layers)):
             r, f = _crop_to_min_shape(r_layers[li], f_layers[li])
             losses.append((r - f).abs().mean())
+    if len(losses) == 0:
+        raise ValueError("feature lists must contain at least one feature map")
     return sum(losses) / len(losses)

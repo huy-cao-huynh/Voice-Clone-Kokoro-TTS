@@ -1,254 +1,268 @@
-"""Tests for dataset, collation, and tokenization (voice_clone/dataset.py).
-
-phonemes_to_input_ids and collate_voice_clone_batch are pure-torch and tested
-without torchaudio. load_audio_mono and VoiceCloneManifestDataset need
-torchaudio + kokoro.pipeline, so those tests skip gracefully.
-"""
+"""Focused tests for the production data path in ``voice_clone.dataset``."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
-from conftest import make_manifest_and_wavs, write_sine_wav, write_wav
-
 _ROOT = Path(__file__).resolve().parents[1]
+_DATASET_PATH = _ROOT / "voice_clone" / "dataset.py"
 
 
-# ---------------------------------------------------------------------------
-# Isolated load of dataset.py via importlib (needs torchaudio + kokoro)
-# ---------------------------------------------------------------------------
-
-def _load_dataset_mod():
-    """Load voice_clone.dataset; skip if deps (torchaudio, kokoro.pipeline) missing."""
-    if str(_ROOT) not in sys.path:
-        sys.path.insert(0, str(_ROOT))
-    try:
-        # Pre-import required deps to give a clear skip
-        import torchaudio  # noqa: F401
-        from kokoro.pipeline import KPipeline  # noqa: F401
-    except ImportError as e:
-        pytest.skip(f"dataset.py deps not available: {e}")
-    import voice_clone.dataset as ds
-    return ds
+class _DatasetHarness:
+    def __init__(self) -> None:
+        self.audio_by_path: dict[str, tuple[np.ndarray, int]] = {}
+        self.pipeline_outputs: dict[str, list[str]] = {}
+        self.pipeline_inits: list[tuple[str, str, bool]] = []
+        self.pipeline_calls: list[tuple[str, None]] = []
+        self.resampler_inits: list[tuple[int, int]] = []
+        self.resampler_calls: list[tuple[int, int, tuple[int, ...]]] = []
 
 
-# ---------------------------------------------------------------------------
-# phonemes_to_input_ids -- pure torch, tested without heavy deps
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def dataset_mod(monkeypatch):
+    harness = _DatasetHarness()
 
-def _phonemes_to_input_ids(vocab, phonemes, *, context_length, bos_id=0, eos_id=0):
-    """Local copy of dataset.phonemes_to_input_ids (avoids torchaudio import)."""
-    ids = [vocab.get(ch) for ch in phonemes]
-    ids = [i for i in ids if i is not None]
-    if len(ids) + 2 > context_length:
-        raise ValueError(
-            f"Phoneme sequence too long for model context: {len(ids) + 2} > {context_length} "
-            f"(after dropping unknown graphemes). Shorten text or split the manifest row."
-        )
-    return torch.tensor([bos_id, *ids, eos_id], dtype=torch.long)
+    class FakePipelineResult:
+        def __init__(self, phonemes: str) -> None:
+            self.phonemes = phonemes
+
+    class FakeKPipeline:
+        def __init__(self, *, lang_code: str, repo_id: str, model: bool) -> None:
+            harness.pipeline_inits.append((lang_code, repo_id, model))
+
+        def __call__(self, text: str, voice=None):
+            harness.pipeline_calls.append((text, voice))
+            return [FakePipelineResult(p) for p in harness.pipeline_outputs.get(text, ["ab"])]
+
+    pipeline_mod = types.ModuleType("kokoro.pipeline")
+    pipeline_mod.ALIASES = {"en-us": "a", "en-gb": "b"}
+    pipeline_mod.LANG_CODES = {"a": "American English", "b": "British English", "h": "Hindi"}
+    pipeline_mod.KPipeline = FakeKPipeline
+
+    kokoro_mod = types.ModuleType("kokoro")
+    kokoro_mod.pipeline = pipeline_mod
+
+    class FakeResample:
+        def __init__(self, *, orig_freq: int, new_freq: int) -> None:
+            self.orig_freq = orig_freq
+            self.new_freq = new_freq
+            harness.resampler_inits.append((orig_freq, new_freq))
+
+        def __call__(self, wav: torch.Tensor) -> torch.Tensor:
+            harness.resampler_calls.append((self.orig_freq, self.new_freq, tuple(wav.shape)))
+            new_len = int(round(wav.shape[-1] * self.new_freq / self.orig_freq))
+            return torch.zeros(wav.shape[:-1] + (new_len,), dtype=wav.dtype)
+
+    def fake_sf_read(path: str, *, always_2d: bool = False, dtype: str = "float32"):
+        assert dtype == "float32"
+        try:
+            data, sr = harness.audio_by_path[str(Path(path))]
+        except KeyError as exc:
+            raise FileNotFoundError(path) from exc
+        return data.copy(), sr
+
+    torchaudio_mod = types.ModuleType("torchaudio")
+    torchaudio_mod.transforms = types.SimpleNamespace(Resample=FakeResample)
+    torchaudio_mod.load = lambda path: (_ for _ in ()).throw(AssertionError("soundfile path expected in tests"))
+
+    soundfile_mod = types.ModuleType("soundfile")
+    soundfile_mod.read = fake_sf_read
+
+    monkeypatch.setitem(sys.modules, "kokoro", kokoro_mod)
+    monkeypatch.setitem(sys.modules, "kokoro.pipeline", pipeline_mod)
+    monkeypatch.setitem(sys.modules, "torchaudio", torchaudio_mod)
+    monkeypatch.setitem(sys.modules, "soundfile", soundfile_mod)
+
+    spec = importlib.util.spec_from_file_location("voice_clone.dataset", _DATASET_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "voice_clone.dataset", module)
+    spec.loader.exec_module(module)
+
+    return module, harness
 
 
-class TestPhonemesToInputIds:
-    def test_adds_bos_and_eos(self):
-        vocab = {"a": 1, "b": 2, "c": 3}
-        ids = _phonemes_to_input_ids(vocab, "abc", context_length=100)
-        assert ids[0].item() == 0  # BOS
-        assert ids[-1].item() == 0  # EOS
-        assert ids.tolist() == [0, 1, 2, 3, 0]
-
-    def test_filters_unknown_chars(self):
-        vocab = {"a": 1, "b": 2}
-        ids = _phonemes_to_input_ids(vocab, "axb", context_length=100)
-        assert ids.tolist() == [0, 1, 2, 0]
-
-    def test_raises_on_context_overflow(self):
-        vocab = {chr(i): i for i in range(65, 91)}
-        with pytest.raises(ValueError, match="too long"):
-            _phonemes_to_input_ids(vocab, "A" * 100, context_length=10)
-
-    def test_empty_phonemes_only_bos_eos(self):
-        vocab = {"a": 1}
-        ids = _phonemes_to_input_ids(vocab, "", context_length=100)
-        assert ids.tolist() == [0, 0]
+def _touch(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
 
 
-# ---------------------------------------------------------------------------
-# collate_voice_clone_batch -- pure torch
-# ---------------------------------------------------------------------------
+def _write_manifest(path: Path, *rows: dict[str, object]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    return path
 
-def _collate_voice_clone_batch(samples):
-    """Local copy of dataset.collate_voice_clone_batch."""
-    if len(samples) != 1:
-        raise ValueError(
-            "collate_voice_clone_batch currently supports batch size 1 (Kokoro `forward_with_tokens`); "
-            f"got {len(samples)}"
-        )
-    s = samples[0]
-    batch = {
-        "ref_wav_16k": s["ref_wav_16k"].unsqueeze(0),
-        "target_wav_24k": s["target_wav_24k"].unsqueeze(0),
-        "input_ids": s["input_ids"].unsqueeze(0),
+
+def _dataset_row(**overrides):
+    row = {
+        "ref_wav": "clips/ref.wav",
+        "target_wav": "clips/target.wav",
+        "text": "hello",
+        "lang_code": "en-us",
+        "phonemes": "ab",
+        "speaker_id": "spk-1",
     }
-    if "speaker_id" in s:
-        batch["speaker_id"] = s["speaker_id"]
-    if "text" in s:
-        batch["text"] = s["text"]
-    return batch
+    row.update(overrides)
+    return row
 
 
-class TestCollateVoiceCloneBatch:
-    def test_rejects_batch_size_not_one(self):
-        sample = {
-            "ref_wav_16k": torch.randn(16_000),
-            "target_wav_24k": torch.randn(24_000),
-            "input_ids": torch.tensor([0, 1, 2, 0]),
-        }
-        with pytest.raises(ValueError, match="batch size 1"):
-            _collate_voice_clone_batch([sample, sample])
-
-    def test_correct_keys_and_shapes(self):
-        sample = {
-            "ref_wav_16k": torch.randn(16_000),
-            "target_wav_24k": torch.randn(24_000),
-            "input_ids": torch.tensor([0, 1, 2, 0]),
-            "text": "hello",
-        }
-        batch = _collate_voice_clone_batch([sample])
-        assert batch["ref_wav_16k"].shape == (1, 16_000)
-        assert batch["target_wav_24k"].shape == (1, 24_000)
-        assert batch["input_ids"].shape == (1, 4)
-        assert batch["text"] == "hello"
-
-    def test_optional_speaker_id_forwarded(self):
-        sample = {
-            "ref_wav_16k": torch.randn(16_000),
-            "target_wav_24k": torch.randn(24_000),
-            "input_ids": torch.tensor([0, 1, 0]),
-            "speaker_id": "spk1",
-        }
-        batch = _collate_voice_clone_batch([sample])
-        assert batch["speaker_id"] == "spk1"
+def test_normalize_lang_code_uses_aliases_and_rejects_unknown(dataset_mod):
+    ds, _ = dataset_mod
+    assert ds.normalize_lang_code("EN-US") == "a"
+    assert ds.normalize_lang_code("b") == "b"
+    with pytest.raises(ValueError, match="Unknown lang_code"):
+        ds.normalize_lang_code("xx-fake")
 
 
-# ---------------------------------------------------------------------------
-# normalize_lang_code (needs kokoro.pipeline)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.slow
-class TestNormalizeLangCode:
-    @pytest.fixture(scope="class")
-    def ds(self):
-        return _load_dataset_mod()
-
-    def test_known_alias(self, ds):
-        assert ds.normalize_lang_code("en-us") == "a"
-        assert ds.normalize_lang_code("en-gb") == "b"
-
-    def test_direct_code(self, ds):
-        assert ds.normalize_lang_code("a") == "a"
-
-    def test_unknown_raises(self, ds):
-        with pytest.raises(ValueError, match="Unknown lang_code"):
-            ds.normalize_lang_code("xx-fake")
-
-    def test_case_insensitive(self, ds):
-        assert ds.normalize_lang_code("EN-US") == "a"
+def test_phonemes_to_input_ids_filters_unknowns_but_rejects_all_oov(dataset_mod):
+    ds, _ = dataset_mod
+    vocab = {"a": 1, "b": 2}
+    assert ds.phonemes_to_input_ids(vocab, "axb", context_length=10).tolist() == [0, 1, 2, 0]
+    with pytest.raises(ValueError, match="no in-vocabulary tokens"):
+        ds.phonemes_to_input_ids(vocab, "xxx", context_length=10)
 
 
-# ---------------------------------------------------------------------------
-# load_audio_mono (needs torchaudio)
-# ---------------------------------------------------------------------------
-
-class TestLoadAudioMono:
-    @pytest.fixture(scope="class")
-    def ds(self):
-        return _load_dataset_mod()
-
-    def test_loads_mono_at_target_sr(self, ds, tmp_path):
-        p = tmp_path / "test.wav"
-        write_sine_wav(p, samples=4800, sr=16_000)
-        wav = ds.load_audio_mono(p, target_sr=16_000)
-        assert wav.dim() == 1
-        assert wav.shape[0] == 4800
-
-    def test_resamples_if_sr_differs(self, ds, tmp_path):
-        p = tmp_path / "test_resample.wav"
-        write_sine_wav(p, samples=4800, sr=24_000)
-        wav = ds.load_audio_mono(p, target_sr=16_000)
-        assert wav.dim() == 1
-        expected_samples = int(4800 * 16_000 / 24_000)
-        assert abs(wav.shape[0] - expected_samples) <= 10
-
-    def test_stereo_downmix(self, ds, tmp_path):
-        p = tmp_path / "stereo.wav"
-        write_wav(p, samples=1600, sr=16_000, channels=2)
-        wav = ds.load_audio_mono(p, target_sr=16_000)
-        assert wav.dim() == 1
+def test_text_to_phonemes_rejects_empty_g2p_output(dataset_mod):
+    ds, harness = dataset_mod
+    harness.pipeline_outputs["empty"] = [""]
+    pipe = ds.KPipeline(lang_code="a", repo_id="repo", model=False)
+    with pytest.raises(ValueError, match="empty phoneme string"):
+        ds.text_to_phonemes(pipe, "empty")
 
 
-# ---------------------------------------------------------------------------
-# VoiceCloneManifestDataset (needs torchaudio + kokoro.pipeline → slow)
-# ---------------------------------------------------------------------------
+def test_load_audio_mono_downmixes_resamples_and_reuses_cached_resampler(dataset_mod, tmp_path):
+    ds, harness = dataset_mod
+    wav_path = tmp_path / "stereo.wav"
+    _touch(wav_path)
+    harness.audio_by_path[str(wav_path)] = (np.ones((6, 2), dtype=np.float32), 48_000)
 
-@pytest.mark.slow
-class TestVoiceCloneManifestDataset:
-    @pytest.fixture
-    def ds_and_data(self, tmp_path):
-        mod = _load_dataset_mod()
-        data = make_manifest_and_wavs(tmp_path, num_rows=3)
-        from voice_clone.config import kokoro_vocab_and_context_length
-        vocab, ctx = kokoro_vocab_and_context_length("hexgrad/Kokoro-82M")
-        dataset = mod.VoiceCloneManifestDataset(
-            data["manifest"],
-            kokoro_repo_id="hexgrad/Kokoro-82M",
-            vocab=vocab,
-            context_length=ctx,
-            manifest_root=data["root"],
+    wav1 = ds.load_audio_mono(wav_path, target_sr=16_000)
+    wav2 = ds.load_audio_mono(wav_path, target_sr=16_000)
+
+    assert wav1.dim() == 1
+    assert wav1.shape[0] == 2
+    assert wav2.shape[0] == 2
+    assert harness.resampler_inits == [(48_000, 16_000)]
+    assert len(harness.resampler_calls) == 2
+
+
+def test_dataset_init_fails_fast_for_bad_rows(dataset_mod, tmp_path):
+    ds, _ = dataset_mod
+    manifest = tmp_path / "bad.jsonl"
+
+    _write_manifest(manifest, _dataset_row(text="   "))
+    with pytest.raises(ValueError, match="text must be non-empty"):
+        ds.VoiceCloneManifestDataset(manifest, kokoro_repo_id="repo", vocab={"a": 1}, context_length=8)
+
+    _write_manifest(manifest, _dataset_row(lang_code="xx-fake"))
+    with pytest.raises(ValueError, match="Unknown lang_code"):
+        ds.VoiceCloneManifestDataset(manifest, kokoro_repo_id="repo", vocab={"a": 1}, context_length=8)
+
+    _write_manifest(manifest, _dataset_row(ref_wav="clips/missing.wav"))
+    with pytest.raises(FileNotFoundError, match="audio file not found"):
+        ds.VoiceCloneManifestDataset(manifest, kokoro_repo_id="repo", vocab={"a": 1}, context_length=8)
+
+
+def test_dataset_uses_provided_phonemes_and_returns_expected_fields(dataset_mod, tmp_path):
+    ds, harness = dataset_mod
+    ref_path = tmp_path / "clips" / "ref.wav"
+    tgt_path = tmp_path / "clips" / "target.wav"
+    _touch(ref_path)
+    _touch(tgt_path)
+    harness.audio_by_path[str(ref_path)] = (np.ones(6_000, dtype=np.float32), 16_000)
+    harness.audio_by_path[str(tgt_path)] = (np.ones(7_200, dtype=np.float32), 24_000)
+    manifest = _write_manifest(tmp_path / "ok.jsonl", _dataset_row())
+
+    dataset = ds.VoiceCloneManifestDataset(
+        manifest,
+        kokoro_repo_id="repo",
+        vocab={"a": 1, "b": 2},
+        context_length=8,
+        manifest_root=tmp_path,
+    )
+    sample = dataset[0]
+
+    assert sample["lang_code"] == "a"
+    assert sample["speaker_id"] == "spk-1"
+    assert sample["input_ids"].tolist() == [0, 1, 2, 0]
+    assert harness.pipeline_inits == []
+    assert harness.pipeline_calls == []
+
+
+def test_dataset_rejects_multi_chunk_g2p_at_init(dataset_mod, tmp_path):
+    ds, harness = dataset_mod
+    ref_path = tmp_path / "clips" / "ref.wav"
+    tgt_path = tmp_path / "clips" / "target.wav"
+    _touch(ref_path)
+    _touch(tgt_path)
+    manifest = _write_manifest(
+        tmp_path / "g2p.jsonl",
+        _dataset_row(phonemes=None, text="split me"),
+    )
+    harness.pipeline_outputs["split me"] = ["ab", "cd"]
+
+    with pytest.raises(ValueError, match="produced 2 chunks"):
+        ds.VoiceCloneManifestDataset(
+            manifest,
+            kokoro_repo_id="repo",
+            vocab={"a": 1, "b": 2, "c": 3, "d": 4},
+            context_length=10,
+            manifest_root=tmp_path,
             preload_phonemes=True,
         )
-        return dataset, data
 
-    def test_len_matches_manifest(self, ds_and_data):
-        dataset, data = ds_and_data
-        assert len(dataset) == len(data["rows"])
 
-    def test_getitem_returns_expected_keys(self, ds_and_data):
-        dataset, _ = ds_and_data
-        sample = dataset[0]
-        assert "ref_wav_16k" in sample
-        assert "target_wav_24k" in sample
-        assert "input_ids" in sample
-        assert "lang_code" in sample
-        assert "text" in sample
+def test_dataset_rejects_too_short_audio_and_oov_phonemes(dataset_mod, tmp_path):
+    ds, harness = dataset_mod
+    ref_path = tmp_path / "clips" / "ref.wav"
+    tgt_path = tmp_path / "clips" / "target.wav"
+    _touch(ref_path)
+    _touch(tgt_path)
+    manifest = _write_manifest(tmp_path / "short.jsonl", _dataset_row(phonemes="xxx"))
+    harness.audio_by_path[str(ref_path)] = (np.ones(4_799, dtype=np.float32), 16_000)
+    harness.audio_by_path[str(tgt_path)] = (np.ones(7_200, dtype=np.float32), 24_000)
 
-    def test_ref_wav_is_1d(self, ds_and_data):
-        dataset, _ = ds_and_data
-        sample = dataset[0]
-        assert sample["ref_wav_16k"].dim() == 1
+    dataset = ds.VoiceCloneManifestDataset(
+        manifest,
+        kokoro_repo_id="repo",
+        vocab={"a": 1, "b": 2},
+        context_length=10,
+        manifest_root=tmp_path,
+    )
+    with pytest.raises(ValueError, match="Reference audio too short"):
+        dataset[0]
 
-    def test_input_ids_has_bos_eos(self, ds_and_data):
-        dataset, _ = ds_and_data
-        sample = dataset[0]
-        ids = sample["input_ids"]
-        assert ids[0].item() == 0  # BOS
-        assert ids[-1].item() == 0  # EOS
+    harness.audio_by_path[str(ref_path)] = (np.ones(6_000, dtype=np.float32), 16_000)
+    with pytest.raises(ValueError, match="no in-vocabulary tokens"):
+        dataset[0]
 
-    def test_missing_key_raises(self, tmp_path):
-        mod = _load_dataset_mod()
-        manifest = tmp_path / "bad.jsonl"
-        manifest.write_text(json.dumps({"ref_wav": "x.wav", "text": "hi"}) + "\n")
-        from voice_clone.config import kokoro_vocab_and_context_length
-        vocab, ctx = kokoro_vocab_and_context_length("hexgrad/Kokoro-82M")
-        with pytest.raises(ValueError, match="missing key"):
-            mod.VoiceCloneManifestDataset(
-                manifest,
-                kokoro_repo_id="hexgrad/Kokoro-82M",
-                vocab=vocab,
-                context_length=ctx,
-            )
+
+def test_collate_voice_clone_batch_uses_real_function(dataset_mod):
+    ds, _ = dataset_mod
+    sample = {
+        "ref_wav_16k": torch.randn(16_000),
+        "target_wav_24k": torch.randn(24_000),
+        "input_ids": torch.tensor([0, 1, 2, 0]),
+        "text": "hello",
+        "speaker_id": "spk-1",
+    }
+
+    batch = ds.collate_voice_clone_batch([sample])
+    assert batch["ref_wav_16k"].shape == (1, 16_000)
+    assert batch["target_wav_24k"].shape == (1, 24_000)
+    assert batch["input_ids"].shape == (1, 4)
+    assert batch["text"] == "hello"
+    assert batch["speaker_id"] == "spk-1"
+
+    with pytest.raises(ValueError, match="batch size 1"):
+        ds.collate_voice_clone_batch([sample, sample])

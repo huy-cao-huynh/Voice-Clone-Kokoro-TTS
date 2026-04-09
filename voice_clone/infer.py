@@ -16,7 +16,7 @@ from kokoro.pipeline import KPipeline
 from .config import LossWeights, MelLossConfig, TrainConfig, kokoro_vocab_and_context_length
 from .dataset import load_audio_mono, normalize_lang_code, phonemes_to_input_ids, text_to_phonemes
 from .segment_gst import SegmentGST
-from .train_adapters import build_models
+from .train_adapters import build_models, _speaker_frame_mask
 from .wespeaker_sv import WeSpeakerSV
 
 KOKORO_OUTPUT_SR = 24_000
@@ -42,12 +42,33 @@ def apply_voice_clone_checkpoint(
 ) -> None:
     """Load SegmentGST and L-adapter weights from an in-memory checkpoint dict."""
     gst.load_state_dict(ckpt["segment_gst"])
-    if ckpt.get("duration_adapters") and kmodel.predictor.text_encoder.adapters is not None:
-        kmodel.predictor.text_encoder.adapters.load_state_dict(ckpt["duration_adapters"])
-    if ckpt.get("decoder_adapters") and kmodel.decoder.decoder_adapters is not None:
-        kmodel.decoder.decoder_adapters.load_state_dict(ckpt["decoder_adapters"])
-    if ckpt.get("generator_adapters") and kmodel.decoder.generator.adapters is not None:
-        kmodel.decoder.generator.adapters.load_state_dict(ckpt["generator_adapters"])
+
+    def _load_optional_adapter_state(key: str, module: Optional[torch.nn.Module], module_name: str) -> None:
+        state = ckpt.get(key)
+        if not state:
+            return
+        if module is None:
+            raise ValueError(
+                f"Checkpoint contains {module_name} weights, but the rebuilt Kokoro stack has no {module_name}. "
+                "Ensure `kokoro_repo_id` matches the checkpoint used during training."
+            )
+        module.load_state_dict(state)
+
+    _load_optional_adapter_state(
+        "duration_adapters",
+        kmodel.predictor.text_encoder.adapters,
+        "duration adapters",
+    )
+    _load_optional_adapter_state(
+        "decoder_adapters",
+        kmodel.decoder.decoder_adapters,
+        "decoder adapters",
+    )
+    _load_optional_adapter_state(
+        "generator_adapters",
+        kmodel.decoder.generator.adapters,
+        "generator adapters",
+    )
 
 
 def build_stack_for_inference(
@@ -80,7 +101,7 @@ def infer_waveform(
             device = torch.device("cpu")
 
     ckpt_path = Path(ckpt_path)
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     raw_tc = ckpt.get("train_config")
     if raw_tc is not None:
         cfg = train_config_from_checkpoint_dict(raw_tc)
@@ -103,22 +124,16 @@ def infer_waveform(
     vocab, context_length = kokoro_vocab_and_context_length(cfg.kokoro_repo_id)
     input_ids = phonemes_to_input_ids(vocab, phonemes, context_length=context_length).unsqueeze(0).to(device)
 
-    ref_16 = load_audio_mono(ref_wav_path, target_sr=16_000).unsqueeze(0).to(device)
+    speaker_sample_rate = int(cfg.wespeaker_sample_rate)
+    ref_16 = load_audio_mono(ref_wav_path, target_sr=speaker_sample_rate).unsqueeze(0).to(device)
     sp = speed if speed is not None else cfg.speed
 
     gst.eval()
     sv_model.eval()
     kmodel.eval()
     with torch.inference_mode():
-        wv = sv_model(ref_16, sampling_rate=cfg.wespeaker_sample_rate, grad_through_input=False)
-        if wv.frame_features is None:
-            raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
-        frame_mask = torch.ones(
-            wv.frame_features.size(0),
-            wv.frame_features.size(1),
-            device=wv.frame_features.device,
-            dtype=wv.frame_features.dtype,
-        )
+        wv = sv_model(ref_16, sampling_rate=speaker_sample_rate, grad_through_input=False)
+        frame_mask = _speaker_frame_mask(wv)
         gst_out, _ = gst(wv.frame_features, frame_mask)
         ref_s = gst_out.ref_s
         audio, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=sp)

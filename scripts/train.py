@@ -15,7 +15,7 @@ Override any of them before invoking the script:
     KOKORO_REPO       hexgrad/Kokoro-82M         HF model repo
     EPOCHS            1
     MAX_STEPS         2000                       cap training steps (e.g. 75 for smoke)
-    DEVICE            cuda                       cuda | cpu | mps
+    DEVICE            (auto)                     cuda | cpu | mps
     NUM_WORKERS       auto                       dataloader workers (auto = cpu_count or 0 on Windows)
     WANDB_PROJECT     Voice-Clone-Kokoro-TTS
     WANDB_RUN_NAME    hi-train-<timestamp>
@@ -54,7 +54,7 @@ def main() -> None:
     kokoro_repo = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
     epochs = os.environ.get("EPOCHS", "1")
     max_steps = os.environ.get("MAX_STEPS", "")
-    device = os.environ.get("DEVICE", "cuda")
+    device = os.environ.get("DEVICE")
     num_workers = os.environ.get("NUM_WORKERS", str(_default_num_workers()))
     wandb_project = os.environ.get("WANDB_PROJECT", "Voice-Clone-Kokoro-TTS")
     wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"hi-train-{timestamp}")
@@ -72,7 +72,6 @@ def main() -> None:
         "--manifest", manifest,
         "--kokoro-repo", kokoro_repo,
         "--epochs", epochs,
-        "--device", device,
         "--wandb",
         "--wandb-project", wandb_project,
         "--wandb-run-name", wandb_run_name,
@@ -80,6 +79,8 @@ def main() -> None:
         "--num-workers", num_workers,
     ]
 
+    if device:
+        cmd += ["--device", device]
     if manifest_root:
         cmd += ["--manifest-root", manifest_root]
     if val_manifest:
@@ -99,7 +100,11 @@ def main() -> None:
 
     cmd += sys.argv[1:]
 
-    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath = str(REPO_ROOT)
+    if existing_pythonpath:
+        pythonpath = os.pathsep.join([pythonpath, existing_pythonpath])
+    env = {**os.environ, "PYTHONPATH": pythonpath}
     sys.exit(subprocess.run(cmd, env=env, cwd=str(REPO_ROOT)).returncode)
 
 

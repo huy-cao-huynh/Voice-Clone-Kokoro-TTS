@@ -155,3 +155,26 @@ class TestSpeakerBackpropPath:
         assert pred_wav.grad.abs().sum() > 0
 
 
+class TestAdversarialLossShapeSafety:
+    def test_discriminator_loss_rejects_mismatched_output_counts(self, losses_mod):
+        with pytest.raises(ValueError, match="same number of discriminator outputs"):
+            losses_mod.discriminator_loss_lsgan(
+                [torch.zeros(1, 8), torch.zeros(1, 4)],
+                [torch.zeros(1, 8)],
+            )
+
+    def test_feature_matching_rejects_mismatched_layer_counts(self, losses_mod):
+        with pytest.raises(ValueError, match="same number of layers"):
+            losses_mod.feature_matching_loss(
+                [[torch.zeros(1, 4, 8), torch.zeros(1, 4, 4)]],
+                [[torch.zeros(1, 4, 8)]],
+            )
+
+    def test_feature_matching_rejects_batch_channel_broadcasting(self, losses_mod):
+        with pytest.raises(ValueError, match="batch/channel dims"):
+            losses_mod.feature_matching_loss(
+                [[torch.zeros(2, 4, 8)]],
+                [[torch.zeros(1, 4, 8)]],
+            )
+
+

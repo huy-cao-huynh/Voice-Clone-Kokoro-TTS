@@ -154,12 +154,36 @@ def generator_trainable_parameters(kmodel: KModel, gst: SegmentGST) -> List[nn.P
     return list(gst.parameters()) + [p for p in kmodel.parameters() if p.requires_grad]
 
 
+def _rescale_optimizer_grads(opt: torch.optim.Optimizer, factor: float) -> None:
+    """Renormalize already-accumulated grads without rebuilding the forward pass."""
+    if factor == 1.0:
+        return
+    for group in opt.param_groups:
+        for param in group["params"]:
+            if param.grad is not None:
+                param.grad.mul_(factor)
+
+
 def _ensure_batch_time(wav: torch.Tensor) -> torch.Tensor:
     if wav.dim() == 1:
         return wav.unsqueeze(0)
     if wav.dim() != 2:
         raise ValueError(f"waveform must be (time,) or (batch, time), got {tuple(wav.shape)}")
     return wav
+
+
+def _speaker_frame_mask(ref_out: WeSpeakerSVOutput) -> torch.Tensor:
+    if ref_out.frame_features is None:
+        raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
+    frame_mask = getattr(ref_out, "frame_mask", None)
+    if frame_mask is not None:
+        return frame_mask.to(device=ref_out.frame_features.device)
+    return torch.ones(
+        ref_out.frame_features.size(0),
+        ref_out.frame_features.size(1),
+        device=ref_out.frame_features.device,
+        dtype=torch.bool,
+    )
 
 
 def resample_mono(wav: torch.Tensor, orig_sr: int, new_sr: int) -> torch.Tensor:
@@ -187,6 +211,25 @@ def build_mel_loss(kokoro_cfg: Dict[str, Any], mel_cfg: MelLossConfig, device: t
         f_max=mel_cfg.f_max,
     )
     return m.to(device)
+
+
+def load_universal_style_vector(path: str, *, ref_dim: int) -> torch.Tensor:
+    """Load the SegmentGST base-voice bias vector from a checkpoint file."""
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise FileNotFoundError(f"Universal style vector not found at {p}")
+    obj = torch.load(p, map_location="cpu", weights_only=False)
+    if not isinstance(obj, torch.Tensor):
+        obj = torch.as_tensor(obj)
+    if obj.dim() != 1:
+        raise ValueError(
+            f"Universal style vector at {p} must be 1-D with shape ({ref_dim},), got {tuple(obj.shape)}"
+        )
+    if int(obj.numel()) != ref_dim:
+        raise ValueError(
+            f"Universal style vector at {p} has length {int(obj.numel())}, expected {ref_dim}"
+        )
+    return obj.detach().to(dtype=torch.float32).contiguous()
 
 
 def build_models(
@@ -231,12 +274,17 @@ def build_models(
         if probe_out.frame_features is None:
             raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
         inferred_frame_dim = int(probe_out.frame_features.shape[-1])
+    universal_style_vector = load_universal_style_vector(
+        cfg.universal_style_vector_path,
+        ref_dim=256,
+    )
     gst = SegmentGST(
         frame_dim=inferred_frame_dim,
         embed_dim=256,
         num_heads=8,
         ref_dim=256,
         style_dec_dim=128,
+        universal_style_vector=universal_style_vector,
     )
     gst = gst.to(device)
 
@@ -258,6 +306,10 @@ def save_checkpoint(
     cfg: TrainConfig,
     scaler_g: Optional[GradScaler] = None,
     scaler_d: Optional[GradScaler] = None,
+    sched_g: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    sched_d: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    generator_updates: int = 0,
+    discriminator_updates: int = 0,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: Dict[str, Any] = {
@@ -278,6 +330,10 @@ def save_checkpoint(
         "optimizer_d": opt_d.state_dict(),
         "scaler_g": scaler_g.state_dict() if scaler_g is not None else None,
         "scaler_d": scaler_d.state_dict() if scaler_d is not None else None,
+        "scheduler_g": sched_g.state_dict() if sched_g is not None else None,
+        "scheduler_d": sched_d.state_dict() if sched_d is not None else None,
+        "generator_updates": int(generator_updates),
+        "discriminator_updates": int(discriminator_updates),
     }
     torch.save(payload, path)
 
@@ -293,6 +349,9 @@ def load_checkpoint(
     device: torch.device,
     scaler_g: Optional[GradScaler] = None,
     scaler_d: Optional[GradScaler] = None,
+    sched_g: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    sched_d: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    resume_state: Optional[Dict[str, Any]] = None,
 ) -> int:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     gst.load_state_dict(ckpt["segment_gst"])
@@ -314,6 +373,24 @@ def load_checkpoint(
         scaler_g.load_state_dict(ckpt["scaler_g"])
     if ckpt.get("scaler_d") and scaler_d is not None:
         scaler_d.load_state_dict(ckpt["scaler_d"])
+    scheduler_g_loaded = False
+    scheduler_d_loaded = False
+    if ckpt.get("scheduler_g") and sched_g is not None:
+        sched_g.load_state_dict(ckpt["scheduler_g"])
+        scheduler_g_loaded = True
+    if ckpt.get("scheduler_d") and sched_d is not None:
+        sched_d.load_state_dict(ckpt["scheduler_d"])
+        scheduler_d_loaded = True
+    if resume_state is not None:
+        step = int(ckpt.get("step", 0))
+        resume_state.update(
+            {
+                "generator_updates": int(ckpt.get("generator_updates", step)),
+                "discriminator_updates": int(ckpt.get("discriminator_updates", 0)),
+                "scheduler_g_loaded": scheduler_g_loaded,
+                "scheduler_d_loaded": scheduler_d_loaded,
+            }
+        )
     return int(ckpt.get("step", 0))
 
 
@@ -446,15 +523,8 @@ def _log_wandb_validation(
                 caption = _caption_from_input_ids(batch["input_ids"].squeeze(0), id_to_char)
 
             with torch.no_grad():
-                wv_ref: WeSpeakerSVOutput = sv_model(ref_16, sampling_rate=cfg.wespeaker_sample_rate, grad_through_input=False)
-                if wv_ref.frame_features is None:
-                    raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
-                frame_mask = torch.ones(
-                    wv_ref.frame_features.size(0),
-                    wv_ref.frame_features.size(1),
-                    device=wv_ref.frame_features.device,
-                    dtype=wv_ref.frame_features.dtype,
-                )
+                wv_ref: WeSpeakerSVOutput = sv_model(ref_16, sampling_rate=16_000, grad_through_input=False)
+                frame_mask = _speaker_frame_mask(wv_ref)
                 gst_out, _ = gst(wv_ref.frame_features, frame_mask)
                 ref_s = gst_out.ref_s
                 pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
@@ -522,6 +592,13 @@ def train_loop(
     torch_profiler_trace: Optional[Path] = None,
     val_dataset: Optional[Dataset] = None,
 ) -> None:
+    if cfg.grad_accum_steps < 1:
+        raise ValueError("cfg.grad_accum_steps must be >= 1")
+    if cfg.log_interval < 1:
+        raise ValueError("cfg.log_interval must be >= 1")
+    if cfg.checkpoint_interval < 1:
+        raise ValueError("cfg.checkpoint_interval must be >= 1")
+
     kmodel, gst, sv_model, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
     vocab: Dict[str, int] = kokoro_cfg["vocab"]
     params_g = generator_trainable_parameters(kmodel, gst)
@@ -550,18 +627,25 @@ def train_loop(
         sched_d = _build_scheduler(opt_d, cfg.warmup_steps, total_steps_d, cfg.lr_min_d)
 
     step = 0
+    generator_updates = 0
+    discriminator_updates = 0
     if resume is not None:
+        resume_state: Dict[str, Any] = {}
         step = load_checkpoint(
             resume, gst=gst, disc=disc, kmodel=kmodel, opt_g=opt_g, opt_d=opt_d,
             device=device, scaler_g=scaler_g, scaler_d=scaler_d,
+            sched_g=sched_g, sched_d=sched_d, resume_state=resume_state,
         )
         print(f"Resumed step {step} from {resume}")
-        if sched_g is not None:
-            for _ in range(step):
+        generator_updates = int(resume_state.get("generator_updates", step))
+        discriminator_updates = int(
+            resume_state.get("discriminator_updates", max(0, step - cfg.disc_start_step))
+        )
+        if sched_g is not None and not bool(resume_state.get("scheduler_g_loaded", False)):
+            for _ in range(generator_updates):
                 sched_g.step()
-        if sched_d is not None:
-            d_sched_steps = max(0, step - cfg.disc_start_step)
-            for _ in range(d_sched_steps):
+        if sched_d is not None and not bool(resume_state.get("scheduler_d_loaded", False)):
+            for _ in range(discriminator_updates):
                 sched_d.step()
 
     global_step = step
@@ -667,17 +751,10 @@ def train_loop(
                                 sw.start("sv_ref")
                             wv_ref: WeSpeakerSVOutput = sv_model(
                                 ref_16,
-                                sampling_rate=cfg.wespeaker_sample_rate,
+                                sampling_rate=16_000,
                                 grad_through_input=False,
                             )
-                            if wv_ref.frame_features is None:
-                                raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
-                            frame_mask = torch.ones(
-                                wv_ref.frame_features.size(0),
-                                wv_ref.frame_features.size(1),
-                                device=wv_ref.frame_features.device,
-                                dtype=wv_ref.frame_features.dtype,
-                            )
+                            frame_mask = _speaker_frame_mask(wv_ref)
                             gst_out, _ = gst(wv_ref.frame_features, frame_mask)
                             ref_s = gst_out.ref_s
                             if sw is not None:
@@ -767,10 +844,12 @@ def train_loop(
                         if sw is not None:
                             sw.end("gen_backward", sync_cuda=True)
 
-                        if any(not np.isfinite(v) for v in g_metrics.values()):
+                        loss_values = list(g_metrics.values())
+                        loss_values.append(float(ld.detach()))
+                        if any(not np.isfinite(v) for v in loss_values):
                             nan_detected = True
                             warnings.warn(
-                                f"[step {global_step}] NaN/Inf in generator loss "
+                                f"[step {global_step}] NaN/Inf in generator/discriminator loss "
                                 f"(micro-step {_micro}); skipping this optimizer step.",
                                 RuntimeWarning,
                                 stacklevel=1,
@@ -783,6 +862,12 @@ def train_loop(
 
                     if micros_done == 0:
                         break
+
+                    if not nan_detected and micros_done != cfg.grad_accum_steps:
+                        rescale = float(cfg.grad_accum_steps) / float(micros_done)
+                        _rescale_optimizer_grads(opt_g, rescale)
+                        if include_gan:
+                            _rescale_optimizer_grads(opt_d, rescale)
 
                     if nan_detected:
                         opt_g.zero_grad(set_to_none=True)
@@ -838,7 +923,12 @@ def train_loop(
                     metrics = {k: v / micros_done for k, v in micro_sums.items()}
 
                     if sched_g is not None and g_stepped:
+                        generator_updates += 1
                         sched_g.step()
+                    elif g_stepped:
+                        generator_updates += 1
+                    if d_stepped:
+                        discriminator_updates += 1
                     if sched_d is not None and global_step > cfg.disc_start_step and d_stepped:
                         sched_d.step()
 
@@ -907,6 +997,10 @@ def train_loop(
                                 cfg=cfg,
                                 scaler_g=scaler_g,
                                 scaler_d=scaler_d,
+                                sched_g=sched_g,
+                                sched_d=sched_d,
+                                generator_updates=generator_updates,
+                                discriminator_updates=discriminator_updates,
                             )
                         if wandb_run is not None:
                             _log_wandb_validation(

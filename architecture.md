@@ -1,6 +1,6 @@
 # Architecture: Voice Cloning with Kokoro TTS
 
-This document reflects the current `voice_clone` codepath: a frozen **WeSpeaker-style speaker frontend** + trainable **SegmentGST** + trainable Kokoro **L-adapters**, with a waveform **HiFi-GAN-style MPD+MSD discriminator** trained using LSGAN and feature matching.
+This document reflects the current `voice_clone` codepath: a frozen **WeSpeaker toolkit speaker frontend** + trainable **SegmentGST** + trainable Kokoro **L-adapters**, with a waveform **HiFi-GAN-style MPD+MSD discriminator** trained using LSGAN and feature matching.
 
 ---
 
@@ -11,9 +11,10 @@ Implemented in `voice_clone/wespeaker_sv.py`.
 - **Model wrapper**: `WeSpeakerSV` (frozen encoder + differentiable mel frontend).
 - **Input**: mono reference audio at **16 kHz** (`TrainConfig.wespeaker_sample_rate`).
 - **Backend encoder**:
-  - preferred: `_TorchvisionResNet34Encoder` (single-channel mel input),
-  - fallback: `_FallbackSpeakerEncoder` if torchvision model construction fails.
-- **Checkpoint source**: `TrainConfig.wespeaker_checkpoint_path` (default `wespeaker_ckpt/models/avg_model.pt`; avoids shadowing the PyPI `wespeaker` package).
+  - current path: `WeSpeakerToolkitEncoder`, which wraps a speaker backbone loaded through the `wespeaker` toolkit,
+  - expected model assets: `config.yaml` + `avg_model.pt` in the resolved checkpoint directory,
+  - current code uses `get_speaker_model(...)`, `load_checkpoint(...)`, `get_frame_level_feat(...)`, `_get_frame_level_feat(...)`, and the toolkit pooling head to expose both pooled embeddings and frame features.
+- **Checkpoint source**: `TrainConfig.wespeaker_checkpoint_path` (default `wespeaker_ckpt/models/avg_model.pt`; the parent directory is resolved as the WeSpeaker model directory and avoids shadowing the PyPI `wespeaker` package).
 - **Outputs** (`WeSpeakerSVOutput`):
   - `pooled_embedding`: `(B, 256)` L2-normalized embedding (speaker loss input),
   - `frame_features`: `(B, T_frames, C)` frame sequence for SegmentGST conditioning.
@@ -44,7 +45,10 @@ Universal style handling:
 
 - `SegmentGST` supports a persistent `universal_style_vector` buffer added to `delta_ref_s`.
 - If not provided at construction time, it defaults to zeros.
-- `TrainConfig.universal_style_vector_path` exists, but the current `build_models` path does not yet load/inject this file into `SegmentGST`.
+- Intended behavior: this vector acts as a base-voice bias so fresh training starts from a meaningful style prior instead of an all-zero `ref_s`.
+- Because `to_ref_s` is zero-initialized, a correctly loaded universal style vector would make initial `ref_s` equal that base voice.
+- Current bug: `TrainConfig.universal_style_vector_path` exists and `voice_clone/universal_style_vector.pt` is present, but the current `build_models` path does not yet load/inject this file into `SegmentGST`.
+- Important nuance: once a non-zero universal style vector is present inside `SegmentGST`, checkpoint save/load should preserve it because it is a persistent buffer in the GST state dict.
 
 ---
 
@@ -100,9 +104,9 @@ Generator objective:
 Defaults from `LossWeights`:
 
 - `lambda_mel=1.0`
-- `lambda_spk=1.0`
-- `lambda_adv=0.1`
-- `lambda_fm=1.0`
+- `lambda_spk=15.0`
+- `lambda_adv=2.0`
+- `lambda_fm=15.0`
 
 ### 5.1 Mel reconstruction
 
@@ -143,14 +147,16 @@ High-level order per effective step:
 Additional mechanics:
 
 - **Gradient accumulation**: default `grad_accum_steps=8` (batch size is currently fixed to 1 in collate).
-- **GAN warmup**: discriminator starts at `disc_start_step` (default **250**).
+- **GAN warmup**: discriminator starts at `disc_start_step` (default **0**).
 - **Schedulers**: warmup then cosine (`SequentialLR(LinearLR -> CosineAnnealingLR)`).
 - **NaN guard**: if non-finite generator loss appears in a micro-step, skip optimizer step and advance safely.
 
 Kokoro freeze mode policy:
 
-- `freeze_kokoro_except_adapters` sets model to eval and freezes params.
-- `apply_kokoro_freeze_mode_policy` currently supports `eval_then_fallback_train_dropout_zero`.
+- `freeze_kokoro_except_adapters` freezes all backbone parameters and re-enables grads only for the injected adapter modules.
+- The current implementation keeps Kokoro in `train(True)` instead of `.eval()`, then forces all `nn.Dropout` and `nn.RNNBase.dropout` values to `0.0`.
+- This is a practical workaround for ROCm/MIOpen training behavior on WSL, where some RNN backward paths require training mode.
+- On CUDA, this limitation may not apply, so a cleaner `.eval()`-style freeze policy may still be viable in the future.
 
 ---
 
@@ -197,11 +203,11 @@ From `TrainConfig` in `voice_clone/config.py`:
 - `lr_g`: `1e-4`
 - `lr_d`: `5e-5`
 - `grad_accum_steps`: `8`
-- `disc_start_step`: `250`
+- `disc_start_step`: `0`
 - `warmup_steps`: `50`
 - `lr_min_g`: `1e-6`
 - `lr_min_d`: `1e-7`
-- `checkpoint_interval`: `250`
+- `checkpoint_interval`: `1000` for future long runs (current code default remains `125` until that config change is made)
 - `speed`: `1.0`
 - `disable_amp_for_stft`: `True`
 

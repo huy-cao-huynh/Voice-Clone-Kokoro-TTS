@@ -69,6 +69,17 @@ class TestResidualAdapter:
         delta = (out - h).abs().mean()
         assert delta < h.abs().mean()
 
+    def test_rejects_wrong_style_shape(self, adapters_mod):
+        adapter = adapters_mod.ResidualAdapter(hidden_dim=512, style_dim=256, bottleneck_dim=64)
+        h = torch.randn(2, 512, 10)
+        with pytest.raises(ValueError, match="z_style"):
+            adapter(h, torch.randn(2, 128))
+
+    def test_rejects_wrong_hidden_shape(self, adapters_mod):
+        adapter = adapters_mod.ResidualAdapter(hidden_dim=512, style_dim=256, bottleneck_dim=64)
+        with pytest.raises(ValueError, match="hidden_dim"):
+            adapter(torch.randn(2, 256, 10), torch.randn(2, 256))
+
 
 # ---------------------------------------------------------------------------
 # build_duration_encoder_adapters

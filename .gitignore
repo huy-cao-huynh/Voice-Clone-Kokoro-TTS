@@ -15,7 +15,10 @@ data/
 manifests/
 ckpt/
 scripts/build_common_voice_manifest.py
+scripts/generate_manifests.sh
+scripts/merge_manifests.py
 scripts/sanity_universal_style_kokoro_val.py
+scripts/merge_manifests.sh
 /output
 /kokoro/voices
 # Python

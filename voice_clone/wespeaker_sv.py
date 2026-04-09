@@ -42,6 +42,9 @@ class WeSpeakerSVOutput:
     frame_features: Optional[Tensor]
     """Optional frame-level features, shape `(batch, frames, channels)`."""
 
+    frame_mask: Optional[Tensor]
+    """Optional boolean mask for `frame_features`, shape `(batch, frames)` with `True` on valid frames."""
+
 class WeSpeakerToolkitEncoder(nn.Module):
     """
     Wraps a ``wespeaker`` toolkit speaker backbone (e.g. ``ResNet34``).
@@ -136,6 +139,8 @@ class WeSpeakerSV(nn.Module):
         self.encoder = encoder
         self.sample_rate = int(sample_rate)
         self.embedding_dim = int(embedding_dim)
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.sample_rate,
             n_fft=n_fft,
@@ -199,30 +204,85 @@ class WeSpeakerSV(nn.Module):
     def _prepare_waveforms(
         self,
         waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
-    ) -> Tensor:
+        waveform_lengths: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        lengths: Optional[Tensor] = None
         if isinstance(waveforms, Tensor):
             w = waveforms
             if w.dim() == 1:
                 w = w.unsqueeze(0)
             if w.dim() != 2:
                 raise ValueError("waveforms must be `(batch, samples)` or `(samples,)`")
-            return w.to(device=self.device, dtype=self.dtype)
+            if waveform_lengths is not None:
+                lengths = torch.as_tensor(waveform_lengths, dtype=torch.long, device=self.device)
+                if lengths.dim() != 1 or lengths.numel() != w.size(0):
+                    raise ValueError(
+                        "waveform_lengths must have shape `(batch,)` matching waveforms when waveforms is a tensor"
+                    )
+            else:
+                lengths = torch.full(
+                    (w.size(0),),
+                    int(w.size(1)),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            return w.to(device=self.device, dtype=self.dtype), lengths
 
         rows = []
         max_len = 0
+        inferred_lengths = []
         for i, x in enumerate(waveforms):
             row = x if isinstance(x, Tensor) else torch.as_tensor(x, dtype=torch.float32)
             if row.dim() != 1:
                 raise ValueError(f"waveforms[{i}] must be 1-D, got {tuple(row.shape)}")
             row = row.to(device=self.device, dtype=self.dtype)
             rows.append(row)
-            max_len = max(max_len, int(row.numel()))
+            row_len = int(row.numel())
+            inferred_lengths.append(row_len)
+            max_len = max(max_len, row_len)
         if not rows:
             raise ValueError("Empty waveform batch")
+        if waveform_lengths is not None:
+            lengths = torch.as_tensor(waveform_lengths, dtype=torch.long, device=self.device)
+            if lengths.dim() != 1 or lengths.numel() != len(rows):
+                raise ValueError(
+                    "waveform_lengths must have shape `(batch,)` matching the number of waveforms"
+                )
+        else:
+            lengths = torch.tensor(inferred_lengths, dtype=torch.long, device=self.device)
         padded = torch.zeros(len(rows), max_len, device=self.device, dtype=self.dtype)
         for i, row in enumerate(rows):
             padded[i, : row.numel()] = row
-        return padded
+        return padded, lengths
+
+    def _resampled_lengths(self, lengths: Tensor, *, orig_freq: int, new_freq: int, max_len: int) -> Tensor:
+        if orig_freq == new_freq:
+            return lengths.clamp(min=0, max=max_len)
+        scaled = torch.round(lengths.to(torch.float32) * (float(new_freq) / float(orig_freq))).to(torch.long)
+        return scaled.clamp(min=0, max=max_len)
+
+    def _waveform_lengths_to_mel_lengths(self, lengths: Tensor, *, max_frames: int) -> Tensor:
+        mel_lengths = torch.div(lengths, self.hop_length, rounding_mode="floor") + 1
+        return mel_lengths.clamp(min=0, max=max_frames)
+
+    def _scale_frame_lengths(
+        self,
+        lengths: Tensor,
+        *,
+        input_frames: int,
+        output_frames: int,
+    ) -> Tensor:
+        if input_frames <= 0 or output_frames <= 0:
+            return torch.zeros_like(lengths)
+        if input_frames == output_frames:
+            return lengths.clamp(min=0, max=output_frames)
+        scaled = torch.div(lengths * output_frames + input_frames - 1, input_frames, rounding_mode="floor")
+        return scaled.clamp(min=0, max=output_frames)
+
+    @staticmethod
+    def _lengths_to_mask(lengths: Tensor, *, max_frames: int, device: torch.device) -> Tensor:
+        frame_ids = torch.arange(max_frames, device=device).unsqueeze(0)
+        return frame_ids < lengths.unsqueeze(1)
 
     def _waveforms_to_mel(self, waveforms: Tensor) -> Tensor:
         mel_tf = self.mel_transform.to(device=waveforms.device, dtype=waveforms.dtype)
@@ -237,6 +297,7 @@ class WeSpeakerSV(nn.Module):
         self,
         mel: Tensor,
         *,
+        frame_lengths: Optional[Tensor] = None,
         normalize_embeddings: bool = True,
         grad_through_input: bool = True,
         return_frame_features: bool = True,
@@ -251,9 +312,21 @@ class WeSpeakerSV(nn.Module):
             with torch.no_grad():
                 pooled, frame = self.encoder(x)
         emb = F.normalize(pooled, dim=-1) if normalize_embeddings else pooled
+        frame_mask = None
+        if frame is not None and frame_lengths is not None:
+            mel_lengths = torch.as_tensor(frame_lengths, dtype=torch.long, device=frame.device)
+            if mel_lengths.dim() != 1 or mel_lengths.numel() != mel.size(0):
+                raise ValueError("frame_lengths must have shape `(batch,)` matching mel")
+            output_lengths = self._scale_frame_lengths(
+                mel_lengths,
+                input_frames=int(mel.size(-1)),
+                output_frames=int(frame.size(1)),
+            )
+            frame_mask = self._lengths_to_mask(output_lengths, max_frames=int(frame.size(1)), device=frame.device)
         return WeSpeakerSVOutput(
             pooled_embedding=emb,
             frame_features=frame if return_frame_features else None,
+            frame_mask=frame_mask if return_frame_features else None,
         )
 
     def forward(
@@ -261,24 +334,31 @@ class WeSpeakerSV(nn.Module):
         waveforms: Union[Tensor, Sequence[Tensor], Sequence[Sequence[float]]],
         *,
         sampling_rate: int = 16_000,
+        waveform_lengths: Optional[Tensor] = None,
         normalize_embeddings: bool = True,
         grad_through_input: bool = False,
         return_frame_features: bool = True,
     ) -> WeSpeakerSVOutput:
+        wav, wav_lengths = self._prepare_waveforms(waveforms, waveform_lengths=waveform_lengths)
         if sampling_rate != self.sample_rate:
             # Differentiable resampling for generated waveforms.
-            wav = self._prepare_waveforms(waveforms)
             wav = torchaudio.functional.resample(
                 wav,
                 orig_freq=sampling_rate,
                 new_freq=self.sample_rate,
             )
-        else:
-            wav = self._prepare_waveforms(waveforms)
+            wav_lengths = self._resampled_lengths(
+                wav_lengths,
+                orig_freq=sampling_rate,
+                new_freq=self.sample_rate,
+                max_len=int(wav.size(-1)),
+            )
 
         mel = self._waveforms_to_mel(wav)
+        mel_lengths = self._waveform_lengths_to_mel_lengths(wav_lengths, max_frames=int(mel.size(-1)))
         return self.forward_from_mel(
             mel,
+            frame_lengths=mel_lengths,
             normalize_embeddings=normalize_embeddings,
             grad_through_input=grad_through_input,
             return_frame_features=return_frame_features,

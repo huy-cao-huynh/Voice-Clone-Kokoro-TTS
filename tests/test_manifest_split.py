@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import importlib.util
 import sys
 from pathlib import Path
@@ -24,6 +25,8 @@ JoinedRow = _mod.JoinedRow
 split_speakers_for_val = _mod.split_speakers_for_val
 build_manifest_lines = _mod.build_manifest_lines
 _derive_val_path = _mod._derive_val_path
+filter_rows_with_client_id = _mod.filter_rows_with_client_id
+main = _mod.main
 
 # Pre-seed the cached pipeline maps so kokoro.pipeline is never imported
 # (avoids loguru / heavy model dependencies in unit tests).
@@ -139,6 +142,58 @@ class TestBuildManifestLines:
             )
         assert l1 == l2
 
+    def test_blank_client_id_rows_are_excluded(self) -> None:
+        rows = _make_rows({"A": 2})
+        rows.extend(
+            [
+                JoinedRow(
+                    path="blank_0.mp3",
+                    client_id="",
+                    sentence="blank 0",
+                    duration_sec=4.0,
+                    stratum="__empty__|__empty__|__empty__",
+                    locale="hi",
+                    accents="",
+                ),
+                JoinedRow(
+                    path="blank_1.mp3",
+                    client_id="",
+                    sentence="blank 1",
+                    duration_sec=4.0,
+                    stratum="__empty__|__empty__|__empty__",
+                    locale="hi",
+                    accents="",
+                ),
+            ]
+        )
+        with _patch_pipeline_maps():
+            lines, dropped, _ = build_manifest_lines(
+                rows, lang_code_override="h", fallback_locale="hi", seed=42,
+            )
+        assert len(lines) == 2
+        assert dropped == 0
+        assert all(item["rec"]["speaker_id"] == "A" for item in lines)
+        assert all("blank_" not in item["rec"]["target_wav"] for item in lines)
+
+
+class TestFilterRowsWithClientId:
+    def test_drops_blank_client_ids(self) -> None:
+        rows = _make_rows({"A": 2})
+        rows.append(
+            JoinedRow(
+                path="blank.mp3",
+                client_id="   ",
+                sentence="blank",
+                duration_sec=4.0,
+                stratum="__empty__|__empty__|__empty__",
+                locale="hi",
+                accents="",
+            )
+        )
+        kept, dropped = filter_rows_with_client_id(rows)
+        assert dropped == 1
+        assert [row.client_id for row in kept] == ["A", "A"]
+
 
 # ---------------------------------------------------------------------------
 # _derive_val_path
@@ -154,6 +209,60 @@ class TestDeriveValPath:
         assert _derive_val_path(p) == Path("manifests/hi_val.jsonl")
 
 
+class TestMainValidationSplit:
+    def test_requires_two_non_empty_speakers_for_val_split(self, tmp_path: Path) -> None:
+        locale_dir = tmp_path / "hi"
+        locale_dir.mkdir()
+        _write_tsv(
+            locale_dir / "validated.tsv",
+            fieldnames=["client_id", "path", "sentence", "locale", "accents", "gender", "age"],
+            rows=[
+                {
+                    "client_id": "speaker-a",
+                    "path": "clip_0.mp3",
+                    "sentence": "hello",
+                    "locale": "hi",
+                    "accents": "",
+                    "gender": "",
+                    "age": "",
+                },
+                {
+                    "client_id": "speaker-a",
+                    "path": "clip_1.mp3",
+                    "sentence": "world",
+                    "locale": "hi",
+                    "accents": "",
+                    "gender": "",
+                    "age": "",
+                },
+            ],
+        )
+        _write_tsv(
+            locale_dir / "clip_durations.tsv",
+            fieldnames=["clip", "duration[ms]"],
+            rows=[
+                {"clip": "clip_0.mp3", "duration[ms]": "1000"},
+                {"clip": "clip_1.mp3", "duration[ms]": "1000"},
+            ],
+        )
+
+        with _patch_pipeline_maps():
+            rc = main(
+                [
+                    "--locale-dir",
+                    str(locale_dir),
+                    "--out",
+                    str(tmp_path / "train.jsonl"),
+                    "--skip-g2p-check",
+                    "--val-fraction",
+                    "0.5",
+                ]
+            )
+
+        assert rc == 1
+        assert not (tmp_path / "train.jsonl").exists()
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -163,3 +272,10 @@ def _find_speaker_for_path(rows: List[JoinedRow], path: str) -> str:
         if r.path == path:
             return r.client_id
     raise ValueError(f"path {path!r} not found in rows")
+
+
+def _write_tsv(path: Path, *, fieldnames: List[str], rows: List[Dict[str, str]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)

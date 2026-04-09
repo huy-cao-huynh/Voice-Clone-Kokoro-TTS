@@ -170,6 +170,18 @@ class TestWaveformDiscriminatorZeroInput:
         for l in logits:
             assert torch.isfinite(l).all()
 
+    def test_very_short_wav_still_runs(self, hifigan_mod):
+        disc = hifigan_mod.HiFiGANMPDMSDDiscriminator(msd_scales=(1, 2, 4))
+        disc.eval()
+        wav = torch.zeros(1, 3)
+        with torch.no_grad():
+            logits, feats = disc(wav)
+        assert len(logits) == 8
+        assert len(feats) == 8
+        for l in logits:
+            assert l.numel() > 0
+            assert torch.isfinite(l).all()
+
 
 # ---------------------------------------------------------------------------
 # resample_mono differentiability

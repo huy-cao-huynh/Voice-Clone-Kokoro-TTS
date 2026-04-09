@@ -9,11 +9,25 @@ import sys
 import wave
 from pathlib import Path
 from typing import Any, Dict
+from unittest import mock
 
 import pytest
 import torch
 
+try:
+    import torchaudio
+except ImportError:
+    torchaudio = None
+
 _ROOT = Path(__file__).resolve().parents[1]
+
+
+# Keep older wespeaker/s3prl imports compatible with newer torchaudio releases.
+if torchaudio is not None:
+    if not hasattr(torchaudio, "set_audio_backend"):
+        torchaudio.set_audio_backend = lambda backend: None
+    if "torchaudio.sox_effects" not in sys.modules:
+        sys.modules["torchaudio.sox_effects"] = mock.MagicMock()
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ Optional fields:
 | `speaker_id` | Optional string for logging; passed through the collate fn when present. |
 
 Paths may be relative; they are resolved against `--manifest-root` if given, otherwise against the manifest file’s directory.
+`VoiceCloneManifestDataset` validates those resolved audio paths at startup so missing files fail fast before training begins.
 
 ## Sampling rates and disk
 
@@ -38,6 +39,7 @@ Example line:
 
 - **One row = one supervised pair**: `text` should describe the **full** `target_wav`. If `KPipeline` splits the line into **multiple** chunks (long English tokenization or long non-English segments), `VoiceCloneManifestDataset` raises by default so you do not silently misalign text and audio. Keep lines short enough for a **single** G2P segment, or pre-split audio and text into multiple rows.
 - Phoneme strings are capped at **510** characters before BOS/EOS (Kokoro pipeline limit). The model context is `plbert.max_position_embeddings` from `config.json` (typically 512 tokens including BOS/EOS).
+- Empty text, blank `phonemes`, or phoneme strings that collapse to zero in-vocabulary tokens after Kokoro vocab filtering are rejected. This avoids silently training on degenerate BOS/EOS-only sequences.
 
 ## `repo_id` and vocabulary constraints
 

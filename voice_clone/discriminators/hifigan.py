@@ -40,6 +40,19 @@ def _crop_to_min_shape(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, 
     return out_a, out_b
 
 
+def _downsample_exact(wav: torch.Tensor, scale: int) -> torch.Tensor:
+    """Average-pool by ``scale`` while staying defined for very short clips."""
+    if scale == 1:
+        return wav
+    if scale <= 0:
+        raise ValueError(f"scale must be positive, got {scale}")
+    if wav.size(-1) < scale:
+        pad = scale - int(wav.size(-1))
+        mode = "replicate" if wav.size(-1) > 0 else "constant"
+        wav = F.pad(wav, (0, pad), mode=mode)
+    return F.avg_pool1d(wav, kernel_size=scale, stride=scale, padding=0)
+
+
 class MPDiscriminator(nn.Module):
     """
     HiFi-GAN MPD sub-discriminator.
@@ -190,6 +203,8 @@ class MultiScaleDiscriminator(nn.Module):
         if len(scales) == 0:
             raise ValueError("scales must be non-empty")
         self.scales = list(map(int, scales))
+        if any(scale <= 0 for scale in self.scales):
+            raise ValueError(f"scales must be positive, got {self.scales}")
         self.sub_discriminators = nn.ModuleList(
             [_SubMSDiscriminator(use_spectral_norm=use_spectral_norm) for _ in self.scales]
         )
@@ -199,11 +214,7 @@ class MultiScaleDiscriminator(nn.Module):
         logits: List[torch.Tensor] = []
         feats: List[List[torch.Tensor]] = []
         for scale, d in zip(self.scales, self.sub_discriminators):
-            if scale == 1:
-                x_s = x
-            else:
-                # Downsample by exact factor using average pooling.
-                x_s = F.avg_pool1d(x, kernel_size=scale, stride=scale, padding=0)
+            x_s = _downsample_exact(x, scale)
             l, f = d(x_s)
             logits.append(l)
             feats.append(f)

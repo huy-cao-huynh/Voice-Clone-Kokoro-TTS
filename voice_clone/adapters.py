@@ -14,13 +14,25 @@ class ResidualAdapter(nn.Module):
 
     def __init__(self, hidden_dim: int, style_dim: int, bottleneck_dim: int):
         super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.style_dim = int(style_dim)
         self.down = nn.Linear(hidden_dim + style_dim, bottleneck_dim)
         self.up = nn.Linear(bottleneck_dim, hidden_dim)
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
     def forward(self, h: torch.Tensor, z_style: torch.Tensor) -> torch.Tensor:
+        if h.dim() != 3:
+            raise ValueError(f"h must have shape `(batch, hidden_dim, time)`, got {tuple(h.shape)}")
+        if z_style.dim() != 2:
+            raise ValueError(f"z_style must have shape `(batch, style_dim)`, got {tuple(z_style.shape)}")
         b, _, t = h.shape
+        if h.size(1) != self.hidden_dim:
+            raise ValueError(f"h channel dim {h.size(1)} != adapter hidden_dim {self.hidden_dim}")
+        if z_style.size(0) != b:
+            raise ValueError(f"z_style batch {z_style.size(0)} != h batch {b}")
+        if z_style.size(1) != self.style_dim:
+            raise ValueError(f"z_style feature dim {z_style.size(1)} != adapter style_dim {self.style_dim}")
         z = z_style.unsqueeze(-1).expand(b, z_style.size(1), t)
         x = torch.cat([h, z], dim=1).transpose(1, 2)
         delta = self.up(F.relu(self.down(x))).transpose(1, 2)

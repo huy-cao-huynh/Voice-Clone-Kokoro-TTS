@@ -97,6 +97,19 @@ class TestSegmentGSTMaskHandling:
             out_half, _ = gst(frames, mask_half)
         assert not torch.allclose(out_full.pooled_style, out_half.pooled_style, atol=1e-6)
 
+    def test_treats_positive_mask_values_as_binary_valid_frames(self, segment_gst_mod):
+        gst = segment_gst_mod.SegmentGST()
+        gst.eval()
+        with torch.no_grad():
+            gst.to_ref_s.weight.fill_(0.01)
+        frames = torch.randn(1, 20, FRAME_DIM)
+        weighted_mask = torch.tensor([[1.0] * 10 + [0.25] * 10])
+        binary_mask = torch.ones(1, 20)
+        with torch.no_grad():
+            out_weighted, _ = gst(frames, weighted_mask)
+            out_binary, _ = gst(frames, binary_mask)
+        torch.testing.assert_close(out_weighted.pooled_style, out_binary.pooled_style)
+
 
 class TestSegmentGSTValidation:
     def test_universal_style_vector_length_mismatch_raises(self, segment_gst_mod):

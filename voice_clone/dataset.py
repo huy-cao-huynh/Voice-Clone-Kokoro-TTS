@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 import json
 import warnings
 from pathlib import Path
@@ -35,6 +36,11 @@ def phonemes_to_input_ids(
     """Map a phoneme string to Kokoro ``input_ids`` with BOS/EOS, same filtering as :meth:`KModel.forward`."""
     ids = [vocab.get(ch) for ch in phonemes]
     ids = [i for i in ids if i is not None]
+    if not ids:
+        raise ValueError(
+            "Phoneme sequence produced no in-vocabulary tokens after filtering unknown graphemes. "
+            "Check the manifest row language, phonemes, and Kokoro repo/vocab compatibility."
+        )
     if len(ids) + 2 > context_length:
         raise ValueError(
             f"Phoneme sequence too long for model context: {len(ids) + 2} > {context_length} "
@@ -75,11 +81,18 @@ def text_to_phonemes(
         warnings.warn(msg + " Concatenating phoneme chunks because strict_single_chunk=False.", UserWarning)
 
     phonemes = "".join(r.phonemes for r in results)
+    if not phonemes.strip():
+        raise ValueError("G2P produced an empty phoneme string.")
     if len(phonemes) > max_phoneme_chars:
         raise ValueError(
             f"Phoneme string length {len(phonemes)} exceeds max_phoneme_chars={max_phoneme_chars}."
         )
     return phonemes
+
+
+@lru_cache(maxsize=16)
+def _resampler(orig_sr: int, target_sr: int):
+    return torchaudio.transforms.Resample(orig_freq=orig_sr, new_freq=target_sr)
 
 
 def load_audio_mono(path: Union[str, Path], *, target_sr: int) -> torch.Tensor:
@@ -100,7 +113,7 @@ def load_audio_mono(path: Union[str, Path], *, target_sr: int) -> torch.Tensor:
         wav = wav.mean(dim=0, keepdim=True)
     wav = wav.squeeze(0)
     if sr != target_sr:
-        wav = torchaudio.functional.resample(wav.unsqueeze(0), sr, target_sr).squeeze(0)
+        wav = _resampler(sr, target_sr)(wav.unsqueeze(0)).squeeze(0)
     if not torch.isfinite(wav).all():
         raise ValueError(f"Non-finite audio samples (NaN/Inf) in {path}")
     return wav
@@ -158,8 +171,26 @@ class VoiceCloneManifestDataset(Dataset):
         for key in ("ref_wav", "target_wav", "text", "lang_code"):
             if key not in row:
                 raise ValueError(f"{self.manifest_path}:{line_no}: missing key {key!r}")
+        for key in ("ref_wav", "target_wav"):
+            value = row[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{self.manifest_path}:{line_no}: {key} must be a non-empty string path")
         if not isinstance(row["text"], str):
             raise ValueError(f"{self.manifest_path}:{line_no}: text must be a string")
+        if not row["text"].strip():
+            raise ValueError(f"{self.manifest_path}:{line_no}: text must be non-empty after stripping whitespace")
+        if not isinstance(row["lang_code"], str):
+            raise ValueError(f"{self.manifest_path}:{line_no}: lang_code must be a string")
+        normalize_lang_code(row["lang_code"])
+        if "phonemes" in row and row["phonemes"] is not None:
+            if not isinstance(row["phonemes"], str):
+                raise ValueError(f"{self.manifest_path}:{line_no}: phonemes must be a string when provided")
+            if not row["phonemes"].strip():
+                raise ValueError(f"{self.manifest_path}:{line_no}: phonemes must be non-empty when provided")
+        for key in ("ref_wav", "target_wav"):
+            resolved = self._resolve_path(row[key])
+            if not resolved.is_file():
+                raise FileNotFoundError(f"{self.manifest_path}:{line_no}: audio file not found: {resolved}")
 
     def _resolve_path(self, p: Union[str, Path]) -> Path:
         path = Path(p)

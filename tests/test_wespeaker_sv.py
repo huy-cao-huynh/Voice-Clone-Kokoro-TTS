@@ -11,7 +11,9 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
+
+torchaudio = pytest.importorskip("torchaudio")
+pytest.importorskip("wespeaker")
 
 from voice_clone.wespeaker_sv import WeSpeakerSV, WeSpeakerSVOutput
 
@@ -129,3 +131,31 @@ class TestResamplingLogic:
         assert call_kw.get("orig_freq") == 24_000
         assert call_kw.get("new_freq") == 16_000
         assert out.pooled_embedding.shape == (1, 256)
+
+
+class TestFrameMaskOutput:
+    def test_sequence_batch_returns_frame_mask(self) -> None:
+        model = make_model()
+        wavs = [torch.randn(16_000), torch.randn(8_000)]
+        out = model.forward(wavs, sampling_rate=16_000, grad_through_input=False)
+        assert out.frame_features is not None
+        assert out.frame_mask is not None
+        assert out.frame_mask.dtype == torch.bool
+        assert out.frame_mask.shape == out.frame_features.shape[:2]
+        assert out.frame_mask[0].all()
+        assert not out.frame_mask[1].all()
+        assert out.frame_mask[1].any()
+
+    def test_explicit_waveform_lengths_override_padded_tensor(self) -> None:
+        model = make_model()
+        wav = torch.randn(2, 16_000)
+        lengths = torch.tensor([16_000, 4_000])
+        out = model.forward(
+            wav,
+            sampling_rate=16_000,
+            waveform_lengths=lengths,
+            grad_through_input=False,
+        )
+        assert out.frame_mask is not None
+        assert out.frame_mask[0].all()
+        assert not out.frame_mask[1].all()

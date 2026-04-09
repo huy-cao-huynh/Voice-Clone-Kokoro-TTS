@@ -142,7 +142,10 @@ class SegmentGST(nn.Module):
         attn_out = self.norm(attn_out)
         attn_out = self.dropout(attn_out)
 
-        m = frame_mask.to(dtype=attn_out.dtype, device=attn_out.device).unsqueeze(-1)
+        valid_mask = frame_mask.to(device=attn_out.device)
+        if valid_mask.dtype is not torch.bool:
+            valid_mask = valid_mask > 0
+        m = valid_mask.to(dtype=attn_out.dtype).unsqueeze(-1)
         denom = m.sum(dim=1).clamp(min=1e-6)
         pooled = (attn_out * m).sum(dim=1) / denom
 
