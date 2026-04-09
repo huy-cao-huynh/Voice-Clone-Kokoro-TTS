@@ -19,7 +19,6 @@ def full_stack():
     from voice_clone.config import TrainConfig
     from voice_clone.train_adapters import (
         build_models,
-        freeze_kokoro_except_adapters,
         generator_trainable_parameters,
     )
     from voice_clone.segment_gst import SegmentGST
@@ -56,6 +55,16 @@ class TestFreezeKokoroExceptAdapters:
                 assert p.requires_grad, f"Adapter param {name} should be trainable"
             else:
                 assert not p.requires_grad, f"Non-adapter param {name} should be frozen"
+
+    def test_kokoro_train_mode_dropout_disabled_on_trunk(self, full_stack):
+        """Frozen Kokoro stays in train() for ROCm RNN backward; trunk dropout is zeroed."""
+        kmodel = full_stack["kmodel"]
+        assert kmodel.training
+        for m in kmodel.modules():
+            if isinstance(m, nn.Dropout):
+                assert m.p == 0.0
+            if isinstance(m, nn.RNNBase) and hasattr(m, "dropout"):
+                assert m.dropout == 0.0
 
     def test_gst_params_all_trainable(self, full_stack):
         gst = full_stack["gst"]

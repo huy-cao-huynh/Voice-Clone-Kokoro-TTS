@@ -132,6 +132,8 @@ class ProsodyPredictor(nn.Module):
         x_pad = torch.zeros([x.shape[0], m.shape[-1], x.shape[-1]], device=x.device)
         x_pad[:, :x.shape[1], :] = x
         x = x_pad
+        # training=False: adapter training keeps Kokoro in train() with module dropout disabled;
+        # do not tie this to ``self.training`` or frozen trunk would re-randomize here.
         duration = self.duration_proj(nn.functional.dropout(x, 0.5, training=False))
         en = (d.transpose(-1, -2) @ alignment)
         return duration.squeeze(-1), en
@@ -200,6 +202,7 @@ class DurationEncoder(nn.Module):
                 x, _ = block(x)
                 x, _ = nn.utils.rnn.pad_packed_sequence(
                     x, batch_first=True)
+                # training=False: same rationale as ProsodyPredictor duration dropout above.
                 x = F.dropout(x, p=self.dropout, training=False)
                 x = x.transpose(-1, -2)
                 x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]], device=x.device)

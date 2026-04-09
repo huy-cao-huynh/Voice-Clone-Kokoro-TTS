@@ -29,7 +29,7 @@ from .losses import (
     speaker_cosine_loss,
     generator_loss_lsgan,
 )
-from .wespeaker_sv import WeSpeakerSV, WeSpeakerSVOutput
+from .wespeaker_sv import WeSpeakerSV, WeSpeakerSVOutput, WeSpeakerToolkitEncoder
 
 __all__ = [
     "AdapterRegistry",
@@ -55,4 +55,5 @@ __all__ = [
     "speaker_cosine_loss",
     "WeSpeakerSV",
     "WeSpeakerSVOutput",
+    "WeSpeakerToolkitEncoder",
 ]

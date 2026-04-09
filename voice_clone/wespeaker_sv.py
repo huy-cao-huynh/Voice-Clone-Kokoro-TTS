@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+import yaml
+from unittest import mock
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
 
 import torch
@@ -10,9 +14,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 
+# Prevent crash from s3prl calling removed torchaudio backend function
+if not hasattr(torchaudio, "set_audio_backend"):
+    torchaudio.set_audio_backend = lambda backend: None
+
+if "torchaudio.sox_effects" not in sys.modules:
+    sys.modules["torchaudio.sox_effects"] = mock.MagicMock()
+
+try:
+    from wespeaker.models.speaker_model import get_speaker_model
+    from wespeaker.utils.checkpoint import load_checkpoint
+except ImportError:
+    raise ImportError(
+        "The 'wespeaker' package is required for WeSpeakerSV but not found. "
+        "Please install it with: `pip install wespeaker`"
+    )
 
 Tensor = torch.Tensor
-
 
 @dataclass
 class WeSpeakerSVOutput:
@@ -24,73 +42,79 @@ class WeSpeakerSVOutput:
     frame_features: Optional[Tensor]
     """Optional frame-level features, shape `(batch, frames, channels)`."""
 
+class WeSpeakerToolkitEncoder(nn.Module):
+    """
+    Wraps a ``wespeaker`` toolkit speaker backbone (e.g. ``ResNet34``).
 
-class _FallbackSpeakerEncoder(nn.Module):
-    """Small fallback encoder when torchvision is unavailable."""
+    Input is ``(batch, 1, n_mels, time)``; internally converted to the toolkit
+    layout ``(batch, time, n_mels)``.
+    """
 
-    def __init__(self, in_ch: int = 1, embedding_dim: int = 256) -> None:
+    def __init__(self, backbone: nn.Module) -> None:
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-        )
-        self.proj = nn.Linear(256, embedding_dim)
+        self.backbone = backbone
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        # x: (B, 1, n_mels, T)
-        feat = self.conv(x)  # (B, C, F, Tf)
-        frame = feat.mean(dim=2).transpose(1, 2).contiguous()  # (B, Tf, C)
-        pooled = frame.mean(dim=1)  # (B, C)
-        emb = self.proj(pooled)
-        return emb, frame
+        if x.dim() != 4 or x.size(1) != 1:
+            raise ValueError(f"expected x shaped (B, 1, n_mels, T), got {tuple(x.shape)}")
+        # WeSpeaker expects (batch, time, freq)
+        x_bt_f = x.squeeze(1).permute(0, 2, 1).contiguous()
+        
+        if not hasattr(self.backbone, "get_frame_level_feat"):
+            raise TypeError("backbone must define get_frame_level_feat (WeSpeaker ResNet family)")
+        
+        # WeSpeaker ResNet implementation: 
+        # get_frame_level_feat returns the frame features (B, T, C)
+        # _get_frame_level_feat returns the output before pooling (B, C, F, T or similar)
+        frame = self.backbone.get_frame_level_feat(x_bt_f)
+        out = self.backbone._get_frame_level_feat(x_bt_f)
+        stats = self.backbone.pool(out)
+        pooled = self.backbone.seg_1(stats)
+        return pooled, frame
 
+def load_wespeaker_toolkit_encoder(
+    model_dir: Path,
+    *,
+    embedding_dim: int,
+) -> WeSpeakerToolkitEncoder:
+    """
+    Loads a WeSpeaker backbone from a directory containing ``config.yaml`` and ``avg_model.pt``.
+    
+    Throws FileNotFoundError if files are missing.
+    """
+    cfg_path = model_dir / "config.yaml"
+    pt_path = model_dir / "avg_model.pt"
+    
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"WeSpeaker config not found at {cfg_path}")
+    if not pt_path.is_file():
+        raise FileNotFoundError(f"WeSpeaker weights not found at {pt_path}")
 
-class _TorchvisionResNet34Encoder(nn.Module):
-    """ResNet34 backbone adapted for single-channel mel input."""
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
 
-    def __init__(self, embedding_dim: int = 256) -> None:
-        super().__init__()
-        from torchvision.models import resnet34  # lazy import
-
-        base = resnet34(weights=None)
-        old_conv1 = base.conv1
-        base.conv1 = nn.Conv2d(
-            1,
-            old_conv1.out_channels,
-            kernel_size=old_conv1.kernel_size,
-            stride=old_conv1.stride,
-            padding=old_conv1.padding,
-            bias=False,
+    # Simplified loading logic relying on get_speaker_model
+    model_name = config.get("model", "ResNet34")
+    model_args = config.get("model_args", {})
+    
+    model = get_speaker_model(model_name)(**model_args)
+    
+    cfg_embed = int(model_args.get("embed_dim", embedding_dim))
+    if cfg_embed != int(embedding_dim):
+        raise ValueError(
+            f"config.yaml embed_dim={cfg_embed} does not match requested embedding_dim={embedding_dim}"
         )
-        self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
-        self.layer1 = base.layer1
-        self.layer2 = base.layer2
-        self.layer3 = base.layer3
-        self.layer4 = base.layer4
-        self.proj = nn.Linear(512, embedding_dim)
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        # x: (B, 1, n_mels, T)
-        h = self.stem(x)
-        h = self.layer1(h)
-        h = self.layer2(h)
-        h = self.layer3(h)
-        h = self.layer4(h)  # (B, 512, F, Tf)
-        frame = h.mean(dim=2).transpose(1, 2).contiguous()  # (B, Tf, 512)
-        pooled = frame.mean(dim=1)
-        emb = self.proj(pooled)
-        return emb, frame
+    load_checkpoint(model, str(pt_path))
+    model.eval()
+    return WeSpeakerToolkitEncoder(model)
 
+def _resolve_wespeaker_model_dir(checkpoint_path: str) -> Path:
+    """Directory that should contain ``config.yaml`` / ``avg_model.pt``."""
+    p = Path(checkpoint_path).expanduser()
+    if p.is_dir():
+        return p
+    return p.parent
 
 class WeSpeakerSV(nn.Module):
     """Frozen WeSpeaker wrapper with differentiable mel frontend."""
@@ -152,39 +176,12 @@ class WeSpeakerSV(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> "WeSpeakerSV":
-        try:
-            encoder: nn.Module = _TorchvisionResNet34Encoder(embedding_dim=embedding_dim)
-        except Exception:
-            encoder = _FallbackSpeakerEncoder(embedding_dim=embedding_dim)
-
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = ckpt
-        if isinstance(ckpt, dict):
-            if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
-                state_dict = ckpt["state_dict"]
-            elif "model" in ckpt and isinstance(ckpt["model"], dict):
-                state_dict = ckpt["model"]
-
-        if isinstance(state_dict, dict):
-            encoder_sd = encoder.state_dict()
-            compatible_state_dict = {
-                k: v
-                for k, v in state_dict.items()
-                if k in encoder_sd and hasattr(v, "shape") and tuple(v.shape) == tuple(encoder_sd[k].shape)
-            }
-            # Accept partially matching checkpoints; wrapper stays usable for integration tests.
-            try:
-                missing, unexpected = encoder.load_state_dict(compatible_state_dict, strict=False)
-            except Exception as exc:
-                raise
-            if len(compatible_state_dict) <= 0:
-                raise RuntimeError(
-                    "Checkpoint does not contain shape-compatible speaker encoder weights."
-                )
-        elif isinstance(ckpt, nn.Module):
-            encoder = ckpt
-        else:
-            raise TypeError("Unsupported checkpoint format for WeSpeakerSV.from_checkpoint")
+        """
+        Creates a WeSpeakerSV from a checkpoint path or directory.
+        Strictly requires the 'wespeaker' package and valid toolkit files.
+        """
+        model_dir = _resolve_wespeaker_model_dir(checkpoint_path)
+        encoder = load_wespeaker_toolkit_encoder(model_dir, embedding_dim=embedding_dim)
 
         model = cls(
             encoder,
@@ -232,6 +229,7 @@ class WeSpeakerSV(nn.Module):
         db_tf = self.amplitude_to_db.to(device=waveforms.device, dtype=waveforms.dtype)
         mel = mel_tf(waveforms)  # (B, n_mels, T)
         mel = db_tf(mel)
+        # CMS
         mel = (mel - mel.mean(dim=-1, keepdim=True)) / (mel.std(dim=-1, keepdim=True) + 1e-5)
         return mel
 

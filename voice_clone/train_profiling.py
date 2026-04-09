@@ -10,13 +10,13 @@ from typing import Any, Dict, Iterator, List, Optional
 import torch
 
 # Order used for printed tables and tests.
+# Keep aligned with timer span names emitted in train_adapters.py.
 BREAKDOWN_LABELS = (
     "dataloader",
     "h2d",
-    "wavlm_ref",
+    "sv_ref",
     "kokoro_fwd",
-    "wavlm_gen",
-    "wavlm_tgt",
+    "sv_gen",
     "disc",
     "gen_backward",
     "wandb_log",

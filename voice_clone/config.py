@@ -12,9 +12,9 @@ from huggingface_hub import hf_hub_download
 @dataclass
 class LossWeights:
     lambda_mel: float = 1.0
-    lambda_spk: float = 1.0
-    lambda_adv: float = 0.1
-    lambda_fm: float = 1.0
+    lambda_spk: float = 15.0
+    lambda_adv: float = 2.0
+    lambda_fm: float = 15.0
 
 
 @dataclass
@@ -32,11 +32,11 @@ class MelLossConfig:
 @dataclass
 class TrainConfig:
     kokoro_repo_id: str = "hexgrad/Kokoro-82M"
-    wespeaker_checkpoint_path: str = "wespeaker/models/avg_model"
+    # Under ``wespeaker_ckpt/`` (not ``wespeaker/``) so ``import wespeaker`` resolves to the PyPI toolkit.
+    wespeaker_checkpoint_path: str = "wespeaker_ckpt/models/avg_model.pt"
     wespeaker_embedding_dim: int = 256
     wespeaker_sample_rate: int = 16_000
     universal_style_vector_path: str = "voice_clone/universal_style_vector.pt"
-    kokoro_eval_mode: str = "eval_then_fallback_train_dropout_zero"
     disable_amp_for_stft: bool = True
     adapter_bottleneck: int = 64
     loss_weights: LossWeights = field(default_factory=LossWeights)
@@ -48,10 +48,10 @@ class TrainConfig:
     use_amp: bool = True
     # How often to log to W&B and refresh training metrics in the terminal (tqdm postfix or one-line \r).
     log_interval: int = 1
-    checkpoint_interval: int = 250
+    checkpoint_interval: int = 125
     warmup_steps: int = 50
     grad_accum_steps: int = 8
-    disc_start_step: int = 500
+    disc_start_step: int = 0
     speed: float = 1.0
     lr_min_g: float = 1e-6
     lr_min_d: float = 1e-7

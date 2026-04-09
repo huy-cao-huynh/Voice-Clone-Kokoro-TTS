@@ -87,8 +87,12 @@ def _terminal_metrics_cr_line(global_step: int, metrics: Dict[str, float]) -> st
 
 
 def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
-    # Prefer eval for frozen backbone determinism; fallback to train + zero-dropout if backend needs it.
-    kmodel.eval()
+    """Freeze Kokoro except L-adapters; keep backbone in ``train()`` with no stochastic dropout.
+
+    ROCm/MIOpen requires RNN backward in training mode. We use ``train()`` on the full model
+    (so validation can restore with ``kmodel.train(prev_k_train)`` correctly) and disable
+    dropout on ``nn.Dropout`` and ``nn.RNNBase`` modules instead of relying on ``eval()``.
+    """
     for p in kmodel.parameters():
         p.requires_grad_(False)
     enc = kmodel.predictor.text_encoder
@@ -102,25 +106,12 @@ def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
         for p in kmodel.decoder.generator.adapters.parameters():
             p.requires_grad_(True)
 
-
-def apply_kokoro_freeze_mode_policy(kmodel: KModel, policy: str) -> None:
-    if policy != "eval_then_fallback_train_dropout_zero":
-        raise ValueError(f"Unsupported kokoro_eval_mode policy: {policy}")
-    try:
-        kmodel.eval()
-        # ROCm/MIOpen requires RNN modules to run in training mode for backward().
-        # Keep the rest of Kokoro in eval, but flip only RNN blocks and disable their dropout.
-        if getattr(torch.version, "hip", None):
-            for m in kmodel.modules():
-                if isinstance(m, nn.RNNBase):
-                    m.train(True)
-                    if hasattr(m, "dropout"):
-                        m.dropout = 0.0
-    except Exception:
-        kmodel.train()
-        for m in kmodel.modules():
-            if isinstance(m, nn.Dropout):
-                m.p = 0.0
+    kmodel.train(True)
+    for m in kmodel.modules():
+        if isinstance(m, nn.Dropout):
+            m.p = 0.0
+        if isinstance(m, nn.RNNBase) and hasattr(m, "dropout"):
+            m.dropout = 0.0
 
 
 def strip_weight_norm_frozen(model: nn.Module) -> None:
@@ -221,7 +212,6 @@ def build_models(
     )
     kmodel = kmodel.to(device)
     freeze_kokoro_except_adapters(kmodel)
-    apply_kokoro_freeze_mode_policy(kmodel, cfg.kokoro_eval_mode)
     strip_weight_norm_frozen(kmodel)
 
     sv_model = WeSpeakerSV.from_checkpoint(
@@ -333,6 +323,7 @@ def generator_loss_backward(
     mel_loss_mod: MelReconstructionLoss,
     opt_g: torch.optim.Optimizer,
     pred_wav: torch.Tensor,
+    pred_wav_seg: torch.Tensor,
     ref_pooled_detached: torch.Tensor,
     gen_pooled: torch.Tensor,
     tgt_24: torch.Tensor,
@@ -361,7 +352,7 @@ def generator_loss_backward(
         l_g_adv = torch.zeros((), device=pred_wav.device, dtype=pred_wav.dtype)
         l_fm = torch.zeros((), device=pred_wav.device, dtype=pred_wav.dtype)
         if real_disc_features is not None:
-            fake_logits, fake_feats = disc_waveform(pred_wav)
+            fake_logits, fake_feats = disc_waveform(pred_wav_seg)
             l_g_adv = generator_loss_lsgan(fake_logits)
             # Detach real features so generator step does not backprop into D.
             real_feats_detached: List[List[torch.Tensor]] = [
@@ -717,6 +708,19 @@ def train_loop(
                         )
                         if sw is not None:
                             sw.end("sv_gen", sync_cuda=True)
+                        
+                        # Random crop for discriminator
+                        segment_size = 16384  # Standard HiFi-GAN segment size
+                        min_len = min(tgt_24.size(-1), pred_wav.size(-1))
+                        slice_len = min(min_len, segment_size)
+                        max_start = min_len - slice_len
+                        
+                        start_idx = 0
+                        if max_start > 0:
+                            start_idx = torch.randint(0, max_start + 1, (1,), device=device).item()
+                        
+                        tgt_24_seg = tgt_24[..., start_idx : start_idx + slice_len]
+                        pred_wav_seg = pred_wav[..., start_idx : start_idx + slice_len]
 
                         # Waveform discriminator on real vs fake (D-step).
                         if sw is not None:
@@ -724,11 +728,13 @@ def train_loop(
                         ld = torch.zeros((), device=device, dtype=torch.float32)
                         real_disc_features: Optional[List[List[torch.Tensor]]] = None
                         if include_gan:
-                            # Real path.
-                            real_logits, real_feats = disc(tgt_24)
-                            # Fake (detached) path for D-step only.
-                            fake_logits_detached, _ = disc(pred_wav.detach())
-                            ld = discriminator_loss_lsgan(real_logits, fake_logits_detached)
+                            # Wrap the D-step forward passes in AMP
+                            with _cuda_amp_context(cfg.use_amp, tgt_24):
+                                # Real path.
+                                real_logits, real_feats = disc(tgt_24_seg)
+                                # Fake (detached) path for D-step only.
+                                fake_logits_detached, _ = disc(pred_wav_seg.detach())
+                                ld = discriminator_loss_lsgan(real_logits, fake_logits_detached)
                             scaled_ld = ld * inv_accum
                             if scaler_d is not None and cfg.use_amp:
                                 scaler_d.scale(scaled_ld).backward()
@@ -747,6 +753,7 @@ def train_loop(
                             mel_loss_mod,
                             opt_g,
                             pred_wav,
+                            pred_wav_seg,
                             wv_ref.pooled_embedding.detach(),
                             wv_gen.pooled_embedding,
                             tgt_24,
