@@ -26,6 +26,8 @@ split_speakers_for_val = _mod.split_speakers_for_val
 build_manifest_lines = _mod.build_manifest_lines
 _derive_val_path = _mod._derive_val_path
 filter_rows_with_client_id = _mod.filter_rows_with_client_id
+join_validated = _mod.join_validated
+load_existing_clip_relpaths = _mod.load_existing_clip_relpaths
 main = _mod.main
 
 # Pre-seed the cached pipeline maps so kokoro.pipeline is never imported
@@ -193,6 +195,74 @@ class TestFilterRowsWithClientId:
         kept, dropped = filter_rows_with_client_id(rows)
         assert dropped == 1
         assert [row.client_id for row in kept] == ["A", "A"]
+
+
+class TestJoinValidated:
+    def test_requires_exact_relative_clip_path(self, tmp_path: Path) -> None:
+        locale_dir = tmp_path / "hi"
+        clips_dir = locale_dir / "clips"
+        clips_dir.mkdir(parents=True)
+        (clips_dir / "clip_0.mp3").write_bytes(b"audio")
+
+        _write_tsv(
+            locale_dir / "validated.tsv",
+            fieldnames=["client_id", "path", "sentence", "locale", "accents", "gender", "age"],
+            rows=[
+                {
+                    "client_id": "speaker-a",
+                    "path": "nested/clip_0.mp3",
+                    "sentence": "hello",
+                    "locale": "hi",
+                    "accents": "",
+                    "gender": "",
+                    "age": "",
+                }
+            ],
+        )
+
+        rows, stats = join_validated(
+            locale_dir / "validated.tsv",
+            {"nested/clip_0.mp3": 1.0},
+            existing_clip_relpaths=load_existing_clip_relpaths(clips_dir),
+            include_variant=False,
+            exclude_paths=None,
+        )
+
+        assert rows == []
+        assert stats["missing_clip_file"] == 1
+
+    def test_accepts_nested_relative_clip_path_when_present(self, tmp_path: Path) -> None:
+        locale_dir = tmp_path / "hi"
+        clips_dir = locale_dir / "clips"
+        (clips_dir / "nested").mkdir(parents=True)
+        (clips_dir / "nested" / "clip_0.mp3").write_bytes(b"audio")
+
+        _write_tsv(
+            locale_dir / "validated.tsv",
+            fieldnames=["client_id", "path", "sentence", "locale", "accents", "gender", "age"],
+            rows=[
+                {
+                    "client_id": "speaker-a",
+                    "path": "nested/clip_0.mp3",
+                    "sentence": "hello",
+                    "locale": "hi",
+                    "accents": "",
+                    "gender": "",
+                    "age": "",
+                }
+            ],
+        )
+
+        rows, stats = join_validated(
+            locale_dir / "validated.tsv",
+            {"nested/clip_0.mp3": 1.0},
+            existing_clip_relpaths=load_existing_clip_relpaths(clips_dir),
+            include_variant=False,
+            exclude_paths=None,
+        )
+
+        assert [row.path for row in rows] == ["nested/clip_0.mp3"]
+        assert stats["missing_clip_file"] == 0
 
 
 # ---------------------------------------------------------------------------

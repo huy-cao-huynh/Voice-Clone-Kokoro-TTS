@@ -11,10 +11,10 @@ from huggingface_hub import hf_hub_download
 
 @dataclass
 class LossWeights:
-    lambda_mel: float = 1.0
-    lambda_spk: float = 15.0
-    lambda_adv: float = 2.0
-    lambda_fm: float = 15.0
+    lambda_mel: float = 5.0
+    lambda_spk: float = 5.0
+    lambda_adv: float = 1.0
+    lambda_fm: float = 2.0
 
 
 @dataclass
@@ -43,16 +43,18 @@ class TrainConfig:
     mel: MelLossConfig = field(default_factory=MelLossConfig)
     lr_g: float = 1e-4
     lr_d: float = 5e-5
-    weight_decay_g: float = 0.0
+    weight_decay_g: float = 0.01
     weight_decay_d: float = 0.0
     use_amp: bool = True
     # How often to log to W&B and refresh training metrics in the terminal (tqdm postfix or one-line \r).
     log_interval: int = 1
-    checkpoint_interval: int = 125
-    warmup_steps: int = 50
+    checkpoint_interval: int = 100
+    warmup_steps: int = 500
     grad_accum_steps: int = 8
-    disc_start_step: int = 0
+    disc_start_step: int = 500
     speed: float = 1.0
+    grad_clip_norm_g: float = 1.0
+    grad_clip_norm_d: float = 1.0
     lr_min_g: float = 1e-6
     lr_min_d: float = 1e-7
 

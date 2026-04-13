@@ -283,8 +283,36 @@ def test_launcher_defers_device_selection_and_preserves_pythonpath(monkeypatch):
 
     assert excinfo.value.code == 0
     assert "--device" not in captured["cmd"]
+    assert "--manifest-root" not in captured["cmd"]
+    assert "--val-manifest-root" not in captured["cmd"]
 
     pythonpath = captured["env"]["PYTHONPATH"]
     entries = pythonpath.split(os.pathsep)
     assert entries[0] == str(train_script.REPO_ROOT)
     assert "custom-path" in entries
+
+
+def test_launcher_preserves_explicit_manifest_root_overrides(monkeypatch):
+    import scripts.train as train_script
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, env, cwd):
+        captured["cmd"] = list(cmd)
+
+        class _Result:
+            returncode = 0
+
+        return _Result()
+
+    monkeypatch.setenv("MANIFEST_ROOT", "data/hi")
+    monkeypatch.setenv("VAL_MANIFEST_ROOT", "data/hi")
+    monkeypatch.setattr(train_script.subprocess, "run", fake_run)
+    monkeypatch.setattr(train_script.sys, "argv", ["scripts/train.py"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        train_script.main()
+
+    assert excinfo.value.code == 0
+    assert "--manifest-root" in captured["cmd"]
+    assert "--val-manifest-root" in captured["cmd"]

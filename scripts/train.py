@@ -8,8 +8,9 @@ Usage (from repo root):
 All knobs are controlled via environment variables with sensible defaults.
 Override any of them before invoking the script:
 
-    MANIFEST          manifests/hi_train.jsonl   JSONL manifest path
-    MANIFEST_ROOT     data/hi                    resolve relative manifest paths
+    MANIFEST          manifests/multilingual_train.jsonl   JSONL manifest path
+    MANIFEST_ROOT     (empty)                             optional root for relative manifest paths;
+                                                         omit for merged multilingual manifests
     CKPT_DIR          ckpt                       periodic checkpoint directory
     RESUME            (empty)                    checkpoint to resume from
     KOKORO_REPO       hexgrad/Kokoro-82M         HF model repo
@@ -18,9 +19,9 @@ Override any of them before invoking the script:
     DEVICE            (auto)                     cuda | cpu | mps
     NUM_WORKERS       auto                       dataloader workers (auto = cpu_count or 0 on Windows)
     WANDB_PROJECT     Voice-Clone-Kokoro-TTS
-    WANDB_RUN_NAME    hi-train-<timestamp>
-    VAL_MANIFEST      manifests/hi_val.jsonl      validation JSONL manifest (skipped if missing)
-    VAL_MANIFEST_ROOT data/hi                    resolve relative val manifest paths
+    WANDB_RUN_NAME    multilingual-train-<timestamp>
+    VAL_MANIFEST      manifests/multilingual_val.jsonl    validation JSONL manifest (skipped if missing)
+    VAL_MANIFEST_ROOT (empty)                             optional root for relative val manifest paths
     PROFILE_BREAKDOWN       0                    1 to enable coarse step timers
     PROFILE_BREAKDOWN_STEPS 3                    steps before printing timing summary
     TORCH_PROFILER_TRACE    (empty)              path for Chrome trace JSON
@@ -47,9 +48,9 @@ def _default_num_workers() -> int:
 def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    manifest = os.environ.get("MANIFEST", "manifests/hi_train.jsonl")
-    manifest_root = os.environ.get("MANIFEST_ROOT", "data/hi")
-    ckpt_dir = os.environ.get("CKPT_DIR", "ckpt")
+    manifest = os.environ.get("MANIFEST", "manifests/multilingual_train.jsonl")
+    manifest_root = os.environ.get("MANIFEST_ROOT", "")
+    ckpt_dir = os.environ.get("CKPT_DIR", "ckpt/multilingual")
     resume = os.environ.get("RESUME", "")
     kokoro_repo = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
     epochs = os.environ.get("EPOCHS", "1")
@@ -57,9 +58,9 @@ def main() -> None:
     device = os.environ.get("DEVICE")
     num_workers = os.environ.get("NUM_WORKERS", str(_default_num_workers()))
     wandb_project = os.environ.get("WANDB_PROJECT", "Voice-Clone-Kokoro-TTS")
-    wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"hi-train-{timestamp}")
-    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/hi_val.jsonl")
-    val_manifest_root = os.environ.get("VAL_MANIFEST_ROOT", "data/hi")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"multilingual-train-{timestamp}")
+    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/multilingual_val.jsonl")
+    val_manifest_root = os.environ.get("VAL_MANIFEST_ROOT", "")
     if val_manifest and not (REPO_ROOT / val_manifest).is_file():
         val_manifest = ""
         val_manifest_root = ""

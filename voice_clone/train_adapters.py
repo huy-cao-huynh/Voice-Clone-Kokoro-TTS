@@ -95,13 +95,11 @@ def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
     """
     for p in kmodel.parameters():
         p.requires_grad_(False)
-    enc = kmodel.predictor.text_encoder
-    if enc.adapters is not None:
-        for p in enc.adapters.parameters():
-            p.requires_grad_(True)
+
     if kmodel.decoder.decoder_adapters is not None:
-        for p in kmodel.decoder.decoder_adapters.parameters():
+        for p in kmodel.decoder.decoder_adapters[0].parameters():
             p.requires_grad_(True)
+
     if kmodel.decoder.generator.adapters is not None:
         for p in kmodel.decoder.generator.adapters.parameters():
             p.requires_grad_(True)
@@ -249,7 +247,7 @@ def build_models(
     kmodel = KModel(
         repo_id=cfg.kokoro_repo_id,
         config=kokoro_cfg,
-        duration_encoder_adapters=registry.duration_encoder,
+        duration_encoder_adapters=None,
         decoder_adapters=registry.decoder,
         generator_adapters=registry.generator,
     )
@@ -410,6 +408,7 @@ def generator_loss_backward(
     weights: LossWeights,
     scaler: Optional[GradScaler],
     use_amp: bool,
+    disable_amp_for_stft: bool = True,
     scale_factor: float = 1.0,
 ) -> Dict[str, float]:
     """Compute mel + speaker + (optional) GAN losses and call ``.backward()`` only.
@@ -420,8 +419,13 @@ def generator_loss_backward(
     Returns per-component loss values (**unscaled**, detached) for logging.
     """
     with _cuda_amp_context(use_amp, pred_wav):
-        out_mel = mel_loss_mod(pred_wav, tgt_24)
-        l_mel = out_mel.loss
+        if disable_amp_for_stft and pred_wav.is_cuda:
+            with autocast("cuda", enabled=False):
+                out_mel = mel_loss_mod(pred_wav.float(), tgt_24.float())
+            l_mel = out_mel.loss
+        else:
+            out_mel = mel_loss_mod(pred_wav, tgt_24)
+            l_mel = out_mel.loss
 
         l_spk = speaker_cosine_loss(ref_pooled_detached, gen_pooled)
 
@@ -839,6 +843,7 @@ def train_loop(
                             weights=cfg.loss_weights,
                             scaler=scaler_g,
                             use_amp=cfg.use_amp,
+                            disable_amp_for_stft=cfg.disable_amp_for_stft,
                             scale_factor=inv_accum,
                         )
                         if sw is not None:
@@ -888,6 +893,7 @@ def train_loop(
                     if include_gan:
                         if scaler_d is not None and cfg.use_amp:
                             scaler_d.unscale_(opt_d)
+                        torch.nn.utils.clip_grad_norm_(disc.parameters(), cfg.grad_clip_norm_d)
                         if scaler_d is not None and cfg.use_amp:
                             scaler_d.step(opt_d)
                         else:
@@ -895,6 +901,7 @@ def train_loop(
 
                     if scaler_g is not None and cfg.use_amp:
                         scaler_g.unscale_(opt_g)
+                    torch.nn.utils.clip_grad_norm_(params_g, cfg.grad_clip_norm_g)
                     if scaler_g is not None and cfg.use_amp:
                         scaler_g.step(opt_g)
                     else:
