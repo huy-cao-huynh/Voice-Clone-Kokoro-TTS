@@ -175,8 +175,9 @@ def test_checkpoint_resume_restores_scheduler_state(monkeypatch, tmp_path):
     gst = _DummyGST()
     disc = _DummyDisc()
 
-    opt_g = torch.optim.AdamW(list(kmodel.parameters()) + list(gst.parameters()), lr=cfg.lr_g)
-    opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d)
+    adam_betas = (cfg.adam_b1, cfg.adam_b2)
+    opt_g = torch.optim.AdamW(list(kmodel.parameters()) + list(gst.parameters()), lr=cfg.lr_g, betas=adam_betas)
+    opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d, betas=adam_betas)
     sched_g = train_mod._build_scheduler(opt_g, warmup_steps=2, total_steps=6, lr_min=cfg.lr_min_g)
     sched_d = train_mod._build_scheduler(opt_d, warmup_steps=1, total_steps=4, lr_min=cfg.lr_min_d)
 
@@ -206,8 +207,8 @@ def test_checkpoint_resume_restores_scheduler_state(monkeypatch, tmp_path):
     kmodel2 = _DummyKModel()
     gst2 = _DummyGST()
     disc2 = _DummyDisc()
-    opt_g2 = torch.optim.AdamW(list(kmodel2.parameters()) + list(gst2.parameters()), lr=cfg.lr_g)
-    opt_d2 = torch.optim.AdamW(disc2.parameters(), lr=cfg.lr_d)
+    opt_g2 = torch.optim.AdamW(list(kmodel2.parameters()) + list(gst2.parameters()), lr=cfg.lr_g, betas=adam_betas)
+    opt_d2 = torch.optim.AdamW(disc2.parameters(), lr=cfg.lr_d, betas=adam_betas)
     sched_g2 = train_mod._build_scheduler(opt_g2, warmup_steps=2, total_steps=6, lr_min=cfg.lr_min_g)
     sched_d2 = train_mod._build_scheduler(opt_d2, warmup_steps=1, total_steps=4, lr_min=cfg.lr_min_d)
 

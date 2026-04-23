@@ -260,20 +260,47 @@ class VoiceCloneManifestDataset(Dataset):
 
 
 def collate_voice_clone_batch(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Batch size 1 collate for variable-length ``input_ids`` and waveforms (same as training today)."""
-    if len(samples) != 1:
-        raise ValueError(
-            "collate_voice_clone_batch currently supports batch size 1 (Kokoro `forward_with_tokens`); "
-            f"got {len(samples)}"
-        )
-    s = samples[0]
+    """Dynamic-padding collate for variable-length ``input_ids`` and waveforms.
+
+    Returns padded ``(B, T)`` tensors for ``input_ids``, ``ref_wav_16k``, and
+    ``target_wav_24k`` plus per-item ``*_lengths`` tensors for downstream masking.
+    Token padding uses id ``0`` (Kokoro ``$`` silence token).
+    """
+    B = len(samples)
+
+    input_ids_list = [s["input_ids"] for s in samples]
+    input_ids_lengths = torch.tensor([ids.shape[0] for ids in input_ids_list], dtype=torch.long)
+    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=0)
+
+    ref_wavs = [s["ref_wav_16k"] for s in samples]
+    ref_lengths = torch.tensor([w.shape[0] for w in ref_wavs], dtype=torch.long)
+    ref_wav_16k = torch.nn.utils.rnn.pad_sequence(ref_wavs, batch_first=True, padding_value=0.0)
+
+    tgt_wavs = [s["target_wav_24k"] for s in samples]
+    target_lengths = torch.tensor([w.shape[0] for w in tgt_wavs], dtype=torch.long)
+    target_wav_24k = torch.nn.utils.rnn.pad_sequence(tgt_wavs, batch_first=True, padding_value=0.0)
+
     batch: Dict[str, Any] = {
-        "ref_wav_16k": s["ref_wav_16k"].unsqueeze(0),
-        "target_wav_24k": s["target_wav_24k"].unsqueeze(0),
-        "input_ids": s["input_ids"].unsqueeze(0),
+        "ref_wav_16k": ref_wav_16k,
+        "target_wav_24k": target_wav_24k,
+        "input_ids": input_ids,
+        "input_ids_lengths": input_ids_lengths,
+        "ref_lengths": ref_lengths,
+        "target_lengths": target_lengths,
     }
-    if "speaker_id" in s:
-        batch["speaker_id"] = s["speaker_id"]
-    if "text" in s:
-        batch["text"] = s["text"]
+
+    if B == 1:
+        if "speaker_id" in samples[0]:
+            batch["speaker_id"] = samples[0]["speaker_id"]
+        if "text" in samples[0]:
+            batch["text"] = samples[0]["text"]
+    else:
+        texts = [s.get("text", "") for s in samples]
+        batch["texts"] = texts
+        if texts:
+            batch["text"] = texts[0]
+        speaker_ids = [s.get("speaker_id") for s in samples]
+        if any(sid is not None for sid in speaker_ids):
+            batch["speaker_ids"] = speaker_ids
+
     return batch

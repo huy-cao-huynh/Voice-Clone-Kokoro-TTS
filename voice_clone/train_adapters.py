@@ -8,9 +8,9 @@ import os
 import shutil
 import sys
 import warnings
-from dataclasses import asdict
+from dataclasses import asdict, fields, replace as _dc_replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -31,6 +31,7 @@ from .losses import (
     speaker_input_mel_from_waveform,
     speaker_cosine_loss,
 )
+from .mhubert_encoder import MHuBERTEncoder
 from .segment_gst import SegmentGST
 from .train_profiling import BreakdownAggregator, StepStopwatch, build_torch_profiler
 from .wespeaker_sv import WeSpeakerSV, WeSpeakerSVOutput
@@ -96,8 +97,12 @@ def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
     for p in kmodel.parameters():
         p.requires_grad_(False)
 
+    if kmodel.predictor.text_encoder.adapters is not None:
+        for p in kmodel.predictor.text_encoder.adapters.parameters():
+            p.requires_grad_(True)
+
     if kmodel.decoder.decoder_adapters is not None:
-        for p in kmodel.decoder.decoder_adapters[0].parameters():
+        for p in kmodel.decoder.decoder_adapters.parameters():
             p.requires_grad_(True)
 
     if kmodel.decoder.generator.adapters is not None:
@@ -110,6 +115,15 @@ def freeze_kokoro_except_adapters(kmodel: KModel) -> None:
             m.p = 0.0
         if isinstance(m, nn.RNNBase) and hasattr(m, "dropout"):
             m.dropout = 0.0
+
+
+def _effective_optimizer_steps_per_epoch(num_batches: int, grad_accum_steps: int) -> int:
+    """Outer-loop optimizer steps per epoch: ``ceil(num_batches / grad_accum_steps)``."""
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be >= 1")
+    nb = int(num_batches)
+    ga = int(grad_accum_steps)
+    return (nb + ga - 1) // ga
 
 
 def strip_weight_norm_frozen(model: nn.Module) -> None:
@@ -135,15 +149,25 @@ def _build_scheduler(
     start_factor: float = 1e-3,
 ) -> torch.optim.lr_scheduler.LRScheduler:
     """LinearLR warmup, then CosineAnnealingLR decay when *total_steps* is known."""
+    wu = int(warmup_steps)
+    if wu <= 0:
+        if total_steps is not None and int(total_steps) > 0:
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=int(total_steps), eta_min=lr_min,
+            )
+        # No horizon (e.g. D scheduler when ``disc_start`` consumes the whole run): hold base LR.
+        return torch.optim.lr_scheduler.LambdaLR(opt, lambda _epoch: 1.0)
+
     warmup = torch.optim.lr_scheduler.LinearLR(
-        opt, start_factor=start_factor, end_factor=1.0, total_iters=warmup_steps,
+        opt, start_factor=start_factor, end_factor=1.0, total_iters=wu,
     )
-    if total_steps is not None and total_steps > warmup_steps:
+    ts = int(total_steps) if total_steps is not None else None
+    if ts is not None and ts > wu:
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=total_steps - warmup_steps, eta_min=lr_min,
+            opt, T_max=ts - wu, eta_min=lr_min,
         )
         return torch.optim.lr_scheduler.SequentialLR(
-            opt, schedulers=[warmup, cosine], milestones=[warmup_steps],
+            opt, schedulers=[warmup, cosine], milestones=[wu],
         )
     return warmup
 
@@ -168,20 +192,6 @@ def _ensure_batch_time(wav: torch.Tensor) -> torch.Tensor:
     if wav.dim() != 2:
         raise ValueError(f"waveform must be (time,) or (batch, time), got {tuple(wav.shape)}")
     return wav
-
-
-def _speaker_frame_mask(ref_out: WeSpeakerSVOutput) -> torch.Tensor:
-    if ref_out.frame_features is None:
-        raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
-    frame_mask = getattr(ref_out, "frame_mask", None)
-    if frame_mask is not None:
-        return frame_mask.to(device=ref_out.frame_features.device)
-    return torch.ones(
-        ref_out.frame_features.size(0),
-        ref_out.frame_features.size(1),
-        device=ref_out.frame_features.device,
-        dtype=torch.bool,
-    )
 
 
 def resample_mono(wav: torch.Tensor, orig_sr: int, new_sr: int) -> torch.Tensor:
@@ -233,7 +243,7 @@ def load_universal_style_vector(path: str, *, ref_dim: int) -> torch.Tensor:
 def build_models(
     cfg: TrainConfig,
     device: torch.device,
-) -> Tuple[KModel, SegmentGST, WeSpeakerSV, HiFiGANMPDMSDDiscriminator, MelReconstructionLoss, Dict[str, Any]]:
+) -> Tuple[KModel, SegmentGST, MHuBERTEncoder, WeSpeakerSV, HiFiGANMPDMSDDiscriminator, MelReconstructionLoss, Dict[str, Any]]:
     kokoro_cfg = load_kokoro_config(cfg.kokoro_repo_id)
     istft = kokoro_cfg["istftnet"]
     registry = AdapterRegistry.from_dims(
@@ -247,13 +257,18 @@ def build_models(
     kmodel = KModel(
         repo_id=cfg.kokoro_repo_id,
         config=kokoro_cfg,
-        duration_encoder_adapters=None,
+        duration_encoder_adapters=registry.duration_encoder,
         decoder_adapters=registry.decoder,
         generator_adapters=registry.generator,
     )
     kmodel = kmodel.to(device)
     freeze_kokoro_except_adapters(kmodel)
     strip_weight_norm_frozen(kmodel)
+
+    mhubert = MHuBERTEncoder(
+        repo_id=cfg.mhubert_repo_id,
+        extract_layer=cfg.mhubert_extract_layer,
+    ).to(device)
 
     sv_model = WeSpeakerSV.from_checkpoint(
         cfg.wespeaker_checkpoint_path,
@@ -262,26 +277,18 @@ def build_models(
         device=device,
         dtype=None,
     )
-    with torch.no_grad():
-        probe_mel = torch.zeros(1, 80, 8, device=device, dtype=sv_model.dtype)
-        probe_out = sv_model.forward_from_mel(
-            probe_mel,
-            grad_through_input=False,
-            return_frame_features=True,
-        )
-        if probe_out.frame_features is None:
-            raise RuntimeError("WeSpeakerSV must return frame_features for SegmentGST conditioning.")
-        inferred_frame_dim = int(probe_out.frame_features.shape[-1])
+
     universal_style_vector = load_universal_style_vector(
         cfg.universal_style_vector_path,
         ref_dim=256,
     )
     gst = SegmentGST(
-        frame_dim=inferred_frame_dim,
+        frame_dim=mhubert.hidden_size,
         embed_dim=256,
         num_heads=8,
         ref_dim=256,
         style_dec_dim=128,
+        dropout=cfg.gst_dropout,
         universal_style_vector=universal_style_vector,
     )
     gst = gst.to(device)
@@ -289,7 +296,7 @@ def build_models(
     disc = HiFiGANMPDMSDDiscriminator().to(device)
 
     mel_loss = build_mel_loss(kokoro_cfg, cfg.mel, device)
-    return kmodel, gst, sv_model, disc, mel_loss, kokoro_cfg
+    return kmodel, gst, mhubert, sv_model, disc, mel_loss, kokoro_cfg
 
 
 def save_checkpoint(
@@ -410,6 +417,8 @@ def generator_loss_backward(
     use_amp: bool,
     disable_amp_for_stft: bool = True,
     scale_factor: float = 1.0,
+    pred_lengths: Optional[torch.Tensor] = None,
+    target_lengths: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """Compute mel + speaker + (optional) GAN losses and call ``.backward()`` only.
 
@@ -421,10 +430,16 @@ def generator_loss_backward(
     with _cuda_amp_context(use_amp, pred_wav):
         if disable_amp_for_stft and pred_wav.is_cuda:
             with autocast("cuda", enabled=False):
-                out_mel = mel_loss_mod(pred_wav.float(), tgt_24.float())
+                out_mel = mel_loss_mod(
+                    pred_wav.float(), tgt_24.float(),
+                    pred_lengths=pred_lengths, target_lengths=target_lengths,
+                )
             l_mel = out_mel.loss
         else:
-            out_mel = mel_loss_mod(pred_wav, tgt_24)
+            out_mel = mel_loss_mod(
+                pred_wav, tgt_24,
+                pred_lengths=pred_lengths, target_lengths=target_lengths,
+            )
             l_mel = out_mel.loss
 
         l_spk = speaker_cosine_loss(ref_pooled_detached, gen_pooled)
@@ -489,6 +504,7 @@ def _log_wandb_validation(
     dataset: Dataset,
     kmodel: KModel,
     gst: SegmentGST,
+    mhubert: MHuBERTEncoder,
     sv_model: WeSpeakerSV,
     mel_loss_mod: MelReconstructionLoss,
     cfg: TrainConfig,
@@ -520,26 +536,46 @@ def _log_wandb_validation(
             sample = eval_ds[i]
             batch = collate_voice_clone_batch([sample])
             ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(device))
+            ref_lengths = batch["ref_lengths"].to(device)
             tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(device))
+            target_lengths = batch["target_lengths"].to(device)
             input_ids = batch["input_ids"].to(device)
+            input_ids_lengths = batch["input_ids_lengths"].to(device)
             caption = batch.get("text")
             if not caption:
                 caption = _caption_from_input_ids(batch["input_ids"].squeeze(0), id_to_char)
 
             with torch.no_grad():
-                wv_ref: WeSpeakerSVOutput = sv_model(ref_16, sampling_rate=16_000, grad_through_input=False)
-                frame_mask = _speaker_frame_mask(wv_ref)
-                gst_out, _ = gst(wv_ref.frame_features, frame_mask)
+                ref_attn_mask = (
+                    torch.arange(ref_16.size(1), device=device).unsqueeze(0) < ref_lengths.unsqueeze(1)
+                ).long()
+                mhubert_out = mhubert(ref_16, attention_mask=ref_attn_mask)
+                gst_out, _ = gst(mhubert_out.hidden_states, mhubert_out.frame_mask)
                 ref_s = gst_out.ref_s
-                pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
+                # Match training: Kokoro forward is B=1 and must not see token-padding as phonemes.
+                ids = input_ids[0, : int(input_ids_lengths[0].item())].unsqueeze(0)
+                pred_wav, _ = kmodel.forward_with_tokens(ids, ref_s, speed=cfg.speed)
                 pred_wav = _ensure_batch_time(pred_wav)
                 pred_wav = pred_wav.clamp(-1.0, 1.0)
+                pred_lengths = torch.tensor([pred_wav.shape[1]], dtype=torch.long, device=device)
 
-                out_mel = mel_loss_mod(pred_wav, tgt_24)
+                out_mel = mel_loss_mod(
+                    pred_wav,
+                    tgt_24,
+                    pred_lengths=pred_lengths,
+                    target_lengths=target_lengths,
+                )
                 d = out_mel.mel_pred - out_mel.mel_target
                 mel_l1_sum += float(d.abs().mean().item())
                 mel_l2_sum += float((d**2).mean().item())
 
+                wv_ref: WeSpeakerSVOutput = sv_model(
+                    ref_16,
+                    sampling_rate=16_000,
+                    grad_through_input=False,
+                    waveform_lengths=ref_lengths,
+                    return_frame_features=False,
+                )
                 mel_gen = speaker_input_mel_from_waveform(
                     pred_wav,
                     mel_transform=sv_model._waveforms_to_mel,
@@ -580,6 +616,57 @@ def _log_wandb_validation(
         gst.train(prev_g_train)
 
 
+def _apply_config_overrides(cfg: TrainConfig, overrides: Dict[str, Any]) -> TrainConfig:
+    """Return a new ``TrainConfig`` with *overrides* applied.
+
+    Keys that are fields of :class:`TrainConfig` are replaced directly.
+    Keys that are fields of :class:`LossWeights` (e.g. ``lambda_mel``) are
+    routed into the nested ``loss_weights`` sub-dataclass.
+    """
+    top_names = {f.name for f in fields(TrainConfig)}
+    lw_names = {f.name for f in fields(LossWeights)}
+    top_kw: Dict[str, Any] = {}
+    lw_kw: Dict[str, Any] = {}
+    for k, v in overrides.items():
+        if k in top_names:
+            top_kw[k] = v
+        elif k in lw_names:
+            lw_kw[k] = v
+        else:
+            raise ValueError(f"Unknown config override key: {k!r}")
+    if lw_kw:
+        top_kw["loss_weights"] = _dc_replace(cfg.loss_weights, **lw_kw)
+    return _dc_replace(cfg, **top_kw)
+
+
+def _should_save_and_validate(
+    *,
+    global_step: int,
+    cfg: TrainConfig,
+    max_steps: Optional[int],
+    epoch_idx: int,
+    epochs: int,
+    epoch_done: bool,
+    expected_batches_per_epoch: Optional[int],
+    batches_seen: int,
+) -> bool:
+    is_periodic_step = global_step > 0 and global_step % cfg.checkpoint_interval == 0
+    if not cfg.save_final_checkpoint:
+        return is_periodic_step
+    at_max_stop = max_steps is not None and global_step >= max_steps
+    is_last_step = at_max_stop or (
+        max_steps is None
+        and epoch_idx == (epochs - 1)
+        and (
+            epoch_done
+            or (expected_batches_per_epoch is not None
+                and expected_batches_per_epoch > 0
+                and batches_seen >= expected_batches_per_epoch)
+        )
+    )
+    return is_periodic_step or is_last_step
+
+
 def train_loop(
     dataloader: DataLoader,
     cfg: TrainConfig,
@@ -595,7 +682,12 @@ def train_loop(
     profile_breakdown_steps: int = 3,
     torch_profiler_trace: Optional[Path] = None,
     val_dataset: Optional[Dataset] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+    report_callback: Optional[Callable[[int, float], None]] = None,
 ) -> None:
+    if config_overrides:
+        cfg = _apply_config_overrides(cfg, config_overrides)
+
     if cfg.grad_accum_steps < 1:
         raise ValueError("cfg.grad_accum_steps must be >= 1")
     if cfg.log_interval < 1:
@@ -603,11 +695,16 @@ def train_loop(
     if cfg.checkpoint_interval < 1:
         raise ValueError("cfg.checkpoint_interval must be >= 1")
 
-    kmodel, gst, sv_model, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, mhubert, sv_model, disc, mel_loss_mod, kokoro_cfg = build_models(cfg, device)
     vocab: Dict[str, int] = kokoro_cfg["vocab"]
     params_g = generator_trainable_parameters(kmodel, gst)
-    opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g, weight_decay=cfg.weight_decay_g)
-    opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d, weight_decay=cfg.weight_decay_d)
+    adam_betas = (cfg.adam_b1, cfg.adam_b2)
+    opt_g = torch.optim.AdamW(
+        params_g, lr=cfg.lr_g, betas=adam_betas, weight_decay=cfg.weight_decay_g,
+    )
+    opt_d = torch.optim.AdamW(
+        disc.parameters(), lr=cfg.lr_d, betas=adam_betas, weight_decay=cfg.weight_decay_d,
+    )
     scaler_g: Optional[GradScaler] = GradScaler("cuda", enabled=cfg.use_amp) if device.type == "cuda" else None
     scaler_d: Optional[GradScaler] = GradScaler("cuda", enabled=cfg.use_amp) if device.type == "cuda" else None
 
@@ -619,14 +716,17 @@ def train_loop(
     # Compute total effective steps for scheduler horizon.
     total_steps_g: Optional[int] = max_steps
     if total_steps_g is None and expected_batches_per_epoch is not None:
-        total_steps_g = -(-expected_batches_per_epoch // cfg.grad_accum_steps) * epochs
+        per_epoch = _effective_optimizer_steps_per_epoch(
+            expected_batches_per_epoch, cfg.grad_accum_steps,
+        )
+        total_steps_g = per_epoch * epochs
     total_steps_d: Optional[int] = None
     if total_steps_g is not None:
         total_steps_d = max(0, total_steps_g - cfg.disc_start_step)
 
     sched_g: Optional[torch.optim.lr_scheduler.LRScheduler] = None
     sched_d: Optional[torch.optim.lr_scheduler.LRScheduler] = None
-    if cfg.warmup_steps > 0 or total_steps_g is not None:
+    if cfg.warmup_steps > 0 or (total_steps_g is not None and total_steps_g > 0):
         sched_g = _build_scheduler(opt_g, cfg.warmup_steps, total_steps_g, cfg.lr_min_g)
         sched_d = _build_scheduler(opt_d, cfg.warmup_steps, total_steps_d, cfg.lr_min_d)
 
@@ -686,7 +786,9 @@ def train_loop(
             pbar_ctx: Any = contextlib.nullcontext()
             use_tqdm_pbar = False
             if _tqdm_cls is not None and expected_batches_per_epoch is not None:
-                eff_steps = -(-expected_batches_per_epoch // cfg.grad_accum_steps)
+                eff_steps = _effective_optimizer_steps_per_epoch(
+                    expected_batches_per_epoch, cfg.grad_accum_steps,
+                )
                 n_tqdm = eff_steps
                 if max_steps is not None:
                     n_tqdm = min(eff_steps, max(0, max_steps - global_step))
@@ -744,32 +846,64 @@ def train_loop(
                         ref_16 = _ensure_batch_time(batch["ref_wav_16k"].to(device))
                         tgt_24 = _ensure_batch_time(batch["target_wav_24k"].to(device))
                         input_ids = batch["input_ids"].to(device)
+                        input_ids_lengths = batch["input_ids_lengths"].to(device)
+                        ref_lengths = batch["ref_lengths"].to(device)
+                        target_lengths = batch["target_lengths"].to(device)
+                        B = ref_16.size(0)
                         if sw is not None:
                             sw.end("h2d", sync_cuda=True)
                         if input_ids.dim() != 2:
                             raise ValueError("input_ids must be (batch, seq_len)")
 
-                        # Reference SSL forward (no grad) -> GST conditioning.
+                        # mHuBERT conditioning (frozen) -> GST -> ref_s.
                         with _cuda_amp_context(cfg.use_amp, ref_16):
                             if sw is not None:
-                                sw.start("sv_ref")
-                            wv_ref: WeSpeakerSVOutput = sv_model(
-                                ref_16,
-                                sampling_rate=16_000,
-                                grad_through_input=False,
-                            )
-                            frame_mask = _speaker_frame_mask(wv_ref)
-                            gst_out, _ = gst(wv_ref.frame_features, frame_mask)
+                                sw.start("mhubert_ref")
+                            ref_attn_mask = (
+                                torch.arange(ref_16.size(1), device=device).unsqueeze(0)
+                                < ref_lengths.unsqueeze(1)
+                            ).long()
+                            mhubert_out = mhubert(ref_16, attention_mask=ref_attn_mask)
+                            gst_out, _ = gst(mhubert_out.hidden_states, mhubert_out.frame_mask)
                             ref_s = gst_out.ref_s
+                            if sw is not None:
+                                sw.end("mhubert_ref", sync_cuda=True)
+
+                            # WeSpeaker ref embedding for speaker loss (frozen, detached).
+                            if sw is not None:
+                                sw.start("sv_ref")
+                            with torch.no_grad():
+                                wv_ref: WeSpeakerSVOutput = sv_model(
+                                    ref_16,
+                                    sampling_rate=16_000,
+                                    grad_through_input=False,
+                                    waveform_lengths=ref_lengths,
+                                    return_frame_features=False,
+                                )
                             if sw is not None:
                                 sw.end("sv_ref", sync_cuda=True)
 
-                            # Kokoro generator forward (24 kHz waveform).
+                            # Kokoro generator forward (24 kHz waveform) -- per-item loop
+                            # because KModel.forward_with_tokens is hardcoded for B=1.
                             if sw is not None:
                                 sw.start("kokoro_fwd")
-                            pred_wav, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=cfg.speed)
-                            pred_wav = _ensure_batch_time(pred_wav)
-                            pred_wav = pred_wav.clamp(-1.0, 1.0)
+                            pred_wavs_list: List[torch.Tensor] = []
+                            for _bi in range(B):
+                                ids_i = input_ids[_bi, :input_ids_lengths[_bi]].unsqueeze(0)
+                                ref_s_i = ref_s[_bi].unsqueeze(0)
+                                wav_i, _ = kmodel.forward_with_tokens(ids_i, ref_s_i, speed=cfg.speed)
+                                wav_i = _ensure_batch_time(wav_i).clamp(-1.0, 1.0)
+                                pred_wavs_list.append(wav_i.squeeze(0))
+                            max_gen_len = max(w.shape[0] for w in pred_wavs_list)
+                            pred_wav = torch.stack(
+                                [torch.nn.functional.pad(w, (0, max_gen_len - w.shape[0]))
+                                 for w in pred_wavs_list],
+                                dim=0,
+                            )
+                            pred_wav_lengths = torch.tensor(
+                                [w.shape[0] for w in pred_wavs_list],
+                                dtype=torch.long, device=device,
+                            )
                             if sw is not None:
                                 sw.end("kokoro_fwd", sync_cuda=True)
 
@@ -790,18 +924,22 @@ def train_loop(
                         if sw is not None:
                             sw.end("sv_gen", sync_cuda=True)
                         
-                        # Random crop for discriminator
-                        segment_size = 16384  # Standard HiFi-GAN segment size
-                        min_len = min(tgt_24.size(-1), pred_wav.size(-1))
-                        slice_len = min(min_len, segment_size)
-                        max_start = min_len - slice_len
-                        
-                        start_idx = 0
-                        if max_start > 0:
-                            start_idx = torch.randint(0, max_start + 1, (1,), device=device).item()
-                        
-                        tgt_24_seg = tgt_24[..., start_idx : start_idx + slice_len]
-                        pred_wav_seg = pred_wav[..., start_idx : start_idx + slice_len]
+                        # Per-item random crop for discriminator.
+                        segment_size = 16384
+                        valid_lens = torch.minimum(pred_wav_lengths, target_lengths)
+                        slice_len = int(valid_lens.min().clamp(max=segment_size).item())
+                        pred_segs: List[torch.Tensor] = []
+                        tgt_segs: List[torch.Tensor] = []
+                        for _bi in range(B):
+                            max_start = int(valid_lens[_bi].item()) - slice_len
+                            start = (
+                                int(torch.randint(0, max(1, max_start + 1), (1,)).item())
+                                if max_start > 0 else 0
+                            )
+                            pred_segs.append(pred_wav[_bi, start : start + slice_len])
+                            tgt_segs.append(tgt_24[_bi, start : start + slice_len])
+                        pred_wav_seg = torch.stack(pred_segs, dim=0)
+                        tgt_24_seg = torch.stack(tgt_segs, dim=0)
 
                         # Waveform discriminator on real vs fake (D-step).
                         if sw is not None:
@@ -845,6 +983,8 @@ def train_loop(
                             use_amp=cfg.use_amp,
                             disable_amp_for_stft=cfg.disable_amp_for_stft,
                             scale_factor=inv_accum,
+                            pred_lengths=pred_wav_lengths,
+                            target_lengths=target_lengths,
                         )
                         if sw is not None:
                             sw.end("gen_backward", sync_cuda=True)
@@ -943,23 +1083,24 @@ def train_loop(
                     for k in epoch_sums:
                         epoch_sums[k] += metrics[k]
 
+                    if report_callback is not None:
+                        report_callback(global_step, metrics["loss_mel"])
+
                     if pbar is not None:
                         pbar.update(1)
 
                     at_log_interval = global_step % cfg.log_interval == 0
                     at_max_stop = max_steps is not None and global_step >= max_steps
-                    is_periodic_step = global_step > 0 and global_step % cfg.checkpoint_interval == 0
-                    is_last_step = at_max_stop or (
-                        max_steps is None
-                        and epoch_idx == (epochs - 1)
-                        and (
-                            epoch_done
-                            or (expected_batches_per_epoch is not None
-                                and expected_batches_per_epoch > 0
-                                and batches_seen >= expected_batches_per_epoch)
-                        )
+                    should_save_and_validate = _should_save_and_validate(
+                        global_step=global_step,
+                        cfg=cfg,
+                        max_steps=max_steps,
+                        epoch_idx=epoch_idx,
+                        epochs=epochs,
+                        epoch_done=epoch_done,
+                        expected_batches_per_epoch=expected_batches_per_epoch,
+                        batches_seen=batches_seen,
                     )
-                    should_save_and_validate = is_periodic_step or is_last_step
 
                     if at_log_interval or at_max_stop:
                         if pbar is not None:
@@ -1015,6 +1156,7 @@ def train_loop(
                                 dataset=dataloader.dataset,
                                 kmodel=kmodel,
                                 gst=gst,
+                                mhubert=mhubert,
                                 sv_model=sv_model,
                                 mel_loss_mod=mel_loss_mod,
                                 cfg=cfg,
@@ -1102,6 +1244,49 @@ def parse_args() -> argparse.Namespace:
         help="Log wandb in offline mode (no network upload until sync).",
     )
     p.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size for training (default: from TrainConfig, which is 1).",
+    )
+    p.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Gradient accumulation micro-steps per optimizer step (default: from TrainConfig).",
+    )
+    p.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="LR warmup steps (default: from TrainConfig).",
+    )
+    p.add_argument(
+        "--disc-start-step",
+        type=int,
+        default=None,
+        help="Step at which discriminator training begins (default: from TrainConfig).",
+    )
+    p.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=None,
+        help="Save a checkpoint every N optimizer steps (default: from TrainConfig).",
+    )
+    p.add_argument(
+        "--save-final-checkpoint",
+        dest="save_final_checkpoint",
+        action="store_true",
+        default=None,
+        help="Force a checkpoint at the end of training even if the last step is off-interval.",
+    )
+    p.add_argument(
+        "--no-save-final-checkpoint",
+        dest="save_final_checkpoint",
+        action="store_false",
+        help="Only save checkpoints at the configured interval.",
+    )
+    p.add_argument(
         "--max-steps",
         type=int,
         default=None,
@@ -1152,6 +1337,22 @@ def main() -> None:
     _configure_training_warnings()
     device = _resolve_device(args.device)
     cfg = TrainConfig(kokoro_repo_id=args.kokoro_repo, use_amp=args.amp)
+    from dataclasses import replace as _replace
+    _cli_overrides: Dict[str, Any] = {}
+    if args.batch_size is not None:
+        _cli_overrides["batch_size"] = args.batch_size
+    if args.grad_accum_steps is not None:
+        _cli_overrides["grad_accum_steps"] = args.grad_accum_steps
+    if args.warmup_steps is not None:
+        _cli_overrides["warmup_steps"] = args.warmup_steps
+    if args.disc_start_step is not None:
+        _cli_overrides["disc_start_step"] = args.disc_start_step
+    if args.checkpoint_interval is not None:
+        _cli_overrides["checkpoint_interval"] = args.checkpoint_interval
+    if args.save_final_checkpoint is not None:
+        _cli_overrides["save_final_checkpoint"] = args.save_final_checkpoint
+    if _cli_overrides:
+        cfg = _replace(cfg, **_cli_overrides)
 
     wandb_run: Optional[Any] = None
     if args.wandb:
@@ -1221,7 +1422,7 @@ def _run_training(
     nw = args.num_workers
     dl = DataLoader(
         ds,
-        batch_size=1,
+        batch_size=cfg.batch_size,
         shuffle=True,
         collate_fn=collate_voice_clone_batch,
         num_workers=nw,

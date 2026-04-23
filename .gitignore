@@ -1,27 +1,47 @@
-# Cursor local plans (not part of functional source)
+# ------------------------------------------------------------------------------
+# IDE & editor (local / optional for collaborators)
+# ------------------------------------------------------------------------------
 .cursor/plans/
-.hub/
-# Hugging Face hub cache when HF_HUB_CACHE (or equivalent) points into the repo
-hub/
-# hf_xet / xet-core local cache and logs
-xet/
-# wandb runs
-wandb/
-# terminal configurations
 .editorconfig
 .gitattributes
-# dataset
+.codex
+
+# ------------------------------------------------------------------------------
+# Hugging Face hub & xet cache (HF_HUB_CACHE or in-repo hub paths)
+# ------------------------------------------------------------------------------
+.hub/
+hub/
+xet/
+
+# ------------------------------------------------------------------------------
+# Experiment tracking
+# ------------------------------------------------------------------------------
+wandb/
+
+# ------------------------------------------------------------------------------
+# Data, manifests, checkpoints, and generated outputs
+# ------------------------------------------------------------------------------
 data/
 manifests/
 ckpt/
+/output
+/kokoro/voices
+research/
+
+# ------------------------------------------------------------------------------
+# One-off or machine-local scripts (not part of shared training pipeline)
+# ------------------------------------------------------------------------------
 scripts/build_common_voice_manifest.py
 scripts/generate_manifests.sh
 scripts/merge_manifests.py
-scripts/sanity_universal_style_kokoro_val.py
 scripts/merge_manifests.sh
-/output
-/kokoro/voices
+scripts/sanity_universal_style_kokoro_val.py
+scripts/debug_mhubert_layer.py
+scripts/run_debug_mhubert.sh
+
+# ------------------------------------------------------------------------------
 # Python
+# ------------------------------------------------------------------------------
 .pytest_cache/
 __pycache__/
 *.py[cod]

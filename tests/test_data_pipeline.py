@@ -264,5 +264,20 @@ def test_collate_voice_clone_batch_uses_real_function(dataset_mod):
     assert batch["text"] == "hello"
     assert batch["speaker_id"] == "spk-1"
 
-    with pytest.raises(ValueError, match="batch size 1"):
-        ds.collate_voice_clone_batch([sample, sample])
+    shorter = {
+        "ref_wav_16k": torch.randn(8_000),
+        "target_wav_24k": torch.randn(12_000),
+        "input_ids": torch.tensor([0, 1]),
+        "text": "hi",
+        "speaker_id": "spk-2",
+    }
+    batch2 = ds.collate_voice_clone_batch([sample, shorter])
+    assert batch2["ref_wav_16k"].shape == (2, 16_000)
+    assert batch2["target_wav_24k"].shape == (2, 24_000)
+    assert batch2["input_ids"].shape == (2, 4)
+    assert batch2["input_ids_lengths"].tolist() == [4, 2]
+    assert batch2["ref_lengths"].tolist() == [16_000, 8_000]
+    assert batch2["target_lengths"].tolist() == [24_000, 12_000]
+    assert batch2["texts"] == ["hello", "hi"]
+    assert batch2["text"] == "hello"
+    assert batch2["speaker_ids"] == ["spk-1", "spk-2"]

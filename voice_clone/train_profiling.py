@@ -14,6 +14,7 @@ import torch
 BREAKDOWN_LABELS = (
     "dataloader",
     "h2d",
+    "mhubert_ref",
     "sv_ref",
     "kokoro_fwd",
     "sv_gen",

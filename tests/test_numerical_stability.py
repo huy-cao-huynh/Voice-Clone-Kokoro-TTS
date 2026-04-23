@@ -87,7 +87,7 @@ class TestSegmentGSTZeroMask:
         """clamp(min=1e-6) in denom prevents division by zero."""
         gst = segment_gst_mod.SegmentGST()
         gst.eval()
-        frames = torch.randn(1, 10, 1024)
+        frames = torch.randn(1, 10, 768)
         mask = torch.zeros(1, 10)
         with torch.no_grad():
             out, _ = gst(frames, mask)
@@ -97,7 +97,7 @@ class TestSegmentGSTZeroMask:
     def test_single_valid_frame(self, segment_gst_mod):
         gst = segment_gst_mod.SegmentGST()
         gst.eval()
-        frames = torch.randn(1, 10, 1024)
+        frames = torch.randn(1, 10, 768)
         mask = torch.zeros(1, 10)
         mask[0, 0] = 1.0
         with torch.no_grad():

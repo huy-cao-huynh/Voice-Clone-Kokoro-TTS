@@ -79,10 +79,42 @@ class MelReconstructionLoss(nn.Module):
             power=1.0,
         )
 
-    def forward(self, pred_wav: torch.Tensor, target_wav: torch.Tensor) -> MelLossOutput:
-        """``pred_wav`` / ``target_wav``: shape ``(batch, time)`` mono."""
+    def forward(
+        self,
+        pred_wav: torch.Tensor,
+        target_wav: torch.Tensor,
+        *,
+        pred_lengths: Optional[torch.Tensor] = None,
+        target_lengths: Optional[torch.Tensor] = None,
+    ) -> MelLossOutput:
+        """``pred_wav`` / ``target_wav``: shape ``(batch, time)`` mono.
+
+        When ``pred_lengths`` and ``target_lengths`` are supplied (variable-length
+        batches), the loss is computed per-item on valid (unpadded) slices and
+        averaged across the batch.
+        """
         if pred_wav.dim() != 2 or target_wav.dim() != 2:
             raise ValueError("expected pred_wav and target_wav shaped (batch, time)")
+
+        if pred_lengths is not None and target_lengths is not None:
+            B = pred_wav.size(0)
+            item_losses: List[torch.Tensor] = []
+            first_mel_p: Optional[torch.Tensor] = None
+            first_mel_t: Optional[torch.Tensor] = None
+            for i in range(B):
+                vlen = min(int(pred_lengths[i].item()), int(target_lengths[i].item()))
+                p_i = pred_wav[i : i + 1, :vlen]
+                t_i = target_wav[i : i + 1, :vlen]
+                mp = torch.log(self.mel(p_i).clamp_min(self.log_floor))
+                mt = torch.log(self.mel(t_i).clamp_min(self.log_floor))
+                l1 = (mp - mt).abs().mean()
+                l2 = ((mp - mt) ** 2).mean()
+                item_losses.append(self.l1_weight * l1 + self.l2_weight * l2)
+                if first_mel_p is None:
+                    first_mel_p, first_mel_t = mp, mt
+            loss = sum(item_losses) / B
+            return MelLossOutput(loss=loss, mel_pred=first_mel_p, mel_target=first_mel_t)
+
         pred_wav, target_wav = _min_time_crop(pred_wav, target_wav)
         mel_p = torch.log(self.mel(pred_wav).clamp_min(self.log_floor))
         mel_t = torch.log(self.mel(target_wav).clamp_min(self.log_floor))

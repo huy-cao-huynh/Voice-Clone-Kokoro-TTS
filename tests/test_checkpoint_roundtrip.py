@@ -32,10 +32,11 @@ def stack_and_opts():
 
     device = torch.device("cpu")
     cfg = TrainConfig()
-    kmodel, gst, sv_model, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, _mhubert, sv_model, disc, mel_loss, kokoro_cfg = build_models(cfg, device)
     params_g = generator_trainable_parameters(kmodel, gst)
-    opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g)
-    opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d)
+    adam_betas = (cfg.adam_b1, cfg.adam_b2)
+    opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g, betas=adam_betas)
+    opt_d = torch.optim.AdamW(disc.parameters(), lr=cfg.lr_d, betas=adam_betas)
     return {
         "kmodel": kmodel,
         "gst": gst,
@@ -66,10 +67,11 @@ class TestSaveLoadRoundtrip:
 
         device = s["device"]
         cfg2 = TrainConfig()
-        km2, gst2, _, disc2, _, _ = build_models(cfg2, device)
+        km2, gst2, _, _, disc2, _, _ = build_models(cfg2, device)
         params_g2 = generator_trainable_parameters(km2, gst2)
-        og2 = torch.optim.AdamW(params_g2, lr=cfg2.lr_g)
-        od2 = torch.optim.AdamW(disc2.parameters(), lr=cfg2.lr_d)
+        adam_betas = (cfg2.adam_b1, cfg2.adam_b2)
+        og2 = torch.optim.AdamW(params_g2, lr=cfg2.lr_g, betas=adam_betas)
+        od2 = torch.optim.AdamW(disc2.parameters(), lr=cfg2.lr_d, betas=adam_betas)
 
         step = load_checkpoint(
             ckpt_path, gst=gst2, disc=disc2, kmodel=km2,
@@ -109,7 +111,7 @@ class TestSaveLoadRoundtrip:
             opt_g=s["opt_g"], opt_d=s["opt_d"], step=1, cfg=s["cfg"],
         )
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        assert ckpt["duration_adapters"] is not None
+        assert ckpt["duration_adapters"] is None
         assert ckpt["decoder_adapters"] is not None
         assert ckpt["generator_adapters"] is not None
 
@@ -162,7 +164,7 @@ class TestApplyVoiceCloneCheckpoint:
 
         device = s["device"]
         cfg2 = TrainConfig()
-        km2, gst2, _, _, _, _ = build_models(cfg2, device)
+        km2, gst2, _, _, _, _, _ = build_models(cfg2, device)
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         apply_voice_clone_checkpoint(ckpt, gst=gst2, kmodel=km2)
 
@@ -186,5 +188,5 @@ class TestApplyVoiceCloneCheckpoint:
 
         device = s["device"]
         cfg2 = TrainConfig()
-        km2, gst2, _, _, _, _ = build_models(cfg2, device)
+        km2, gst2, _, _, _, _, _ = build_models(cfg2, device)
         apply_voice_clone_checkpoint(ckpt, gst=gst2, kmodel=km2)

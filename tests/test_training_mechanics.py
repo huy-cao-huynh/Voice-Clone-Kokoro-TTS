@@ -60,6 +60,8 @@ def train_mod(monkeypatch):
     @dataclass
     class TrainConfig:
         kokoro_repo_id: str = "dummy/kokoro"
+        mhubert_repo_id: str = "dummy/mhubert"
+        mhubert_extract_layer: int = 9
         wespeaker_checkpoint_path: str = "dummy/wespeaker/avg_model.pt"
         wespeaker_embedding_dim: int = 256
         wespeaker_sample_rate: int = 16_000
@@ -70,6 +72,9 @@ def train_mod(monkeypatch):
         mel: MelLossConfig = field(default_factory=MelLossConfig)
         lr_g: float = 1e-4
         lr_d: float = 5e-5
+        gst_dropout: float = 0.1
+        speed: float = 1.0
+        use_amp: bool = False
 
     config_mod.LossWeights = LossWeights
     config_mod.MelLossConfig = MelLossConfig
@@ -106,7 +111,7 @@ def train_mod(monkeypatch):
     losses_mod = types.ModuleType("voice_clone.losses")
 
     class DummyMelLoss(nn.Module):
-        def forward(self, pred_wav, target_wav):
+        def forward(self, pred_wav, target_wav, *, pred_lengths=None, target_lengths=None):
             loss = (pred_wav - target_wav).pow(2).mean()
             return types.SimpleNamespace(
                 loss=loss,
@@ -143,6 +148,7 @@ def train_mod(monkeypatch):
             super().__init__()
             self.encoder = nn.Linear(1, 1, bias=False)
             self.encoder.requires_grad_(False)
+            self.last_waveform_lengths = None
 
         @property
         def dtype(self) -> torch.dtype:
@@ -155,6 +161,17 @@ def train_mod(monkeypatch):
                 model = model.to(device=device)
             return model
 
+        def forward(self, waveforms, **kwargs):
+            self.last_waveform_lengths = kwargs.get("waveform_lengths")
+            batch = waveforms.size(0)
+            return DummySVOutput(
+                pooled_embedding=torch.zeros(batch, 256, device=waveforms.device, dtype=waveforms.dtype),
+                frame_features=None,
+            )
+
+        def _waveforms_to_mel(self, wav: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(wav.size(0), 80, 32, device=wav.device, dtype=wav.dtype)
+
         def forward_from_mel(self, mel, **kwargs):
             batch = mel.size(0)
             return DummySVOutput(
@@ -165,6 +182,33 @@ def train_mod(monkeypatch):
     wespeaker_mod.WeSpeakerSV = DummyWeSpeaker
     wespeaker_mod.WeSpeakerSVOutput = DummySVOutput
     monkeypatch.setitem(sys.modules, "voice_clone.wespeaker_sv", wespeaker_mod)
+
+    mhubert_mod = types.ModuleType("voice_clone.mhubert_encoder")
+
+    @dataclass
+    class DummyMHuBERTOutput:
+        hidden_states: torch.Tensor
+        frame_mask: torch.Tensor
+
+    class DummyMHuBERTEncoder(nn.Module):
+        def __init__(self, repo_id="dummy", extract_layer=9):
+            super().__init__()
+            self.hidden_size = 768
+            self._dummy = nn.Linear(1, 1, bias=False)
+            self.requires_grad_(False)
+            self.last_attention_mask = None
+
+        def forward(self, waveforms_16k, attention_mask=None):
+            self.last_attention_mask = attention_mask
+            B = waveforms_16k.size(0)
+            return DummyMHuBERTOutput(
+                hidden_states=torch.zeros(B, 8, self.hidden_size, device=waveforms_16k.device),
+                frame_mask=torch.ones(B, 8, device=waveforms_16k.device, dtype=torch.bool),
+            )
+
+    mhubert_mod.MHuBERTEncoder = DummyMHuBERTEncoder
+    mhubert_mod.MHuBERTOutput = DummyMHuBERTOutput
+    monkeypatch.setitem(sys.modules, "voice_clone.mhubert_encoder", mhubert_mod)
 
     disc_mod = types.ModuleType("voice_clone.discriminators.hifigan")
 
@@ -205,6 +249,11 @@ def train_mod(monkeypatch):
             self.backbone = nn.Linear(1, 1)
             self.predictor = DummyPredictor()
             self.decoder = DummyDecoder()
+            self.last_forward_token_len: int | None = None
+
+        def forward_with_tokens(self, input_ids, ref_s, speed=1.0):
+            self.last_forward_token_len = int(input_ids.shape[1])
+            return torch.zeros(input_ids.shape[0], 32, device=input_ids.device, dtype=input_ids.dtype), None
 
     kokoro_model_mod.KModel = DummyKModel
     monkeypatch.setitem(sys.modules, "kokoro.model", kokoro_model_mod)
@@ -271,7 +320,11 @@ class _ToyDisc(nn.Module):
         return logits, feats
 
 
-def _adapter_param_ids(kmodel: _ToyKModel) -> set[int]:
+def _trainable_adapter_param_ids(kmodel: _ToyKModel) -> set[int]:
+    """Params that freeze_kokoro_except_adapters should leave trainable.
+
+    All adapters are trainable: duration encoder, decoder, and generator.
+    """
     adapter_ids = set()
     adapter_ids.update(id(p) for p in kmodel.predictor.text_encoder.adapters.parameters())
     adapter_ids.update(id(p) for p in kmodel.decoder.decoder_adapters.parameters())
@@ -286,12 +339,22 @@ class TestFreezeKokoroExceptAdapters:
 
         train_adapters.freeze_kokoro_except_adapters(kmodel)
 
-        adapter_ids = _adapter_param_ids(kmodel)
+        trainable_ids = _trainable_adapter_param_ids(kmodel)
         for name, param in kmodel.named_parameters():
-            if id(param) in adapter_ids:
+            if id(param) in trainable_ids:
                 assert param.requires_grad, f"adapter param {name} should stay trainable"
             else:
                 assert not param.requires_grad, f"non-adapter param {name} should be frozen"
+
+    def test_duration_encoder_adapters_trainable(self, train_mod):
+        """Duration encoder adapters are trainable along with decoder/generator adapters."""
+        train_adapters, _config_mod, _segment_mod = train_mod
+        kmodel = _ToyKModel()
+
+        train_adapters.freeze_kokoro_except_adapters(kmodel)
+
+        for p in kmodel.predictor.text_encoder.adapters.parameters():
+            assert p.requires_grad, "duration encoder adapter params should be trainable"
 
     def test_keeps_model_in_train_mode_but_disables_dropout(self, train_mod):
         train_adapters, _config_mod, _segment_mod = train_mod
@@ -318,7 +381,7 @@ class TestUniversalStyleVectorLoading:
         torch.save(base_voice, vec_path)
 
         cfg = config_mod.TrainConfig(universal_style_vector_path=str(vec_path))
-        _kmodel, gst, _sv_model, _disc, _mel_loss, _kokoro_cfg = train_adapters.build_models(cfg, device)
+        _kmodel, gst, _mhubert, _sv_model, _disc, _mel_loss, _kokoro_cfg = train_adapters.build_models(cfg, device)
 
         torch.testing.assert_close(gst.universal_style_vector.cpu(), base_voice)
         frames = torch.randn(2, 12, gst.frame_dim)
@@ -344,38 +407,6 @@ class TestGeneratorTrainableParameters:
         }
         assert returned_ids == expected_ids
         assert all(p.requires_grad for p in params)
-
-
-class TestSpeakerFrameMask:
-    def test_uses_explicit_mask_when_present(self, train_mod):
-        train_adapters, _config_mod, _segment_mod = train_mod
-        frame_features = torch.randn(2, 5, 7)
-        explicit = torch.tensor(
-            [[True, True, False, False, False], [True, True, True, False, False]]
-        )
-        ref_out = types.SimpleNamespace(frame_features=frame_features, frame_mask=explicit)
-
-        mask = train_adapters._speaker_frame_mask(ref_out)
-
-        assert torch.equal(mask, explicit)
-
-    def test_defaults_to_all_true_when_wespeaker_omits_mask(self, train_mod):
-        train_adapters, _config_mod, _segment_mod = train_mod
-        frame_features = torch.randn(2, 5, 7)
-        ref_out = types.SimpleNamespace(frame_features=frame_features, frame_mask=None)
-
-        mask = train_adapters._speaker_frame_mask(ref_out)
-
-        assert mask.dtype == torch.bool
-        assert mask.shape == (2, 5)
-        assert mask.all()
-
-    def test_rejects_missing_frame_features(self, train_mod):
-        train_adapters, _config_mod, _segment_mod = train_mod
-        ref_out = types.SimpleNamespace(frame_features=None, frame_mask=None)
-
-        with pytest.raises(RuntimeError, match="frame_features"):
-            train_adapters._speaker_frame_mask(ref_out)
 
 
 class TestPhasedTraining:
@@ -458,7 +489,29 @@ class TestPhasedTraining:
         assert seen_requires_grad == [False]
 
 
+def test_effective_optimizer_steps_per_epoch_ceil(train_mod):
+    train_adapters, _config_mod, _segment_mod = train_mod
+    f = train_adapters._effective_optimizer_steps_per_epoch
+    assert f(1, 8) == 1
+    assert f(8, 8) == 1
+    assert f(9, 8) == 2
+    assert f(0, 8) == 0
+
+
 class TestWarmupLR:
+    def test_no_warmup_is_pure_cosine_when_total_known(self, train_mod):
+        train_adapters, _config_mod, _segment_mod = train_mod
+        lr = 1e-4
+        dummy = nn.Linear(10, 10)
+        opt = torch.optim.AdamW(dummy.parameters(), lr=lr)
+        sched = train_adapters._build_scheduler(opt, warmup_steps=0, total_steps=100, lr_min=1e-6)
+        assert isinstance(sched, torch.optim.lr_scheduler.CosineAnnealingLR)
+        assert opt.param_groups[0]["lr"] == pytest.approx(lr, rel=1e-5)
+        for _ in range(100):
+            opt.step()
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(1e-6, rel=1e-2)
+
     def test_lr_reaches_full_after_warmup(self, train_mod):
         train_adapters, _config_mod, _segment_mod = train_mod
         lr = 1e-4
@@ -521,3 +574,73 @@ class TestWarmupLR:
             sched.step()
 
         assert opt.param_groups[0]["lr"] == pytest.approx(lr, rel=1e-5)
+
+
+class TestWandbValidationForward:
+    """Regression: validation inference must mirror training (trim tokens, mask reference)."""
+
+    def test_log_wandb_validation_trims_tokens_and_masks_reference(self, train_mod, monkeypatch, tmp_path):
+        train_adapters, config_mod, _segment_mod = train_mod
+        true_tokens = 5
+        ref_len = 100
+
+        def evil_collate(samples):
+            _ = samples[0]
+            pad = torch.zeros(1, true_tokens + 4, dtype=torch.long)
+            pad[0, :true_tokens] = torch.arange(1, true_tokens + 1, dtype=torch.long)
+            ref = torch.zeros(1, 200)
+            ref[0, :ref_len] = torch.randn(ref_len)
+            return {
+                "ref_wav_16k": ref,
+                "ref_lengths": torch.tensor([ref_len]),
+                "target_wav_24k": torch.zeros(1, 32),
+                "target_lengths": torch.tensor([32]),
+                "input_ids": pad,
+                "input_ids_lengths": torch.tensor([true_tokens]),
+                "text": "caption",
+            }
+
+        monkeypatch.setattr(train_adapters, "collate_voice_clone_batch", evil_collate)
+        wb_mod = types.SimpleNamespace(
+            Audio=lambda *a, **k: None,
+            Table=lambda *a, **k: None,
+        )
+        monkeypatch.setattr(train_adapters, "_import_wandb", lambda: wb_mod)
+
+        vec_path = tmp_path / "universal_style_vector.pt"
+        torch.save(torch.zeros(256), vec_path)
+        cfg = config_mod.TrainConfig(universal_style_vector_path=str(vec_path))
+        device = torch.device("cpu")
+        monkeypatch.setattr(train_adapters, "build_mel_loss", lambda *args, **kwargs: train_adapters.MelReconstructionLoss())
+        kmodel, gst, mhubert, sv_model, _disc, mel_loss_mod, kokoro_cfg = train_adapters.build_models(cfg, device)
+
+        class _OneEval:
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, idx):
+                return {}
+
+        wandb_run = types.SimpleNamespace(log=lambda *a, **k: None)
+        train_adapters._log_wandb_validation(
+            wandb_run,
+            dataset=_OneEval(),
+            kmodel=kmodel,
+            gst=gst,
+            mhubert=mhubert,
+            sv_model=sv_model,
+            mel_loss_mod=mel_loss_mod,
+            cfg=cfg,
+            device=device,
+            global_step=1,
+            num_samples=1,
+            vocab=kokoro_cfg["vocab"],
+        )
+
+        assert kmodel.last_forward_token_len == true_tokens
+        assert mhubert.last_attention_mask is not None
+        assert tuple(mhubert.last_attention_mask.shape) == (1, 200)
+        assert int(mhubert.last_attention_mask[0, :ref_len].sum()) == ref_len
+        assert int(mhubert.last_attention_mask[0, ref_len:].sum()) == 0
+        assert sv_model.last_waveform_lengths is not None
+        assert torch.equal(sv_model.last_waveform_lengths.cpu(), torch.tensor([ref_len]))

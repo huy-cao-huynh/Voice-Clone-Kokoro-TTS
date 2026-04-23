@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import sys
 import types
@@ -33,6 +34,7 @@ def _load_infer_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "kokoro", kokoro_pkg)
 
     torchaudio_mod = types.ModuleType("torchaudio")
+    torchaudio_mod.__spec__ = importlib.machinery.ModuleSpec("torchaudio", loader=None)
     torchaudio_mod.save = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "torchaudio", torchaudio_mod)
 
@@ -86,7 +88,6 @@ def _load_infer_module(monkeypatch):
 
     train_mod = types.ModuleType("voice_clone.train_adapters")
     train_mod.build_models = lambda *args, **kwargs: None
-    train_mod._speaker_frame_mask = lambda ref_out: ref_out.frame_mask
     monkeypatch.setitem(sys.modules, "voice_clone.train_adapters", train_mod)
 
     wespeaker_mod = types.ModuleType("voice_clone.wespeaker_sv")
@@ -112,21 +113,19 @@ def test_infer_waveform_uses_actual_reference_sample_rate(monkeypatch):
     ref_audio = torch.randn(16_000)
     calls: dict[str, object] = {}
 
-    class DummySV:
+    class DummyMHuBERT:
         def eval(self):
             return self
 
-        def __call__(self, waveforms, *, sampling_rate, grad_through_input):
-            calls["sampling_rate"] = sampling_rate
-            calls["grad_through_input"] = grad_through_input
-            calls["waveform_shape"] = tuple(waveforms.shape)
+        def __call__(self, waveforms_16k, attention_mask=None):
+            calls["waveform_shape"] = tuple(waveforms_16k.shape)
+            calls["attention_mask"] = attention_mask
             return type(
-                "DummySVOutput",
+                "DummyMHuBERTOutput",
                 (),
                 {
-                    "frame_features": torch.randn(1, 5, 4),
+                    "hidden_states": torch.randn(1, 5, 768),
                     "frame_mask": torch.tensor([[True, True, True, False, False]]),
-                    "pooled_embedding": torch.randn(1, 256),
                 },
             )()
 
@@ -134,7 +133,7 @@ def test_infer_waveform_uses_actual_reference_sample_rate(monkeypatch):
         def eval(self):
             return self
 
-        def __call__(self, frame_features, frame_mask):
+        def __call__(self, frame_hidden_states, frame_mask):
             calls["frame_mask"] = frame_mask.clone()
             return type("DummyGSTOutput", (), {"ref_s": torch.randn(1, 256)})(), None
 
@@ -146,19 +145,27 @@ def test_infer_waveform_uses_actual_reference_sample_rate(monkeypatch):
             calls["speed"] = speed
             return torch.zeros(1, 32), torch.ones(1, dtype=torch.long)
 
+    load_calls: list[tuple[object, int]] = []
+
+    def fake_load_audio_mono(path, *, target_sr):
+        load_calls.append((path, target_sr))
+        return ref_audio.clone()
+
     def fake_torch_load(*args, **kwargs):
         calls["weights_only"] = kwargs.get("weights_only")
         return {"train_config": asdict(cfg)}
 
     monkeypatch.setattr(infer_mod.torch, "load", fake_torch_load)
-    monkeypatch.setattr(infer_mod, "build_stack_for_inference", lambda cfg, device: (DummyKModel(), DummyGST(), DummySV()))
+    monkeypatch.setattr(
+        infer_mod, "build_stack_for_inference", lambda cfg, device: (DummyKModel(), DummyGST(), DummyMHuBERT())
+    )
     monkeypatch.setattr(infer_mod, "apply_voice_clone_checkpoint", lambda *args, **kwargs: None)
     monkeypatch.setattr(infer_mod, "normalize_lang_code", lambda lang: lang)
     monkeypatch.setattr(infer_mod, "KPipeline", lambda *args, **kwargs: object())
     monkeypatch.setattr(infer_mod, "text_to_phonemes", lambda *args, **kwargs: "ab")
     monkeypatch.setattr(infer_mod, "kokoro_vocab_and_context_length", lambda *args, **kwargs: ({"a": 1, "b": 2}, 8))
     monkeypatch.setattr(infer_mod, "phonemes_to_input_ids", lambda *args, **kwargs: torch.tensor([1, 2]))
-    monkeypatch.setattr(infer_mod, "load_audio_mono", lambda *args, **kwargs: ref_audio.clone())
+    monkeypatch.setattr(infer_mod, "load_audio_mono", fake_load_audio_mono)
 
     wav = infer_mod.infer_waveform(
         ckpt_path="dummy.pt",
@@ -170,9 +177,9 @@ def test_infer_waveform_uses_actual_reference_sample_rate(monkeypatch):
 
     assert tuple(wav.shape) == (32,)
     assert calls["weights_only"] is True
-    assert calls["sampling_rate"] == cfg.wespeaker_sample_rate
-    assert calls["grad_through_input"] is False
     assert calls["waveform_shape"] == (1, ref_audio.numel())
+    assert calls["attention_mask"] is None
+    assert load_calls == [("ref.wav", 16_000)]
     assert calls["speed"] == cfg.speed
     assert torch.equal(calls["frame_mask"], torch.tensor([[True, True, True, False, False]]))
 

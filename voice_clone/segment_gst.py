@@ -37,7 +37,7 @@ class SegmentGST(nn.Module):
         *,
         num_bases: int = 512,
         embed_dim: int = 256,
-        frame_dim: int = 1024,
+        frame_dim: int = 768,
         num_heads: int = 8,
         ref_dim: int = 256,
         style_dec_dim: int = 128,
@@ -155,7 +155,7 @@ class SegmentGST(nn.Module):
                 "SegmentGST.universal_style_vector must have shape `(ref_dim,)`; "
                 f"got {tuple(self.universal_style_vector.shape)}"
             )
-        ref_s = delta_ref_s + self.universal_style_vector.to(
+        ref_s = delta_ref_s + 0.1 * self.universal_style_vector.to(
             device=delta_ref_s.device,
             dtype=delta_ref_s.dtype,
         ).unsqueeze(0).expand(b, -1)

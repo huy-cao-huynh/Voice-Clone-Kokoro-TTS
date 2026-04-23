@@ -4,6 +4,7 @@ Usage (from repo root):
     python scripts/train.py
     MANIFEST=manifests/other.jsonl python scripts/train.py
     python scripts/train.py --max-steps 75          # smoke run (extra args forwarded)
+    MANIFEST=manifests/memorize_train.jsonl VAL_MANIFEST=manifests/memorize_val.jsonl EPOCHS=200 CHECKPOINT_INTERVAL=25 python scripts/train.py
 
 All knobs are controlled via environment variables with sensible defaults.
 Override any of them before invoking the script:
@@ -22,6 +23,12 @@ Override any of them before invoking the script:
     WANDB_RUN_NAME    multilingual-train-<timestamp>
     VAL_MANIFEST      manifests/multilingual_val.jsonl    validation JSONL manifest (skipped if missing)
     VAL_MANIFEST_ROOT (empty)                             optional root for relative val manifest paths
+    SAVE_FINAL_CHECKPOINT   (unset)                1 to force a final off-interval checkpoint, 0 for interval-only
+    BATCH_SIZE              (from TrainConfig)     batch size per micro-step
+    GRAD_ACCUM_STEPS        (from TrainConfig)     micro-steps per optimizer step
+    WARMUP_STEPS            (from TrainConfig)     LR warmup steps
+    DISC_START_STEP         (from TrainConfig)     step to activate discriminator
+    CHECKPOINT_INTERVAL     (from TrainConfig)     save checkpoint every N steps
     PROFILE_BREAKDOWN       0                    1 to enable coarse step timers
     PROFILE_BREAKDOWN_STEPS 3                    steps before printing timing summary
     TORCH_PROFILER_TRACE    (empty)              path for Chrome trace JSON
@@ -48,22 +55,28 @@ def _default_num_workers() -> int:
 def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    manifest = os.environ.get("MANIFEST", "manifests/multilingual_train.jsonl")
+    manifest = os.environ.get("MANIFEST", "manifests/memorize_train.jsonl")
     manifest_root = os.environ.get("MANIFEST_ROOT", "")
-    ckpt_dir = os.environ.get("CKPT_DIR", "ckpt/multilingual")
-    resume = os.environ.get("RESUME", "")
+    ckpt_dir = os.environ.get("CKPT_DIR", "ckpt/memorize")
+    resume = os.environ.get("RESUME", "ckpt/memorize/checkpoint_300.pt")
     kokoro_repo = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
-    epochs = os.environ.get("EPOCHS", "1")
+    epochs = os.environ.get("EPOCHS", "300")
     max_steps = os.environ.get("MAX_STEPS", "")
     device = os.environ.get("DEVICE")
     num_workers = os.environ.get("NUM_WORKERS", str(_default_num_workers()))
     wandb_project = os.environ.get("WANDB_PROJECT", "Voice-Clone-Kokoro-TTS")
-    wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"multilingual-train-{timestamp}")
-    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/multilingual_val.jsonl")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"memorize-train-{timestamp}")
+    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/memorize_val.jsonl")
     val_manifest_root = os.environ.get("VAL_MANIFEST_ROOT", "")
     if val_manifest and not (REPO_ROOT / val_manifest).is_file():
         val_manifest = ""
         val_manifest_root = ""
+    batch_size = os.environ.get("BATCH_SIZE", "")
+    grad_accum_steps = os.environ.get("GRAD_ACCUM_STEPS", "")
+    warmup_steps = os.environ.get("WARMUP_STEPS", "0")
+    disc_start_step = os.environ.get("DISC_START_STEP", "")
+    checkpoint_interval = os.environ.get("CHECKPOINT_INTERVAL", "")
+    save_final_checkpoint = os.environ.get("SAVE_FINAL_CHECKPOINT", "0")
     profile_breakdown = os.environ.get("PROFILE_BREAKDOWN", "0")
     profile_breakdown_steps = os.environ.get("PROFILE_BREAKDOWN_STEPS", "3")
     torch_profiler_trace = os.environ.get("TORCH_PROFILER_TRACE", "")
@@ -94,6 +107,20 @@ def main() -> None:
         cmd += ["--resume", resume]
     if max_steps:
         cmd += ["--max-steps", max_steps]
+    if batch_size:
+        cmd += ["--batch-size", batch_size]
+    if grad_accum_steps:
+        cmd += ["--grad-accum-steps", grad_accum_steps]
+    if warmup_steps:
+        cmd += ["--warmup-steps", warmup_steps]
+    if disc_start_step:
+        cmd += ["--disc-start-step", disc_start_step]
+    if checkpoint_interval:
+        cmd += ["--checkpoint-interval", checkpoint_interval]
+    if save_final_checkpoint == "1":
+        cmd += ["--save-final-checkpoint"]
+    elif save_final_checkpoint == "0":
+        cmd += ["--no-save-final-checkpoint"]
     if profile_breakdown == "1":
         cmd += ["--profile-breakdown", "--profile-breakdown-steps", profile_breakdown_steps]
     if torch_profiler_trace:

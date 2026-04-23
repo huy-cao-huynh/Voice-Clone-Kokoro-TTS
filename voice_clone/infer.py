@@ -1,4 +1,4 @@
-"""Inference: reference wav + text + language -> audio (Kokoro + trained SegmentGST / L-adapters, frozen WeSpeaker-SV)."""
+"""Inference: reference wav + text + language -> audio (Kokoro + trained SegmentGST / L-adapters, frozen mHuBERT)."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ from kokoro.pipeline import KPipeline
 
 from .config import LossWeights, MelLossConfig, TrainConfig, kokoro_vocab_and_context_length
 from .dataset import load_audio_mono, normalize_lang_code, phonemes_to_input_ids, text_to_phonemes
+from .mhubert_encoder import MHuBERTEncoder
 from .segment_gst import SegmentGST
-from .train_adapters import build_models, _speaker_frame_mask
-from .wespeaker_sv import WeSpeakerSV
+from .train_adapters import build_models
 
 KOKORO_OUTPUT_SR = 24_000
 
@@ -45,7 +45,7 @@ def apply_voice_clone_checkpoint(
 
     def _load_optional_adapter_state(key: str, module: Optional[torch.nn.Module], module_name: str) -> None:
         state = ckpt.get(key)
-        if not state:
+        if state is None:
             return
         if module is None:
             raise ValueError(
@@ -74,10 +74,10 @@ def apply_voice_clone_checkpoint(
 def build_stack_for_inference(
     cfg: TrainConfig,
     device: torch.device,
-) -> Tuple[KModel, SegmentGST, WeSpeakerSV]:
-    """Construct Kokoro (with adapter slots), SegmentGST, and frozen WeSpeaker-SV."""
-    kmodel, gst, sv_model, _disc, _mel, _kokoro_cfg = build_models(cfg, device)
-    return kmodel, gst, sv_model
+) -> Tuple[KModel, SegmentGST, MHuBERTEncoder]:
+    """Construct Kokoro (with adapter slots), SegmentGST, and frozen mHuBERT encoder."""
+    kmodel, gst, mhubert, _sv_model, _disc, _mel, _kokoro_cfg = build_models(cfg, device)
+    return kmodel, gst, mhubert
 
 
 def infer_waveform(
@@ -115,7 +115,7 @@ def infer_waveform(
     if kokoro_repo_id is not None:
         cfg = replace(cfg, kokoro_repo_id=kokoro_repo_id)
 
-    kmodel, gst, sv_model = build_stack_for_inference(cfg, device)
+    kmodel, gst, mhubert = build_stack_for_inference(cfg, device)
     apply_voice_clone_checkpoint(ckpt, gst=gst, kmodel=kmodel)
 
     lang = normalize_lang_code(lang_code)
@@ -124,17 +124,15 @@ def infer_waveform(
     vocab, context_length = kokoro_vocab_and_context_length(cfg.kokoro_repo_id)
     input_ids = phonemes_to_input_ids(vocab, phonemes, context_length=context_length).unsqueeze(0).to(device)
 
-    speaker_sample_rate = int(cfg.wespeaker_sample_rate)
-    ref_16 = load_audio_mono(ref_wav_path, target_sr=speaker_sample_rate).unsqueeze(0).to(device)
+    ref_16 = load_audio_mono(ref_wav_path, target_sr=16_000).unsqueeze(0).to(device)
     sp = speed if speed is not None else cfg.speed
 
     gst.eval()
-    sv_model.eval()
+    mhubert.eval()
     kmodel.eval()
     with torch.inference_mode():
-        wv = sv_model(ref_16, sampling_rate=speaker_sample_rate, grad_through_input=False)
-        frame_mask = _speaker_frame_mask(wv)
-        gst_out, _ = gst(wv.frame_features, frame_mask)
+        mhubert_out = mhubert(ref_16)
+        gst_out, _ = gst(mhubert_out.hidden_states, mhubert_out.frame_mask)
         ref_s = gst_out.ref_s
         audio, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=sp)
         audio = audio.clamp(-1.0, 1.0)
@@ -144,7 +142,7 @@ def infer_waveform(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Voice-clone inference: ref wav + text + lang → WAV (24 kHz).")
     p.add_argument("--checkpoint", type=Path, required=True, help="Training checkpoint (.pt) with GST + adapters.")
-    p.add_argument("--ref-wav", type=Path, required=True, help="Reference speaker audio (any rate; resampled to 16 kHz for WeSpeaker).")
+    p.add_argument("--ref-wav", type=Path, required=True, help="Reference speaker audio (any rate; resampled to 16 kHz for mHuBERT).")
     p.add_argument("--text", type=str, required=True)
     p.add_argument("--lang", type=str, required=True, help="Kokoro lang code or alias (e.g. a, en-us, z).")
     p.add_argument("--out", type=Path, required=True, help="Output WAV path.")
