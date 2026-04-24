@@ -1,11 +1,5 @@
-"""Voice-clone training and inference (Kokoro + frozen WeSpeaker frontend)."""
+"""Voice-clone training and inference (Kokoro + frozen frontends)."""
 
-from .adapters import (
-    AdapterRegistry,
-    ResidualAdapter,
-    build_decoder_adapters,
-    build_duration_encoder_adapters,
-)
 from .config import (
     LossWeights,
     MelLossConfig,
@@ -25,17 +19,15 @@ from .discriminators import HiFiGANMPDMSDDiscriminator
 from .losses import (
     MelReconstructionLoss,
     discriminator_loss_lsgan,
+    duration_loss_log_space,
     feature_matching_loss,
-    speaker_cosine_loss,
     generator_loss_lsgan,
+    masked_l1_loss,
+    speaker_contrastive_loss,
 )
 from .wespeaker_sv import WeSpeakerSV, WeSpeakerSVOutput, WeSpeakerToolkitEncoder
 
 __all__ = [
-    "AdapterRegistry",
-    "ResidualAdapter",
-    "build_decoder_adapters",
-    "build_duration_encoder_adapters",
     "LossWeights",
     "MelLossConfig",
     "TrainConfig",
@@ -51,8 +43,10 @@ __all__ = [
     "HiFiGANMPDMSDDiscriminator",
     "discriminator_loss_lsgan",
     "generator_loss_lsgan",
+    "duration_loss_log_space",
     "feature_matching_loss",
-    "speaker_cosine_loss",
+    "masked_l1_loss",
+    "speaker_contrastive_loss",
     "WeSpeakerSV",
     "WeSpeakerSVOutput",
     "WeSpeakerToolkitEncoder",

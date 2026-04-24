@@ -1,4 +1,4 @@
-"""Mel reconstruction, speaker cosine, and waveform-GAN helper losses."""
+"""Mel, contrastive speaker, prosody, and GAN helper losses."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ class MelLossOutput:
 
 
 def _min_time_crop(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Crop last dim to ``min(a.size(-1), b.size(-1))``."""
     n = min(a.shape[-1], b.shape[-1])
     return a[..., :n], b[..., :n]
 
@@ -32,7 +31,6 @@ def speaker_input_mel_from_waveform(
     amp_enabled: bool,
     disable_amp_for_stft: bool,
 ) -> torch.Tensor:
-    """Compute mel input for frozen speaker frontend while preserving gradients to waveform."""
     if waveforms.dim() != 2:
         raise ValueError(f"waveforms must be `(batch, time)`, got {tuple(waveforms.shape)}")
     if disable_amp_for_stft and waveforms.is_cuda:
@@ -45,8 +43,6 @@ def speaker_input_mel_from_waveform(
 
 
 class MelReconstructionLoss(nn.Module):
-    """L1 (and optional L2) on log mel spectrograms."""
-
     def __init__(
         self,
         *,
@@ -87,101 +83,99 @@ class MelReconstructionLoss(nn.Module):
         pred_lengths: Optional[torch.Tensor] = None,
         target_lengths: Optional[torch.Tensor] = None,
     ) -> MelLossOutput:
-        """``pred_wav`` / ``target_wav``: shape ``(batch, time)`` mono.
-
-        When ``pred_lengths`` and ``target_lengths`` are supplied (variable-length
-        batches), the loss is computed per-item on valid (unpadded) slices and
-        averaged across the batch.
-        """
         if pred_wav.dim() != 2 or target_wav.dim() != 2:
             raise ValueError("expected pred_wav and target_wav shaped (batch, time)")
 
         if pred_lengths is not None and target_lengths is not None:
-            B = pred_wav.size(0)
-            item_losses: List[torch.Tensor] = []
-            first_mel_p: Optional[torch.Tensor] = None
-            first_mel_t: Optional[torch.Tensor] = None
-            for i in range(B):
-                vlen = min(int(pred_lengths[i].item()), int(target_lengths[i].item()))
-                p_i = pred_wav[i : i + 1, :vlen]
-                t_i = target_wav[i : i + 1, :vlen]
+            items: List[torch.Tensor] = []
+            first_p: Optional[torch.Tensor] = None
+            first_t: Optional[torch.Tensor] = None
+            for i in range(pred_wav.size(0)):
+                valid = min(int(pred_lengths[i].item()), int(target_lengths[i].item()))
+                p_i = pred_wav[i : i + 1, :valid]
+                t_i = target_wav[i : i + 1, :valid]
                 mp = torch.log(self.mel(p_i).clamp_min(self.log_floor))
                 mt = torch.log(self.mel(t_i).clamp_min(self.log_floor))
-                l1 = (mp - mt).abs().mean()
-                l2 = ((mp - mt) ** 2).mean()
-                item_losses.append(self.l1_weight * l1 + self.l2_weight * l2)
-                if first_mel_p is None:
-                    first_mel_p, first_mel_t = mp, mt
-            loss = sum(item_losses) / B
-            return MelLossOutput(loss=loss, mel_pred=first_mel_p, mel_target=first_mel_t)
+                item = self.l1_weight * (mp - mt).abs().mean() + self.l2_weight * ((mp - mt) ** 2).mean()
+                items.append(item)
+                if first_p is None:
+                    first_p, first_t = mp, mt
+            return MelLossOutput(loss=sum(items) / len(items), mel_pred=first_p, mel_target=first_t)
 
         pred_wav, target_wav = _min_time_crop(pred_wav, target_wav)
         mel_p = torch.log(self.mel(pred_wav).clamp_min(self.log_floor))
         mel_t = torch.log(self.mel(target_wav).clamp_min(self.log_floor))
-        l1 = (mel_p - mel_t).abs().mean()
-        l2 = ((mel_p - mel_t) ** 2).mean()
-        loss = self.l1_weight * l1 + self.l2_weight * l2
+        loss = self.l1_weight * (mel_p - mel_t).abs().mean() + self.l2_weight * ((mel_p - mel_t) ** 2).mean()
         return MelLossOutput(loss=loss, mel_pred=mel_p, mel_target=mel_t)
 
 
-def speaker_cosine_loss(
-    emb_ref: torch.Tensor,
-    emb_gen: torch.Tensor,
+def speaker_contrastive_loss(
+    predicted_embeddings: torch.Tensor,
+    cached_target_embeddings: torch.Tensor,
     *,
-    eps: float = 1e-8,
+    temperature: float = 0.07,
+    detach_targets: bool = True,
 ) -> torch.Tensor:
-    """``1 - cos(a, b)`` with optional L2 re-normalization (HF embeddings are usually pre-normalized)."""
-    a = F.normalize(emb_ref, dim=-1, eps=eps)
-    b = F.normalize(emb_gen, dim=-1, eps=eps)
-    cos = (a * b).sum(dim=-1).clamp(-1.0, 1.0)
-    return (1.0 - cos).mean()
+    if predicted_embeddings.dim() != 2 or cached_target_embeddings.dim() != 2:
+        raise ValueError("predicted_embeddings and cached_target_embeddings must be `(batch, dim)`")
+    if predicted_embeddings.shape != cached_target_embeddings.shape:
+        raise ValueError("predicted_embeddings and cached_target_embeddings must have the same shape")
+    if predicted_embeddings.size(0) < 2:
+        raise ValueError("Contrastive speaker loss requires batch size >= 2")
+
+    anchors = F.normalize(predicted_embeddings, dim=-1)
+    targets = cached_target_embeddings.detach() if detach_targets else cached_target_embeddings
+    targets = F.normalize(targets, dim=-1)
+    logits = anchors @ targets.transpose(0, 1)
+    logits = logits / float(temperature)
+    labels = torch.arange(logits.size(0), device=logits.device)
+    return F.cross_entropy(logits, labels)
+
+
+def duration_loss_log_space(
+    duration_logits: torch.Tensor,
+    duration_targets: torch.Tensor,
+    duration_mask: torch.Tensor,
+    *,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    pred = torch.log(duration_logits.clamp_min(0.0) + 1.0 + eps)
+    target = torch.log(duration_targets.clamp_min(0.0) + 1.0 + eps)
+    mask = duration_mask.to(dtype=pred.dtype)
+    denom = mask.sum().clamp_min(1.0)
+    return (((pred - target) ** 2) * mask).sum() / denom
+
+
+def masked_l1_loss(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_f = mask.to(dtype=prediction.dtype)
+    denom = mask_f.sum().clamp_min(1.0)
+    return ((prediction - target).abs() * mask_f).sum() / denom
 
 
 def _as_list(x: Union[torch.Tensor, Sequence[torch.Tensor]]) -> List[torch.Tensor]:
-    if isinstance(x, (list, tuple)):
-        return list(x)
-    return [x]
+    return list(x) if isinstance(x, (list, tuple)) else [x]
 
 
 def _crop_logits_to_min_last_dim(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Crop `(B, N)` logits tensors to the minimum last-dim length.
-    """
     if a.dim() != b.dim():
         raise ValueError(f"a and b must have the same dim, got {a.dim()} and {b.dim()}")
     if a.shape[:-1] != b.shape[:-1]:
-        raise ValueError(
-            "a and b must match on all non-time dims before cropping, "
-            f"got {tuple(a.shape)} and {tuple(b.shape)}"
-        )
+        raise ValueError("a and b must match on all non-time dims before cropping")
     n = min(a.size(-1), b.size(-1))
-    if a.size(-1) != n:
-        a = a[..., :n]
-    if b.size(-1) != n:
-        b = b[..., :n]
-    return a, b
+    return a[..., :n], b[..., :n]
 
 
 def _crop_to_min_shape(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Crop `a` and `b` to the minimum size along each spatial dimension.
-    Keeps batch/channel dims intact.
-    """
     if a.dim() != b.dim():
         raise ValueError(f"a and b must have the same dim, got {a.dim()} and {b.dim()}")
     if a.shape[:2] != b.shape[:2]:
-        raise ValueError(
-            "a and b must match on batch/channel dims before cropping, "
-            f"got {tuple(a.shape)} and {tuple(b.shape)}"
-        )
+        raise ValueError("a and b must match on batch/channel dims before cropping")
     out_a = a
     out_b = b
     for dim in range(2, a.dim()):
         n = min(out_a.size(dim), out_b.size(dim))
-        if out_a.size(dim) != n:
-            out_a = out_a.narrow(dim, 0, n)
-        if out_b.size(dim) != n:
-            out_b = out_b.narrow(dim, 0, n)
+        out_a = out_a.narrow(dim, 0, n)
+        out_b = out_b.narrow(dim, 0, n)
     return out_a, out_b
 
 
@@ -189,92 +183,42 @@ def discriminator_loss_lsgan(
     real_logits: Union[torch.Tensor, Sequence[torch.Tensor]],
     fake_logits: Union[torch.Tensor, Sequence[torch.Tensor]],
 ) -> torch.Tensor:
-    """
-    LSGAN discriminator loss for HiFi-GAN style discriminators.
-
-    Supports either a single logits tensor or a list/tuple of logits tensors.
-    """
     r_list = _as_list(real_logits)
     f_list = _as_list(fake_logits)
-    if len(r_list) == 0 or len(f_list) == 0:
-        raise ValueError("real_logits and fake_logits must be non-empty")
     if len(r_list) != len(f_list):
-        raise ValueError(
-            "real_logits and fake_logits must have the same number of discriminator outputs, "
-            f"got {len(r_list)} and {len(f_list)}"
-        )
-
-    losses: List[torch.Tensor] = []
-    for i in range(len(r_list)):
-        r, f = _crop_logits_to_min_last_dim(r_list[i], f_list[i])
+        raise ValueError("real_logits and fake_logits must have the same number of discriminator outputs")
+    losses = []
+    for r, f in zip(r_list, f_list):
+        r, f = _crop_logits_to_min_last_dim(r, f)
         losses.append(((r - 1.0) ** 2).mean() + (f**2).mean())
     return sum(losses) / len(losses)
 
 
-def generator_loss_lsgan(
-    fake_logits: Union[torch.Tensor, Sequence[torch.Tensor]],
-) -> torch.Tensor:
-    """
-    LSGAN generator loss for HiFi-GAN style discriminators.
-    Encourages fake logits to match the "real" target (= 1).
-    """
+def generator_loss_lsgan(fake_logits: Union[torch.Tensor, Sequence[torch.Tensor]]) -> torch.Tensor:
     f_list = _as_list(fake_logits)
-    if len(f_list) == 0:
-        raise ValueError("fake_logits must be non-empty")
-    losses: List[torch.Tensor] = []
-    for f in f_list:
-        # If logits come in mismatched shapes, we only have one tensor here.
-        losses.append(((f - 1.0) ** 2).mean())
-    return sum(losses) / len(losses)
+    return sum(((f - 1.0) ** 2).mean() for f in f_list) / len(f_list)
 
 
 def feature_matching_loss(
     real_features: Sequence[Union[torch.Tensor, Sequence[torch.Tensor]]],
     fake_features: Sequence[Union[torch.Tensor, Sequence[torch.Tensor]]],
 ) -> torch.Tensor:
-    """
-    Feature matching (HiFi-GAN style) using intermediate discriminator feature maps.
-
-    Expected structure:
-      - `real_features` and `fake_features` are lists over discriminators/sub-discriminators
-      - each item is a list of layer feature maps.
-
-    The function also tolerates a "single discriminator" case where you pass a flat list
-    of tensors instead of a nested list (it will be treated as a 1-element outer list).
-    """
-
-    def _normalize_feats(feats: Sequence[Union[torch.Tensor, Sequence[torch.Tensor]]]):
+    def _normalize(feats: Sequence[Union[torch.Tensor, Sequence[torch.Tensor]]]):
         if len(feats) == 0:
             return []
-        first = feats[0]
-        if isinstance(first, torch.Tensor):
-            # Flat list: [T1, T2, ...] -> [[T1, T2, ...]]
-            return [list(feats)]  # type: ignore[list-item]
-        # Nested list: [[...], [...], ...]
-        return [list(inner) for inner in feats]  # type: ignore[arg-type]
+        return [list(feats)] if isinstance(feats[0], torch.Tensor) else [list(inner) for inner in feats]  # type: ignore[index]
 
-    r_feats = _normalize_feats(real_features)
-    f_feats = _normalize_feats(fake_features)
-    if len(r_feats) == 0 or len(f_feats) == 0:
-        raise ValueError("real_features and fake_features must be non-empty")
+    r_feats = _normalize(real_features)
+    f_feats = _normalize(fake_features)
     if len(r_feats) != len(f_feats):
-        raise ValueError(
-            "real_features and fake_features must have the same number of discriminators, "
-            f"got {len(r_feats)} and {len(f_feats)}"
-        )
-
+        raise ValueError("real_features and fake_features must have the same number of discriminators")
     losses: List[torch.Tensor] = []
-    for di in range(len(r_feats)):
-        r_layers = r_feats[di]
-        f_layers = f_feats[di]
+    for r_layers, f_layers in zip(r_feats, f_feats):
         if len(r_layers) != len(f_layers):
-            raise ValueError(
-                "real_features and fake_features must have the same number of layers per discriminator, "
-                f"got {len(r_layers)} and {len(f_layers)} for discriminator index {di}"
-            )
-        for li in range(len(r_layers)):
-            r, f = _crop_to_min_shape(r_layers[li], f_layers[li])
+            raise ValueError("real_features and fake_features must have the same number of layers")
+        for r, f in zip(r_layers, f_layers):
+            r, f = _crop_to_min_shape(r, f)
             losses.append((r - f).abs().mean())
-    if len(losses) == 0:
+    if not losses:
         raise ValueError("feature lists must contain at least one feature map")
     return sum(losses) / len(losses)

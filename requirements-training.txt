@@ -16,6 +16,7 @@
 soundfile>=0.12.0
 transformers>=4.36.0
 huggingface_hub>=0.20.0
+peft>=0.17.0
 wandb>=0.16.0
 
 # Optional: WeSpeaker weight parity test (WESPEAKER_MODEL_DIR + tests/test_wespeaker_toolkit_parity.py).

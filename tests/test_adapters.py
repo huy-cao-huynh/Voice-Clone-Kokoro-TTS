@@ -1,4 +1,4 @@
-"""Tests for ResidualAdapter and AdapterRegistry (voice_clone/adapters.py)."""
+"""Tests for projection-style adapters and AdapterRegistry (voice_clone/adapters.py)."""
 
 from __future__ import annotations
 
@@ -16,12 +16,12 @@ def _generator_l_adapter_hidden_dims(upsample_initial_channel: int, num_upsample
 
 
 # ---------------------------------------------------------------------------
-# ResidualAdapter
+# ProjectionAdapter / ResidualAdapter compatibility alias
 # ---------------------------------------------------------------------------
 
 class TestResidualAdapter:
     def test_zero_init_identity(self, adapters_mod):
-        """Freshly constructed adapter returns h unchanged (W_up is zero-init)."""
+        """Freshly constructed adapter returns h unchanged via identity projection on the hidden slice."""
         adapter = adapters_mod.ResidualAdapter(hidden_dim=512, style_dim=256, bottleneck_dim=64)
         h = torch.randn(2, 512, 10)
         z = torch.randn(2, 256)
@@ -43,31 +43,27 @@ class TestResidualAdapter:
         z = torch.randn(1, 256)
         assert adapter(h, z).shape == (1, 1024, 5)
 
-    def test_gradient_flow_to_down_weight(self, adapters_mod):
-        """Backward through adapter produces non-zero grad on down.weight."""
+    def test_gradient_flow_to_proj_weight(self, adapters_mod):
+        """Backward through adapter produces non-zero grad on the projection weight."""
         adapter = adapters_mod.ResidualAdapter(hidden_dim=512, style_dim=256, bottleneck_dim=64)
-        # Perturb up so the adapter is no longer identity
         with torch.no_grad():
-            adapter.up.weight.fill_(0.01)
+            adapter.proj.weight[:, 512:].fill_(0.01)
         h = torch.randn(2, 512, 10, requires_grad=True)
         z = torch.randn(2, 256, requires_grad=True)
         out = adapter(h, z)
         out.sum().backward()
-        assert adapter.down.weight.grad is not None
-        assert adapter.down.weight.grad.abs().sum() > 0
+        assert adapter.proj.weight.grad is not None
+        assert adapter.proj.weight.grad.abs().sum() > 0
 
-    def test_residual_structure(self, adapters_mod):
-        """After perturbing W_up, output differs from h but stays close (residual)."""
+    def test_style_projection_changes_output_when_style_weights_used(self, adapters_mod):
+        """Style slice participates once the projection uses it."""
         adapter = adapters_mod.ResidualAdapter(hidden_dim=512, style_dim=256, bottleneck_dim=64)
         with torch.no_grad():
-            adapter.up.weight.fill_(1e-3)
+            adapter.proj.weight[:, 512:].fill_(1e-3)
         h = torch.randn(1, 512, 5)
         z = torch.randn(1, 256)
         out = adapter(h, z)
         assert not torch.equal(out, h)
-        # Delta should be small relative to h
-        delta = (out - h).abs().mean()
-        assert delta < h.abs().mean()
 
     def test_rejects_wrong_style_shape(self, adapters_mod):
         adapter = adapters_mod.ResidualAdapter(hidden_dim=512, style_dim=256, bottleneck_dim=64)
@@ -97,7 +93,7 @@ class TestBuildDurationEncoderAdapters:
             d_model=512, z_style_dim=256, nlayers=3, bottleneck_dim=64,
         )
         for a in adapters:
-            assert a.up.out_features == 512
+            assert a.proj.out_features == 512
 
 
 # ---------------------------------------------------------------------------
@@ -135,23 +131,23 @@ class TestAdapterRegistry:
 
     def test_duration_channel_dims(self, registry):
         for a in registry.duration_encoder:
-            assert a.up.out_features == 512
+            assert a.proj.out_features == 512
 
     def test_decoder_channel_dims(self, registry):
         expected = (1024, 1024, 1024, 1024, 512)
-        actual = tuple(a.up.out_features for a in registry.decoder)
+        actual = tuple(a.proj.out_features for a in registry.decoder)
         assert actual == expected
 
     def test_generator_channel_dims(self, registry):
         expected = (256, 128)
-        actual = tuple(a.up.out_features for a in registry.generator)
+        actual = tuple(a.proj.out_features for a in registry.generator)
         assert actual == expected
 
     def test_all_adapters_start_as_identity(self, registry):
         """Every adapter in the registry should produce identity at init."""
         for group in (registry.duration_encoder, registry.decoder, registry.generator):
             for adapter in group:
-                C = adapter.up.out_features
+                C = adapter.proj.out_features
                 h = torch.randn(1, C, 8)
                 z = torch.randn(1, 256)
                 torch.testing.assert_close(adapter(h, z), h)

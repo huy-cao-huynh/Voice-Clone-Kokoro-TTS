@@ -26,7 +26,7 @@ Override any of them before invoking the script:
     SAVE_FINAL_CHECKPOINT   (unset)                1 to force a final off-interval checkpoint, 0 for interval-only
     BATCH_SIZE              (from TrainConfig)     batch size per micro-step
     GRAD_ACCUM_STEPS        (from TrainConfig)     micro-steps per optimizer step
-    WARMUP_STEPS            (from TrainConfig)     LR warmup steps
+    WARMUP_STEPS            (unset)                LR warmup steps; omit to use TrainConfig default
     DISC_START_STEP         (from TrainConfig)     step to activate discriminator
     CHECKPOINT_INTERVAL     (from TrainConfig)     save checkpoint every N steps
     PROFILE_BREAKDOWN       0                    1 to enable coarse step timers
@@ -58,7 +58,7 @@ def main() -> None:
     manifest = os.environ.get("MANIFEST", "manifests/memorize_train.jsonl")
     manifest_root = os.environ.get("MANIFEST_ROOT", "")
     ckpt_dir = os.environ.get("CKPT_DIR", "ckpt/memorize")
-    resume = os.environ.get("RESUME", "ckpt/memorize/checkpoint_300.pt")
+    resume = os.environ.get("RESUME", "")
     kokoro_repo = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
     epochs = os.environ.get("EPOCHS", "300")
     max_steps = os.environ.get("MAX_STEPS", "")
@@ -73,7 +73,7 @@ def main() -> None:
         val_manifest_root = ""
     batch_size = os.environ.get("BATCH_SIZE", "")
     grad_accum_steps = os.environ.get("GRAD_ACCUM_STEPS", "")
-    warmup_steps = os.environ.get("WARMUP_STEPS", "0")
+    warmup_steps = os.environ.get("WARMUP_STEPS", "")
     disc_start_step = os.environ.get("DISC_START_STEP", "")
     checkpoint_interval = os.environ.get("CHECKPOINT_INTERVAL", "")
     save_final_checkpoint = os.environ.get("SAVE_FINAL_CHECKPOINT", "0")

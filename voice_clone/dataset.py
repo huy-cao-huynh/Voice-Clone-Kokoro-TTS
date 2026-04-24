@@ -1,8 +1,9 @@
-"""Multilingual voice-clone dataset: manifest rows with ``lang_code`` and Kokoro G2P via ``KPipeline(model=False)``."""
+"""Multilingual voice-clone dataset with offline feature-cache support."""
 
 from __future__ import annotations
 
 from functools import lru_cache
+import hashlib
 import json
 import warnings
 from pathlib import Path
@@ -17,11 +18,10 @@ from kokoro.pipeline import ALIASES, KPipeline, LANG_CODES
 
 
 def normalize_lang_code(lang_code: str) -> str:
-    """Match :class:`KPipeline` language normalization (aliases + lower case)."""
     c = lang_code.lower().strip()
     c = ALIASES.get(c, c)
     if c not in LANG_CODES:
-        raise ValueError(f"Unknown lang_code {lang_code!r}; expected one of {sorted(LANG_CODES)} (or aliases like en-us).")
+        raise ValueError(f"Unknown lang_code {lang_code!r}; expected one of {sorted(LANG_CODES)}")
     return c
 
 
@@ -33,19 +33,12 @@ def phonemes_to_input_ids(
     bos_id: int = 0,
     eos_id: int = 0,
 ) -> torch.LongTensor:
-    """Map a phoneme string to Kokoro ``input_ids`` with BOS/EOS, same filtering as :meth:`KModel.forward`."""
     ids = [vocab.get(ch) for ch in phonemes]
     ids = [i for i in ids if i is not None]
     if not ids:
-        raise ValueError(
-            "Phoneme sequence produced no in-vocabulary tokens after filtering unknown graphemes. "
-            "Check the manifest row language, phonemes, and Kokoro repo/vocab compatibility."
-        )
+        raise ValueError("Phoneme sequence produced no in-vocabulary tokens after filtering unknown graphemes.")
     if len(ids) + 2 > context_length:
-        raise ValueError(
-            f"Phoneme sequence too long for model context: {len(ids) + 2} > {context_length} "
-            f"(after dropping unknown graphemes). Shorten text or split the manifest row."
-        )
+        raise ValueError(f"Phoneme sequence too long for model context: {len(ids) + 2} > {context_length}")
     return torch.tensor([bos_id, *ids, eos_id], dtype=torch.long)
 
 
@@ -56,13 +49,6 @@ def text_to_phonemes(
     strict_single_chunk: bool = True,
     max_phoneme_chars: int = 510,
 ) -> str:
-    """
-    Run a quiet :class:`KPipeline` (``model=False``) on one training segment.
-
-    If the pipeline emits multiple chunks (long English or long non-English), by default we raise so
-    manifest rows stay aligned with a single ``target_wav``. Set ``strict_single_chunk=False`` to
-    concatenate chunk phoneme strings (use only when you know that matches your supervision).
-    """
     text = text.strip()
     if not text:
         raise ValueError("Empty text for phonemization.")
@@ -70,12 +56,8 @@ def text_to_phonemes(
     results = list(pipeline(text, voice=None))
     if not results:
         raise ValueError("G2P produced no segments (empty pipeline output).")
-
     if len(results) > 1:
-        msg = (
-            f"G2P produced {len(results)} chunks for one row; use shorter lines or split ref/target "
-            f"so one manifest row maps to one acoustic segment."
-        )
+        msg = f"G2P produced {len(results)} chunks for one row."
         if strict_single_chunk:
             raise ValueError(msg)
         warnings.warn(msg + " Concatenating phoneme chunks because strict_single_chunk=False.", UserWarning)
@@ -84,9 +66,7 @@ def text_to_phonemes(
     if not phonemes.strip():
         raise ValueError("G2P produced an empty phoneme string.")
     if len(phonemes) > max_phoneme_chars:
-        raise ValueError(
-            f"Phoneme string length {len(phonemes)} exceeds max_phoneme_chars={max_phoneme_chars}."
-        )
+        raise ValueError(f"Phoneme string length {len(phonemes)} exceeds max_phoneme_chars={max_phoneme_chars}.")
     return phonemes
 
 
@@ -96,7 +76,6 @@ def _resampler(orig_sr: int, target_sr: int):
 
 
 def load_audio_mono(path: Union[str, Path], *, target_sr: int) -> torch.Tensor:
-    """Load a file as ``(time,)`` float32 mono at ``target_sr``."""
     path = Path(path)
     try:
         import soundfile as sf
@@ -105,30 +84,69 @@ def load_audio_mono(path: Union[str, Path], *, target_sr: int) -> torch.Tensor:
     else:
         data, sr = sf.read(str(path), always_2d=False, dtype="float32")
         t = torch.from_numpy(np.ascontiguousarray(data))
-        if t.ndim == 1:
-            wav = t.unsqueeze(0)
-        else:
-            wav = t.T
+        wav = t.unsqueeze(0) if t.ndim == 1 else t.T
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
     wav = wav.squeeze(0)
     if sr != target_sr:
         wav = _resampler(sr, target_sr)(wav.unsqueeze(0)).squeeze(0)
     if not torch.isfinite(wav).all():
-        raise ValueError(f"Non-finite audio samples (NaN/Inf) in {path}")
+        raise ValueError(f"Non-finite audio samples in {path}")
     return wav
 
 
+def build_manifest_row_fingerprint(row: Dict[str, Any], *, index: int) -> str:
+    stable = {
+        "index": int(index),
+        "ref_wav": row["ref_wav"],
+        "target_wav": row["target_wav"],
+        "text": row["text"],
+        "lang_code": normalize_lang_code(row["lang_code"]),
+        "phonemes": row.get("phonemes"),
+        "speaker_id": row.get("speaker_id"),
+    }
+    payload = json.dumps(stable, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def default_cache_row_path(
+    manifest_path: Union[str, Path],
+    row_index: int,
+    *,
+    cache_root: Union[str, Path] = "cache",
+) -> Path:
+    manifest = Path(manifest_path)
+    return Path(cache_root) / manifest.stem / f"{int(row_index)}.pt"
+
+
+def _to_bool_mask(x: torch.Tensor) -> torch.Tensor:
+    return x.to(dtype=torch.bool) if x.dtype is not torch.bool else x
+
+
+def load_cache_row(cache_path: Union[str, Path], *, expected_fingerprint: Optional[str] = None) -> Dict[str, Any]:
+    path = Path(cache_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Feature cache row not found: {path}")
+    row = torch.load(path, map_location="cpu", weights_only=False)
+    if expected_fingerprint is not None and row.get("manifest_fingerprint") != expected_fingerprint:
+        raise ValueError(f"Stale feature cache at {path}")
+    required = {
+        "ref_hidden_states",
+        "ref_frame_mask",
+        "target_wespeaker_embedding",
+        "duration_targets",
+        "duration_mask",
+        "f0_targets",
+        "f0_mask",
+        "manifest_fingerprint",
+    }
+    missing = sorted(required.difference(row))
+    if missing:
+        raise ValueError(f"Cache row {path} missing required keys: {missing}")
+    return row
+
+
 class VoiceCloneManifestDataset(Dataset):
-    """
-    JSONL manifest: one JSON object per line with audio paths, text, and ``lang_code``.
-
-    Required keys per row: ``ref_wav``, ``target_wav``, ``text``, ``lang_code``.
-    Optional: ``phonemes`` (skip G2P), ``speaker_id`` (string, returned for logging).
-
-    Paths are resolved relative to ``manifest_root`` when not absolute.
-    """
-
     def __init__(
         self,
         manifest_path: Union[str, Path],
@@ -137,8 +155,10 @@ class VoiceCloneManifestDataset(Dataset):
         vocab: Dict[str, int],
         context_length: int,
         manifest_root: Optional[Union[str, Path]] = None,
+        feature_cache_root: Union[str, Path] = "cache",
         strict_single_chunk: bool = True,
         preload_phonemes: bool = True,
+        validate_cache_freshness: bool = True,
     ) -> None:
         super().__init__()
         self.manifest_path = Path(manifest_path)
@@ -146,24 +166,38 @@ class VoiceCloneManifestDataset(Dataset):
         self.kokoro_repo_id = kokoro_repo_id
         self.vocab = vocab
         self.context_length = context_length
+        self.feature_cache_root = Path(feature_cache_root)
         self.strict_single_chunk = strict_single_chunk
+        self.validate_cache_freshness = validate_cache_freshness
 
         self.rows: List[Dict[str, Any]] = []
+        self.cache_metadata: List[Dict[str, Any]] = []
         with open(self.manifest_path, "r", encoding="utf-8") as f:
             for line_no, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as e:
-                    raise ValueError(f"{self.manifest_path}:{line_no}: invalid JSON") from e
+                row = json.loads(line)
                 self._validate_row(row, line_no)
+                idx = len(self.rows)
+                fingerprint = build_manifest_row_fingerprint(row, index=idx)
+                cache_path = default_cache_row_path(self.manifest_path, idx, cache_root=self.feature_cache_root)
+                cached = load_cache_row(
+                    cache_path,
+                    expected_fingerprint=fingerprint if self.validate_cache_freshness else None,
+                )
                 self.rows.append(row)
+                self.cache_metadata.append(
+                    {
+                        "path": cache_path,
+                        "fingerprint": fingerprint,
+                        "ref_frames": tuple(cached["ref_hidden_states"].shape),
+                        "target_embedding_shape": tuple(cached["target_wespeaker_embedding"].shape),
+                    }
+                )
 
         self._pipelines: Dict[str, KPipeline] = {}
         self._phoneme_cache: Optional[List[str]] = None
-
         if preload_phonemes:
             self._phoneme_cache = [self._phonemes_for_row(i) for i in range(len(self.rows))]
 
@@ -171,22 +205,7 @@ class VoiceCloneManifestDataset(Dataset):
         for key in ("ref_wav", "target_wav", "text", "lang_code"):
             if key not in row:
                 raise ValueError(f"{self.manifest_path}:{line_no}: missing key {key!r}")
-        for key in ("ref_wav", "target_wav"):
-            value = row[key]
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{self.manifest_path}:{line_no}: {key} must be a non-empty string path")
-        if not isinstance(row["text"], str):
-            raise ValueError(f"{self.manifest_path}:{line_no}: text must be a string")
-        if not row["text"].strip():
-            raise ValueError(f"{self.manifest_path}:{line_no}: text must be non-empty after stripping whitespace")
-        if not isinstance(row["lang_code"], str):
-            raise ValueError(f"{self.manifest_path}:{line_no}: lang_code must be a string")
         normalize_lang_code(row["lang_code"])
-        if "phonemes" in row and row["phonemes"] is not None:
-            if not isinstance(row["phonemes"], str):
-                raise ValueError(f"{self.manifest_path}:{line_no}: phonemes must be a string when provided")
-            if not row["phonemes"].strip():
-                raise ValueError(f"{self.manifest_path}:{line_no}: phonemes must be non-empty when provided")
         for key in ("ref_wav", "target_wav"):
             resolved = self._resolve_path(row[key])
             if not resolved.is_file():
@@ -201,84 +220,77 @@ class VoiceCloneManifestDataset(Dataset):
     def _pipeline_for_lang(self, lang_code: str) -> KPipeline:
         lang = normalize_lang_code(str(lang_code))
         if lang not in self._pipelines:
-            self._pipelines[lang] = KPipeline(
-                lang_code=lang,
-                repo_id=self.kokoro_repo_id,
-                model=False,
-            )
+            self._pipelines[lang] = KPipeline(lang_code=lang, repo_id=self.kokoro_repo_id, model=False)
         return self._pipelines[lang]
 
     def _phonemes_for_row(self, index: int) -> str:
         row = self.rows[index]
-        if "phonemes" in row and row["phonemes"] is not None:
+        if row.get("phonemes") is not None:
             return str(row["phonemes"])
-        pipe = self._pipeline_for_lang(row["lang_code"])
-        return text_to_phonemes(pipe, row["text"], strict_single_chunk=self.strict_single_chunk)
+        return text_to_phonemes(self._pipeline_for_lang(row["lang_code"]), row["text"], strict_single_chunk=self.strict_single_chunk)
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         row = self.rows[index]
-        ref_path = self._resolve_path(row["ref_wav"])
-        tgt_path = self._resolve_path(row["target_wav"])
+        ref_wav = load_audio_mono(self._resolve_path(row["ref_wav"]), target_sr=16_000)
+        target_wav = load_audio_mono(self._resolve_path(row["target_wav"]), target_sr=24_000)
+        if ref_wav.numel() < 4_800:
+            raise ValueError("Reference audio too short")
+        if target_wav.numel() < 4_800:
+            raise ValueError("Target audio too short")
 
-        ref_wav = load_audio_mono(ref_path, target_sr=16_000)
-        target_wav = load_audio_mono(tgt_path, target_sr=24_000)
-
-        MIN_REF_SAMPLES_16K = 4800  # ~0.3s at 16 kHz
-        MIN_TGT_SAMPLES_24K = 4800  # ~0.2s at 24 kHz
-        if ref_wav.shape[0] < MIN_REF_SAMPLES_16K:
-            raise ValueError(
-                f"Reference audio too short ({ref_wav.shape[0]} samples at 16 kHz, "
-                f"need >= {MIN_REF_SAMPLES_16K}): {ref_path}"
-            )
-        if target_wav.shape[0] < MIN_TGT_SAMPLES_24K:
-            raise ValueError(
-                f"Target audio too short ({target_wav.shape[0]} samples at 24 kHz, "
-                f"need >= {MIN_TGT_SAMPLES_24K}): {tgt_path}"
-            )
-
-        if self._phoneme_cache is not None:
-            phonemes = self._phoneme_cache[index]
-        else:
-            phonemes = self._phonemes_for_row(index)
-
-        lang = normalize_lang_code(str(row["lang_code"]))
-        input_ids = phonemes_to_input_ids(self.vocab, phonemes, context_length=self.context_length)
-
-        out: Dict[str, Any] = {
+        phonemes = self._phoneme_cache[index] if self._phoneme_cache is not None else self._phonemes_for_row(index)
+        cache = load_cache_row(
+            self.cache_metadata[index]["path"],
+            expected_fingerprint=self.cache_metadata[index]["fingerprint"] if self.validate_cache_freshness else None,
+        )
+        sample: Dict[str, Any] = {
             "ref_wav_16k": ref_wav,
             "target_wav_24k": target_wav,
-            "input_ids": input_ids,
-            "lang_code": lang,
+            "input_ids": phonemes_to_input_ids(self.vocab, phonemes, context_length=self.context_length),
+            "lang_code": normalize_lang_code(str(row["lang_code"])),
             "text": row["text"],
+            "row_index": index,
+            "ref_hidden_states": cache["ref_hidden_states"].detach().float(),
+            "ref_frame_mask": _to_bool_mask(cache["ref_frame_mask"]),
+            "target_wespeaker_embedding": cache["target_wespeaker_embedding"].detach().float(),
+            "duration_targets": cache["duration_targets"].detach().float(),
+            "duration_mask": _to_bool_mask(cache["duration_mask"]),
+            "f0_targets": cache["f0_targets"].detach().float(),
+            "f0_mask": _to_bool_mask(cache["f0_mask"]),
         }
-        if "speaker_id" in row and row["speaker_id"] is not None:
-            out["speaker_id"] = str(row["speaker_id"])
-        return out
+        if row.get("speaker_id") is not None:
+            sample["speaker_id"] = str(row["speaker_id"])
+        return sample
 
 
 def collate_voice_clone_batch(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Dynamic-padding collate for variable-length ``input_ids`` and waveforms.
+    input_ids = torch.nn.utils.rnn.pad_sequence([s["input_ids"] for s in samples], batch_first=True, padding_value=0)
+    input_ids_lengths = torch.tensor([s["input_ids"].numel() for s in samples], dtype=torch.long)
+    ref_wav_16k = torch.nn.utils.rnn.pad_sequence([s["ref_wav_16k"] for s in samples], batch_first=True, padding_value=0.0)
+    ref_lengths = torch.tensor([s["ref_wav_16k"].numel() for s in samples], dtype=torch.long)
+    target_wav_24k = torch.nn.utils.rnn.pad_sequence([s["target_wav_24k"] for s in samples], batch_first=True, padding_value=0.0)
+    target_lengths = torch.tensor([s["target_wav_24k"].numel() for s in samples], dtype=torch.long)
 
-    Returns padded ``(B, T)`` tensors for ``input_ids``, ``ref_wav_16k``, and
-    ``target_wav_24k`` plus per-item ``*_lengths`` tensors for downstream masking.
-    Token padding uses id ``0`` (Kokoro ``$`` silence token).
-    """
-    B = len(samples)
-
-    input_ids_list = [s["input_ids"] for s in samples]
-    input_ids_lengths = torch.tensor([ids.shape[0] for ids in input_ids_list], dtype=torch.long)
-    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=0)
-
-    ref_wavs = [s["ref_wav_16k"] for s in samples]
-    ref_lengths = torch.tensor([w.shape[0] for w in ref_wavs], dtype=torch.long)
-    ref_wav_16k = torch.nn.utils.rnn.pad_sequence(ref_wavs, batch_first=True, padding_value=0.0)
-
-    tgt_wavs = [s["target_wav_24k"] for s in samples]
-    target_lengths = torch.tensor([w.shape[0] for w in tgt_wavs], dtype=torch.long)
-    target_wav_24k = torch.nn.utils.rnn.pad_sequence(tgt_wavs, batch_first=True, padding_value=0.0)
+    ref_hidden_states = torch.nn.utils.rnn.pad_sequence(
+        [s["ref_hidden_states"] for s in samples], batch_first=True, padding_value=0.0
+    )
+    ref_frame_mask = torch.nn.utils.rnn.pad_sequence(
+        [s["ref_frame_mask"].to(dtype=torch.bool) for s in samples], batch_first=True, padding_value=False
+    )
+    duration_targets = torch.nn.utils.rnn.pad_sequence(
+        [s["duration_targets"] for s in samples], batch_first=True, padding_value=0.0
+    )
+    duration_mask = torch.nn.utils.rnn.pad_sequence(
+        [s["duration_mask"].to(dtype=torch.bool) for s in samples], batch_first=True, padding_value=False
+    )
+    f0_targets = torch.nn.utils.rnn.pad_sequence([s["f0_targets"] for s in samples], batch_first=True, padding_value=0.0)
+    f0_mask = torch.nn.utils.rnn.pad_sequence(
+        [s["f0_mask"].to(dtype=torch.bool) for s in samples], batch_first=True, padding_value=False
+    )
+    target_wespeaker_embedding = torch.stack([s["target_wespeaker_embedding"] for s in samples], dim=0)
 
     batch: Dict[str, Any] = {
         "ref_wav_16k": ref_wav_16k,
@@ -287,20 +299,23 @@ def collate_voice_clone_batch(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "input_ids_lengths": input_ids_lengths,
         "ref_lengths": ref_lengths,
         "target_lengths": target_lengths,
+        "ref_hidden_states": ref_hidden_states,
+        "ref_frame_mask": ref_frame_mask,
+        "target_wespeaker_embedding": target_wespeaker_embedding,
+        "duration_targets": duration_targets,
+        "duration_mask": duration_mask,
+        "f0_targets": f0_targets,
+        "f0_mask": f0_mask,
+        "texts": [s.get("text", "") for s in samples],
+        "row_indices": torch.tensor([int(s["row_index"]) for s in samples], dtype=torch.long),
     }
-
-    if B == 1:
-        if "speaker_id" in samples[0]:
-            batch["speaker_id"] = samples[0]["speaker_id"]
-        if "text" in samples[0]:
-            batch["text"] = samples[0]["text"]
+    speaker_ids = [s.get("speaker_id") for s in samples]
+    if any(s is not None for s in speaker_ids):
+        batch["speaker_ids"] = speaker_ids
+        if len(samples) == 1:
+            batch["speaker_id"] = speaker_ids[0]
+    if len(samples) == 1:
+        batch["text"] = samples[0].get("text", "")
     else:
-        texts = [s.get("text", "") for s in samples]
-        batch["texts"] = texts
-        if texts:
-            batch["text"] = texts[0]
-        speaker_ids = [s.get("speaker_id") for s in samples]
-        if any(sid is not None for sid in speaker_ids):
-            batch["speaker_ids"] = speaker_ids
-
+        batch["text"] = batch["texts"][0] if batch["texts"] else ""
     return batch

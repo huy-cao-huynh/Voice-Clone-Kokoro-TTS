@@ -1,9 +1,9 @@
-"""Inference: reference wav + text + language -> audio (Kokoro + trained SegmentGST / L-adapters, frozen mHuBERT)."""
+"""Inference: reference wav + text + language -> audio (Kokoro + SegmentGST)."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import fields, replace
+from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -21,17 +21,31 @@ from .train_adapters import build_models
 
 KOKORO_OUTPUT_SR = 24_000
 
+_LEGACY_CHECKPOINT_KEYS = {
+    "kokoro_lora",
+    "duration_adapters",
+    "decoder_adapters",
+    "generator_adapters",
+}
+
 
 def train_config_from_checkpoint_dict(d: Dict[str, Any]) -> TrainConfig:
-    """Rebuild :class:`TrainConfig` from ``torch.save(..., {"train_config": asdict(cfg)})`` payload."""
     d = dict(d)
     if "loss_weights" in d and isinstance(d["loss_weights"], dict):
         d["loss_weights"] = LossWeights(**d["loss_weights"])
     if "mel" in d and isinstance(d["mel"], dict):
         d["mel"] = MelLossConfig(**d["mel"])
     valid = {f.name for f in fields(TrainConfig)}
-    filtered = {k: v for k, v in d.items() if k in valid}
-    return TrainConfig(**filtered)
+    return TrainConfig(**{k: v for k, v in d.items() if k in valid})
+
+
+def _assert_checkpoint_schema(ckpt: Dict[str, Any]) -> None:
+    legacy = sorted(k for k in _LEGACY_CHECKPOINT_KEYS if k in ckpt)
+    if legacy:
+        raise ValueError(
+            "Legacy adapter/LoRA checkpoint detected; this inference path only supports the new SegmentGST-only schema. "
+            f"Found keys: {legacy}"
+        )
 
 
 def apply_voice_clone_checkpoint(
@@ -40,42 +54,15 @@ def apply_voice_clone_checkpoint(
     gst: SegmentGST,
     kmodel: KModel,
 ) -> None:
-    """Load SegmentGST and L-adapter weights from an in-memory checkpoint dict."""
+    _assert_checkpoint_schema(ckpt)
     gst.load_state_dict(ckpt["segment_gst"])
-
-    def _load_optional_adapter_state(key: str, module: Optional[torch.nn.Module], module_name: str) -> None:
-        state = ckpt.get(key)
-        if state is None:
-            return
-        if module is None:
-            raise ValueError(
-                f"Checkpoint contains {module_name} weights, but the rebuilt Kokoro stack has no {module_name}. "
-                "Ensure `kokoro_repo_id` matches the checkpoint used during training."
-            )
-        module.load_state_dict(state)
-
-    _load_optional_adapter_state(
-        "duration_adapters",
-        kmodel.predictor.text_encoder.adapters,
-        "duration adapters",
-    )
-    _load_optional_adapter_state(
-        "decoder_adapters",
-        kmodel.decoder.decoder_adapters,
-        "decoder adapters",
-    )
-    _load_optional_adapter_state(
-        "generator_adapters",
-        kmodel.decoder.generator.adapters,
-        "generator adapters",
-    )
+    _ = kmodel
 
 
 def build_stack_for_inference(
     cfg: TrainConfig,
     device: torch.device,
 ) -> Tuple[KModel, SegmentGST, MHuBERTEncoder]:
-    """Construct Kokoro (with adapter slots), SegmentGST, and frozen mHuBERT encoder."""
     kmodel, gst, mhubert, _sv_model, _disc, _mel, _kokoro_cfg = build_models(cfg, device)
     return kmodel, gst, mhubert
 
@@ -91,29 +78,19 @@ def infer_waveform(
     kokoro_repo_id: Optional[str] = None,
     strict_single_chunk: bool = False,
 ) -> torch.Tensor:
-    """Load checkpoint, run G2P + style from reference audio, return 1-D float waveform at 24 kHz."""
     if device is None:
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt_path = Path(ckpt_path)
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ckpt = torch.load(Path(ckpt_path), map_location=device, weights_only=True)
     raw_tc = ckpt.get("train_config")
     if raw_tc is not None:
         cfg = train_config_from_checkpoint_dict(raw_tc)
     else:
         if kokoro_repo_id is None:
-            raise ValueError(
-                "Checkpoint has no train_config; pass kokoro_repo_id (e.g. hexgrad/Kokoro-82M) "
-                "so Kokoro layout matches training."
-            )
+            raise ValueError("Checkpoint has no train_config; pass kokoro_repo_id.")
         cfg = TrainConfig(kokoro_repo_id=kokoro_repo_id)
     if kokoro_repo_id is not None:
-        cfg = replace(cfg, kokoro_repo_id=kokoro_repo_id)
+        cfg.kokoro_repo_id = kokoro_repo_id
 
     kmodel, gst, mhubert = build_stack_for_inference(cfg, device)
     apply_voice_clone_checkpoint(ckpt, gst=gst, kmodel=kmodel)
@@ -123,9 +100,7 @@ def infer_waveform(
     phonemes = text_to_phonemes(pipeline, text, strict_single_chunk=strict_single_chunk)
     vocab, context_length = kokoro_vocab_and_context_length(cfg.kokoro_repo_id)
     input_ids = phonemes_to_input_ids(vocab, phonemes, context_length=context_length).unsqueeze(0).to(device)
-
     ref_16 = load_audio_mono(ref_wav_path, target_sr=16_000).unsqueeze(0).to(device)
-    sp = speed if speed is not None else cfg.speed
 
     gst.eval()
     mhubert.eval()
@@ -133,46 +108,28 @@ def infer_waveform(
     with torch.inference_mode():
         mhubert_out = mhubert(ref_16)
         gst_out, _ = gst(mhubert_out.hidden_states, mhubert_out.frame_mask)
-        ref_s = gst_out.ref_s
-        audio, _ = kmodel.forward_with_tokens(input_ids, ref_s, speed=sp)
+        audio, _ = kmodel.forward_with_tokens(input_ids, gst_out.ref_s, speed=speed or cfg.speed)
         audio = audio.clamp(-1.0, 1.0)
     return audio.squeeze(0).detach().float().cpu()
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Voice-clone inference: ref wav + text + lang → WAV (24 kHz).")
-    p.add_argument("--checkpoint", type=Path, required=True, help="Training checkpoint (.pt) with GST + adapters.")
-    p.add_argument("--ref-wav", type=Path, required=True, help="Reference speaker audio (any rate; resampled to 16 kHz for mHuBERT).")
+    p = argparse.ArgumentParser(description="Voice-clone inference: ref wav + text + lang -> WAV (24 kHz).")
+    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--ref-wav", type=Path, required=True)
     p.add_argument("--text", type=str, required=True)
-    p.add_argument("--lang", type=str, required=True, help="Kokoro lang code or alias (e.g. a, en-us, z).")
-    p.add_argument("--out", type=Path, required=True, help="Output WAV path.")
-    p.add_argument("--device", type=str, default=None, help="cuda | cpu | mps (default: auto).")
-    p.add_argument("--speed", type=float, default=None, help="Kokoro speed factor (default: from checkpoint TrainConfig).")
-    p.add_argument(
-        "--kokoro-repo",
-        type=str,
-        default=None,
-        help="Kokoro HF repo id: required if checkpoint omits train_config; optional override otherwise (must match training).",
-    )
-    p.add_argument(
-        "--strict-single-chunk",
-        action="store_true",
-        help="Fail if G2P splits text into multiple chunks (default: concatenate with warning).",
-    )
+    p.add_argument("--lang", type=str, required=True)
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--device", type=str, default=None)
+    p.add_argument("--speed", type=float, default=None)
+    p.add_argument("--kokoro-repo", type=str, default=None)
+    p.add_argument("--strict-single-chunk", action="store_true")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
+    device = torch.device(args.device) if args.device else None
     wav = infer_waveform(
         ckpt_path=args.checkpoint,
         ref_wav_path=args.ref_wav,
@@ -183,7 +140,6 @@ def main() -> None:
         kokoro_repo_id=args.kokoro_repo,
         strict_single_chunk=args.strict_single_chunk,
     )
-
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(args.out), wav.unsqueeze(0), KOKORO_OUTPUT_SR)
     print(f"Wrote {args.out} ({wav.numel()} samples @ {KOKORO_OUTPUT_SR} Hz)")

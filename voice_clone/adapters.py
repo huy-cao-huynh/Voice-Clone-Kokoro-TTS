@@ -1,4 +1,4 @@
-"""Trainable L-adapters: h' = h + W_up(ReLU(W_down([h || z_style])))."""
+"""Trainable projection adapters: concat hidden + style, then project back to hidden size."""
 
 from __future__ import annotations
 
@@ -6,20 +6,21 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class ResidualAdapter(nn.Module):
-    """Residual adapter on conv features. h is [B, C, T], z_style is [B, style_dim]."""
+class ProjectionAdapter(nn.Module):
+    """Projection adapter on conv features. h is [B, C, T], z_style is [B, style_dim]."""
 
     def __init__(self, hidden_dim: int, style_dim: int, bottleneck_dim: int):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.style_dim = int(style_dim)
-        self.down = nn.Linear(hidden_dim + style_dim, bottleneck_dim)
-        self.up = nn.Linear(bottleneck_dim, hidden_dim)
-        nn.init.zeros_(self.up.weight)
-        nn.init.zeros_(self.up.bias)
+        self.bottleneck_dim = int(bottleneck_dim)
+        self.proj = nn.Linear(hidden_dim + style_dim, hidden_dim)
+        with torch.no_grad():
+            self.proj.weight.zero_()
+            self.proj.bias.zero_()
+            self.proj.weight[:, :hidden_dim].copy_(torch.eye(hidden_dim))
 
     def forward(self, h: torch.Tensor, z_style: torch.Tensor) -> torch.Tensor:
         if h.dim() != 3:
@@ -35,8 +36,11 @@ class ResidualAdapter(nn.Module):
             raise ValueError(f"z_style feature dim {z_style.size(1)} != adapter style_dim {self.style_dim}")
         z = z_style.unsqueeze(-1).expand(b, z_style.size(1), t)
         x = torch.cat([h, z], dim=1).transpose(1, 2)
-        delta = self.up(F.relu(self.down(x))).transpose(1, 2)
-        return h + delta
+        return self.proj(x).transpose(1, 2)
+
+
+# Backward-compatible export name while the rest of the stack still refers to ResidualAdapter.
+ResidualAdapter = ProjectionAdapter
 
 
 def build_duration_encoder_adapters(
@@ -46,7 +50,7 @@ def build_duration_encoder_adapters(
     bottleneck_dim: int,
 ) -> nn.ModuleList:
     return nn.ModuleList(
-        ResidualAdapter(d_model, z_style_dim, bottleneck_dim) for _ in range(nlayers)
+        ProjectionAdapter(d_model, z_style_dim, bottleneck_dim) for _ in range(nlayers)
     )
 
 
@@ -59,12 +63,12 @@ def build_decoder_adapters(
     from kokoro.istftnet import DECODER_L_ADAPTER_HIDDEN_DIMS, generator_l_adapter_hidden_dims
 
     dec = nn.ModuleList(
-        ResidualAdapter(dim, z_style_dim, bottleneck_dim)
+        ProjectionAdapter(dim, z_style_dim, bottleneck_dim)
         for dim in DECODER_L_ADAPTER_HIDDEN_DIMS
     )
     gen_dims = generator_l_adapter_hidden_dims(upsample_initial_channel, num_upsamples)
     gen = nn.ModuleList(
-        ResidualAdapter(dim, z_style_dim, bottleneck_dim) for dim in gen_dims
+        ProjectionAdapter(dim, z_style_dim, bottleneck_dim) for dim in gen_dims
     )
     return dec, gen
 

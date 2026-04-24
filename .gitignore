@@ -27,6 +27,8 @@ ckpt/
 /output
 /kokoro/voices
 research/
+prosody_cache/
+cache/
 
 # ------------------------------------------------------------------------------
 # One-off or machine-local scripts (not part of shared training pipeline)
@@ -38,6 +40,10 @@ scripts/merge_manifests.sh
 scripts/sanity_universal_style_kokoro_val.py
 scripts/debug_mhubert_layer.py
 scripts/run_debug_mhubert.sh
+scripts/debug_trainable_params.py
+scripts/build_feature_cache.sh
+scripts/build_prosody_targets.sh
+scripts/build_phonemes.sh
 
 # ------------------------------------------------------------------------------
 # Python

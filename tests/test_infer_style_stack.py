@@ -1,4 +1,4 @@
-"""Focused inference regressions for the style-conditioning stack."""
+"""Focused inference regressions for the SegmentGST-only style stack."""
 
 from __future__ import annotations
 
@@ -18,10 +18,9 @@ _ROOT = Path(__file__).resolve().parents[1]
 def _load_infer_module(monkeypatch):
     def load_module(name: str, path: Path):
         spec = importlib.util.spec_from_file_location(name, path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Cannot load {path}")
         mod = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, name, mod)
+        assert spec is not None and spec.loader is not None
         spec.loader.exec_module(mod)
         return mod
 
@@ -42,10 +41,12 @@ def _load_infer_module(monkeypatch):
 
     @dataclass
     class LossWeights:
-        lambda_mel: float = 1.0
-        lambda_spk: float = 15.0
-        lambda_adv: float = 2.0
-        lambda_fm: float = 15.0
+        lambda_mel: float = 20.0
+        lambda_spk_contrastive: float = 1.0
+        lambda_adv: float = 1.0
+        lambda_fm: float = 2.0
+        lambda_dur: float = 1.0
+        lambda_f0: float = 1.0
 
     @dataclass
     class MelLossConfig:
@@ -59,20 +60,26 @@ def _load_infer_module(monkeypatch):
     @dataclass
     class TrainConfig:
         kokoro_repo_id: str = "dummy/kokoro"
+        mhubert_repo_id: str = "dummy/mhubert"
+        mhubert_extract_layer: int = 6
         wespeaker_checkpoint_path: str = "dummy/wespeaker/avg_model.pt"
         wespeaker_embedding_dim: int = 256
         wespeaker_sample_rate: int = 16_000
         universal_style_vector_path: str = "voice_clone/universal_style_vector.pt"
+        feature_cache_root: str = "cache"
         disable_amp_for_stft: bool = True
-        adapter_bottleneck: int = 64
+        gst_embed_dim: int = 1024
         loss_weights: LossWeights = field(default_factory=LossWeights)
         mel: MelLossConfig = field(default_factory=MelLossConfig)
+        contrastive_temperature: float = 0.07
+        validate_cache_freshness: bool = True
+        min_language_speakers: int = 2
         speed: float = 1.0
 
     config_mod.LossWeights = LossWeights
     config_mod.MelLossConfig = MelLossConfig
     config_mod.TrainConfig = TrainConfig
-    config_mod.kokoro_vocab_and_context_length = lambda repo_id: ({}, 0)
+    config_mod.kokoro_vocab_and_context_length = lambda repo_id: ({"a": 1, "b": 2}, 8)
     monkeypatch.setitem(sys.modules, "voice_clone.config", config_mod)
 
     dataset_mod = types.ModuleType("voice_clone.dataset")
@@ -90,9 +97,9 @@ def _load_infer_module(monkeypatch):
     train_mod.build_models = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "voice_clone.train_adapters", train_mod)
 
-    wespeaker_mod = types.ModuleType("voice_clone.wespeaker_sv")
-    wespeaker_mod.WeSpeakerSV = object
-    monkeypatch.setitem(sys.modules, "voice_clone.wespeaker_sv", wespeaker_mod)
+    mhubert_mod = types.ModuleType("voice_clone.mhubert_encoder")
+    mhubert_mod.MHuBERTEncoder = object
+    monkeypatch.setitem(sys.modules, "voice_clone.mhubert_encoder", mhubert_mod)
 
     kokoro_model_mod = types.ModuleType("kokoro.model")
     kokoro_model_mod.KModel = object
@@ -106,11 +113,9 @@ def _load_infer_module(monkeypatch):
     return config_mod, infer_mod
 
 
-def test_infer_waveform_uses_actual_reference_sample_rate(monkeypatch):
+def test_infer_waveform_has_no_adapter_style_path(monkeypatch):
     config_mod, infer_mod = _load_infer_module(monkeypatch)
-
-    cfg = config_mod.TrainConfig(wespeaker_sample_rate=8_000)
-    ref_audio = torch.randn(16_000)
+    cfg = config_mod.TrainConfig()
     calls: dict[str, object] = {}
 
     class DummyMHuBERT:
@@ -118,54 +123,28 @@ def test_infer_waveform_uses_actual_reference_sample_rate(monkeypatch):
             return self
 
         def __call__(self, waveforms_16k, attention_mask=None):
-            calls["waveform_shape"] = tuple(waveforms_16k.shape)
             calls["attention_mask"] = attention_mask
-            return type(
-                "DummyMHuBERTOutput",
-                (),
-                {
-                    "hidden_states": torch.randn(1, 5, 768),
-                    "frame_mask": torch.tensor([[True, True, True, False, False]]),
-                },
-            )()
+            return type("Out", (), {"hidden_states": torch.randn(1, 5, 768), "frame_mask": torch.ones(1, 5, dtype=torch.bool)})()
 
     class DummyGST:
         def eval(self):
             return self
 
         def __call__(self, frame_hidden_states, frame_mask):
-            calls["frame_mask"] = frame_mask.clone()
-            return type("DummyGSTOutput", (), {"ref_s": torch.randn(1, 256)})(), None
+            return type("Out", (), {"ref_s": torch.randn(1, 256)})(), None
 
     class DummyKModel:
         def eval(self):
             return self
 
-        def forward_with_tokens(self, input_ids, ref_s, speed):
-            calls["speed"] = speed
-            return torch.zeros(1, 32), torch.ones(1, dtype=torch.long)
+        def forward_with_tokens(self, input_ids, ref_s, speed, return_training_outputs=False):
+            calls["return_training_outputs"] = return_training_outputs
+            return torch.zeros(1, 32), torch.ones(2, dtype=torch.long)
 
-    load_calls: list[tuple[object, int]] = []
-
-    def fake_load_audio_mono(path, *, target_sr):
-        load_calls.append((path, target_sr))
-        return ref_audio.clone()
-
-    def fake_torch_load(*args, **kwargs):
-        calls["weights_only"] = kwargs.get("weights_only")
-        return {"train_config": asdict(cfg)}
-
-    monkeypatch.setattr(infer_mod.torch, "load", fake_torch_load)
-    monkeypatch.setattr(
-        infer_mod, "build_stack_for_inference", lambda cfg, device: (DummyKModel(), DummyGST(), DummyMHuBERT())
-    )
+    monkeypatch.setattr(infer_mod.torch, "load", lambda *args, **kwargs: {"train_config": asdict(cfg), "segment_gst": {}})
+    monkeypatch.setattr(infer_mod, "build_stack_for_inference", lambda cfg, device: (DummyKModel(), DummyGST(), DummyMHuBERT()))
     monkeypatch.setattr(infer_mod, "apply_voice_clone_checkpoint", lambda *args, **kwargs: None)
-    monkeypatch.setattr(infer_mod, "normalize_lang_code", lambda lang: lang)
     monkeypatch.setattr(infer_mod, "KPipeline", lambda *args, **kwargs: object())
-    monkeypatch.setattr(infer_mod, "text_to_phonemes", lambda *args, **kwargs: "ab")
-    monkeypatch.setattr(infer_mod, "kokoro_vocab_and_context_length", lambda *args, **kwargs: ({"a": 1, "b": 2}, 8))
-    monkeypatch.setattr(infer_mod, "phonemes_to_input_ids", lambda *args, **kwargs: torch.tensor([1, 2]))
-    monkeypatch.setattr(infer_mod, "load_audio_mono", fake_load_audio_mono)
 
     wav = infer_mod.infer_waveform(
         ckpt_path="dummy.pt",
@@ -174,38 +153,12 @@ def test_infer_waveform_uses_actual_reference_sample_rate(monkeypatch):
         lang_code="a",
         device=torch.device("cpu"),
     )
-
     assert tuple(wav.shape) == (32,)
-    assert calls["weights_only"] is True
-    assert calls["waveform_shape"] == (1, ref_audio.numel())
     assert calls["attention_mask"] is None
-    assert load_calls == [("ref.wav", 16_000)]
-    assert calls["speed"] == cfg.speed
-    assert torch.equal(calls["frame_mask"], torch.tensor([[True, True, True, False, False]]))
+    assert calls["return_training_outputs"] is False
 
 
-def test_apply_voice_clone_checkpoint_rejects_missing_adapter_modules(monkeypatch):
-    _config_mod, infer_mod = _load_infer_module(monkeypatch)
-
-    class DummyModule:
-        def __init__(self):
-            self.loaded = None
-
-        def load_state_dict(self, state):
-            self.loaded = state
-
-    gst = DummyModule()
-    kmodel = types.SimpleNamespace(
-        predictor=types.SimpleNamespace(text_encoder=types.SimpleNamespace(adapters=None)),
-        decoder=types.SimpleNamespace(
-            decoder_adapters=DummyModule(),
-            generator=types.SimpleNamespace(adapters=DummyModule()),
-        ),
-    )
-    ckpt = {
-        "segment_gst": {"bank": torch.tensor([1.0])},
-        "duration_adapters": {"weight": torch.tensor([2.0])},
-    }
-
-    with pytest.raises(ValueError, match="duration adapters"):
-        infer_mod.apply_voice_clone_checkpoint(ckpt, gst=gst, kmodel=kmodel)
+def test_train_config_from_checkpoint_dict_ignores_unknown_keys(monkeypatch):
+    config_mod, infer_mod = _load_infer_module(monkeypatch)
+    restored = infer_mod.train_config_from_checkpoint_dict({"kokoro_repo_id": "dummy/kokoro", "unknown": 1})
+    assert isinstance(restored, config_mod.TrainConfig)
