@@ -159,6 +159,7 @@ class VoiceCloneManifestDataset(Dataset):
         strict_single_chunk: bool = True,
         preload_phonemes: bool = True,
         validate_cache_freshness: bool = True,
+        max_rows: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.manifest_path = Path(manifest_path)
@@ -177,6 +178,8 @@ class VoiceCloneManifestDataset(Dataset):
                 line = line.strip()
                 if not line:
                     continue
+                if max_rows is not None and len(self.rows) >= int(max_rows):
+                    break
                 row = json.loads(line)
                 self._validate_row(row, line_no)
                 idx = len(self.rows)

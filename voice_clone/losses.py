@@ -147,6 +147,14 @@ def duration_loss_log_space(
 
 
 def masked_l1_loss(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if prediction.dim() != target.dim() or prediction.dim() != mask.dim():
+        raise ValueError("prediction, target, and mask must have the same rank")
+    if prediction.shape[:-1] != target.shape[:-1] or prediction.shape[:-1] != mask.shape[:-1]:
+        raise ValueError("prediction, target, and mask must match on all non-time dimensions")
+    n = min(prediction.size(-1), target.size(-1), mask.size(-1))
+    prediction = prediction[..., :n]
+    target = target[..., :n]
+    mask = mask[..., :n]
     mask_f = mask.to(dtype=prediction.dtype)
     denom = mask_f.sum().clamp_min(1.0)
     return ((prediction - target).abs() * mask_f).sum() / denom

@@ -15,8 +15,8 @@ class LossWeights:
     lambda_spk_contrastive: float = 1.0
     lambda_adv: float = 1.0
     lambda_fm: float = 2.0
-    lambda_dur: float = 1.0
-    lambda_f0: float = 1.0
+    lambda_dur: float = 0.0
+    lambda_f0: float = 0.0
 
 
 @dataclass

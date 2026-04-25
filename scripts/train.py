@@ -29,9 +29,6 @@ Override any of them before invoking the script:
     WARMUP_STEPS            (unset)                LR warmup steps; omit to use TrainConfig default
     DISC_START_STEP         (from TrainConfig)     step to activate discriminator
     CHECKPOINT_INTERVAL     (from TrainConfig)     save checkpoint every N steps
-    PROFILE_BREAKDOWN       0                    1 to enable coarse step timers
-    PROFILE_BREAKDOWN_STEPS 3                    steps before printing timing summary
-    TORCH_PROFILER_TRACE    (empty)              path for Chrome trace JSON
 """
 
 from __future__ import annotations
@@ -55,9 +52,9 @@ def _default_num_workers() -> int:
 def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    manifest = os.environ.get("MANIFEST", "manifests/memorize_train.jsonl")
+    manifest = os.environ.get("MANIFEST", "manifests/memorization_en_1024.phonemes.jsonl")
     manifest_root = os.environ.get("MANIFEST_ROOT", "")
-    ckpt_dir = os.environ.get("CKPT_DIR", "ckpt/memorize")
+    ckpt_dir = os.environ.get("CKPT_DIR", "ckpt/memorization_en_1024")
     resume = os.environ.get("RESUME", "")
     kokoro_repo = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
     epochs = os.environ.get("EPOCHS", "300")
@@ -65,22 +62,18 @@ def main() -> None:
     device = os.environ.get("DEVICE")
     num_workers = os.environ.get("NUM_WORKERS", str(_default_num_workers()))
     wandb_project = os.environ.get("WANDB_PROJECT", "Voice-Clone-Kokoro-TTS")
-    wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"memorize-train-{timestamp}")
-    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/memorize_val.jsonl")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"memorization_en_1024-train-{timestamp}")
+    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/memorization_en_val.phonemes.jsonl")
     val_manifest_root = os.environ.get("VAL_MANIFEST_ROOT", "")
     if val_manifest and not (REPO_ROOT / val_manifest).is_file():
         val_manifest = ""
         val_manifest_root = ""
-    batch_size = os.environ.get("BATCH_SIZE", "")
+    batch_size = os.environ.get("BATCH_SIZE", "4")
     grad_accum_steps = os.environ.get("GRAD_ACCUM_STEPS", "")
     warmup_steps = os.environ.get("WARMUP_STEPS", "")
     disc_start_step = os.environ.get("DISC_START_STEP", "")
     checkpoint_interval = os.environ.get("CHECKPOINT_INTERVAL", "")
     save_final_checkpoint = os.environ.get("SAVE_FINAL_CHECKPOINT", "0")
-    profile_breakdown = os.environ.get("PROFILE_BREAKDOWN", "0")
-    profile_breakdown_steps = os.environ.get("PROFILE_BREAKDOWN_STEPS", "3")
-    torch_profiler_trace = os.environ.get("TORCH_PROFILER_TRACE", "")
-
     cmd: list[str] = [
         sys.executable, "-m", "voice_clone.train_adapters",
         "--manifest", manifest,
@@ -121,10 +114,6 @@ def main() -> None:
         cmd += ["--save-final-checkpoint"]
     elif save_final_checkpoint == "0":
         cmd += ["--no-save-final-checkpoint"]
-    if profile_breakdown == "1":
-        cmd += ["--profile-breakdown", "--profile-breakdown-steps", profile_breakdown_steps]
-    if torch_profiler_trace:
-        cmd += ["--torch-profiler-trace", torch_profiler_trace]
 
     cmd += sys.argv[1:]
 

@@ -7,6 +7,7 @@ import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import torch
@@ -189,3 +190,76 @@ def test_train_loop_validates_intervals(monkeypatch):
         train_mod.train_loop(object(), config_mod.TrainConfig(log_interval=0), torch.device("cpu"))
     with pytest.raises(ValueError, match="checkpoint_interval"):
         train_mod.train_loop(object(), config_mod.TrainConfig(checkpoint_interval=0), torch.device("cpu"))
+
+
+def test_train_loop_logs_fixed_validation_batch_to_wandb(monkeypatch):
+    config_mod, train_mod = _load_train_modules(monkeypatch)
+
+    class TinyDataset:
+        def __len__(self):
+            return 3
+
+    class DummyRun:
+        def __init__(self):
+            self.calls = []
+
+        def log(self, data, step=None):
+            self.calls.append((data, step))
+
+    class DummyAudio:
+        def __init__(self, data, sample_rate, caption):
+            self.data = data
+            self.sample_rate = sample_rate
+            self.caption = caption
+
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(Audio=DummyAudio))
+
+    cfg = config_mod.TrainConfig(batch_size=2, checkpoint_interval=1)
+    param = nn.Parameter(torch.tensor(0.0))
+    gst = nn.Linear(1, 1)
+    sv_model = nn.Linear(1, 1)
+    kmodel = nn.Linear(1, 1)
+    disc = nn.Linear(1, 1)
+    mel_loss_mod = nn.Identity()
+    train_batch = {
+        "target_wav_24k": torch.zeros(2, 8),
+        "texts": ["train_a", "train_b"],
+    }
+    val_batch = {
+        "target_wav_24k": torch.zeros(3, 8),
+        "texts": ["val_a", "val_b", "val_c"],
+    }
+
+    monkeypatch.setattr(train_mod, "build_training_models", lambda cfg, device: (kmodel, gst, sv_model, disc, mel_loss_mod, {}))
+    monkeypatch.setattr(train_mod, "generator_trainable_parameters", lambda kmodel, gst: [param])
+    monkeypatch.setattr(train_mod, "_forward_batch_outputs", lambda *args, **kwargs: ([object()], torch.zeros(1, 256)))
+
+    def fake_losses(*, batch, **kwargs):
+        total = (param * 0.0) + 1.0
+        prefix = "val" if len(batch["texts"]) == 3 else "train"
+        metrics = {"loss_g": 1.0 if prefix == "train" else 2.0, "loss_mel": 0.5}
+        pred = torch.zeros(len(batch["texts"]), 16)
+        return total, metrics, pred
+
+    monkeypatch.setattr(train_mod, "_compute_generator_losses", fake_losses)
+    monkeypatch.setattr(train_mod, "create_val_dataloader", lambda dataset, *, batch_size, num_workers=0: [val_batch])
+    monkeypatch.setattr(train_mod, "save_checkpoint", lambda *args, **kwargs: None)
+
+    run = DummyRun()
+    train_mod.train_loop(
+        [train_batch],
+        cfg,
+        torch.device("cpu"),
+        max_steps=1,
+        ckpt_dir=Path("ckpt"),
+        wandb_run=run,
+        wandb_num_samples=3,
+        val_dataset=TinyDataset(),
+    )
+
+    logged_keys = set()
+    for data, _step in run.calls:
+        logged_keys.update(data.keys())
+    assert "train/loss_g" in logged_keys
+    assert "val/loss_g" in logged_keys
+    assert "val/audio_0" in logged_keys

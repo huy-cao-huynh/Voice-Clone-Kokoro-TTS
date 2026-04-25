@@ -201,3 +201,49 @@ def test_dataset_rejects_missing_cache(dataset_mod, tmp_path):
             manifest_root=tmp_path,
             feature_cache_root=tmp_path / "cache",
         )
+
+
+def test_dataset_max_rows_limits_startup_scan(dataset_mod, tmp_path):
+    ds, harness = dataset_mod
+    row = _row()
+    ref_path = tmp_path / "clips" / "ref.wav"
+    tgt_path = tmp_path / "clips" / "target.wav"
+    _touch(ref_path)
+    _touch(tgt_path)
+    harness.audio_by_path[str(ref_path)] = (np.ones(6_000, dtype=np.float32), 16_000)
+    harness.audio_by_path[str(tgt_path)] = (np.ones(7_000, dtype=np.float32), 24_000)
+    manifest = tmp_path / "manifest.jsonl"
+    with open(manifest, "w", encoding="utf-8") as f:
+        for speaker_id in ("spk-1", "spk-2"):
+            item = dict(row)
+            item["speaker_id"] = speaker_id
+            f.write(json.dumps(item) + "\n")
+    for idx in range(2):
+        fingerprint = ds.build_manifest_row_fingerprint(row | {"speaker_id": f"spk-{idx+1}"}, index=idx)
+        _write_cache(
+            ds,
+            manifest,
+            idx,
+            {
+                "ref_hidden_states": torch.randn(5, 768),
+                "ref_frame_mask": torch.ones(5, dtype=torch.bool),
+                "target_wespeaker_embedding": torch.randn(256),
+                "duration_targets": torch.ones(4),
+                "duration_mask": torch.ones(4, dtype=torch.bool),
+                "f0_targets": torch.ones(3),
+                "f0_mask": torch.ones(3, dtype=torch.bool),
+                "manifest_fingerprint": fingerprint,
+            },
+            cache_root=tmp_path / "cache",
+        )
+
+    dataset = ds.VoiceCloneManifestDataset(
+        manifest,
+        kokoro_repo_id="repo",
+        vocab={"a": 1, "b": 2},
+        context_length=8,
+        manifest_root=tmp_path,
+        feature_cache_root=tmp_path / "cache",
+        max_rows=1,
+    )
+    assert len(dataset) == 1

@@ -27,7 +27,6 @@ ckpt/
 /output
 /kokoro/voices
 research/
-prosody_cache/
 cache/
 
 # ------------------------------------------------------------------------------
@@ -44,6 +43,8 @@ scripts/debug_trainable_params.py
 scripts/build_feature_cache.sh
 scripts/build_prosody_targets.sh
 scripts/build_phonemes.sh
+scripts/smoke_cached_train_step.py
+scripts/build_memorization_subset.py
 
 # ------------------------------------------------------------------------------
 # Python

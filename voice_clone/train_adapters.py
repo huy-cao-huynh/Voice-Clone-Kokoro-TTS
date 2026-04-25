@@ -115,6 +115,33 @@ def build_models(
     return kmodel, gst, mhubert, sv_model, disc, mel_loss, kokoro_cfg
 
 
+def build_training_models(
+    cfg: TrainConfig,
+    device: torch.device,
+) -> Tuple[KModel, SegmentGST, WeSpeakerSV, HiFiGANMPDMSDDiscriminator, MelReconstructionLoss, Dict[str, Any]]:
+    kmodel, kokoro_cfg = build_kokoro_model(cfg, device)
+    sv_model = WeSpeakerSV.from_checkpoint(
+        cfg.wespeaker_checkpoint_path,
+        embedding_dim=cfg.wespeaker_embedding_dim,
+        sample_rate=cfg.wespeaker_sample_rate,
+        device=device,
+        dtype=None,
+    )
+    gst = SegmentGST(
+        frame_dim=768,
+        embed_dim=cfg.gst_embed_dim,
+        num_bases=1024,
+        num_heads=4,
+        ref_dim=256,
+        style_dec_dim=128,
+        dropout=cfg.gst_dropout,
+        universal_style_vector=load_universal_style_vector(cfg.universal_style_vector_path, ref_dim=256),
+    ).to(device)
+    disc = HiFiGANMPDMSDDiscriminator().to(device)
+    mel_loss = build_mel_loss(kokoro_cfg, cfg.mel, device)
+    return kmodel, gst, sv_model, disc, mel_loss, kokoro_cfg
+
+
 def generator_trainable_parameters(kmodel: KModel, gst: SegmentGST) -> List[nn.Parameter]:
     del kmodel
     return list(gst.parameters())
@@ -341,6 +368,7 @@ def build_manifest_dataset(
     *,
     cfg: TrainConfig,
     manifest_root: Optional[Path] = None,
+    max_rows: Optional[int] = None,
 ) -> VoiceCloneManifestDataset:
     vocab, context_length = kokoro_vocab_and_context_length(cfg.kokoro_repo_id)
     return VoiceCloneManifestDataset(
@@ -351,6 +379,7 @@ def build_manifest_dataset(
         manifest_root=manifest_root,
         feature_cache_root=cfg.feature_cache_root,
         validate_cache_freshness=cfg.validate_cache_freshness,
+        max_rows=max_rows,
     )
 
 
@@ -483,6 +512,73 @@ def _compute_generator_losses(
     return total, metrics, pred_wav
 
 
+@contextlib.contextmanager
+def _temporary_eval(modules: Sequence[nn.Module]) -> Iterator[None]:
+    modes = [m.training for m in modules]
+    try:
+        for module in modules:
+            module.eval()
+        yield
+    finally:
+        for module, was_training in zip(modules, modes):
+            module.train(was_training)
+
+
+def _wandb_audio_logs(
+    *,
+    pred_wav: torch.Tensor,
+    batch: Dict[str, Any],
+    sample_rate: int,
+    max_items: int,
+) -> Dict[str, Any]:
+    try:
+        import wandb
+    except ImportError:
+        return {}
+    logs: Dict[str, Any] = {}
+    texts = batch.get("texts") or []
+    count = min(int(pred_wav.size(0)), int(max_items))
+    for i in range(count):
+        caption = texts[i] if i < len(texts) else f"validation_example_{i}"
+        logs[f"val/audio_{i}"] = wandb.Audio(pred_wav[i].detach().float().cpu().numpy(), sample_rate=sample_rate, caption=caption)
+    return logs
+
+
+def _run_validation_snapshot(
+    *,
+    cfg: TrainConfig,
+    kmodel: KModel,
+    gst: SegmentGST,
+    sv_model: WeSpeakerSV,
+    mel_loss_mod: MelReconstructionLoss,
+    batch: Dict[str, Any],
+    device: torch.device,
+    wandb_num_samples: int,
+) -> Dict[str, Any]:
+    with _temporary_eval((kmodel, gst, sv_model)):
+        with torch.no_grad():
+            outputs, _ = _forward_batch_outputs(kmodel, gst, batch, device, speed=cfg.speed)
+            total, metrics, pred_wav = _compute_generator_losses(
+                cfg=cfg,
+                mel_loss_mod=mel_loss_mod,
+                sv_model=sv_model,
+                outputs=outputs,
+                batch=batch,
+                device=device,
+            )
+    logs = {f"val/{key}": value for key, value in metrics.items()}
+    logs["val/loss_total"] = float(total.detach())
+    logs.update(
+        _wandb_audio_logs(
+            pred_wav=pred_wav,
+            batch=batch,
+            sample_rate=cfg.mel.sample_rate,
+            max_items=wandb_num_samples,
+        )
+    )
+    return logs
+
+
 def train_loop(
     dataloader: DataLoader,
     cfg: TrainConfig,
@@ -501,7 +597,7 @@ def train_loop(
     config_overrides: Optional[Dict[str, Any]] = None,
     report_callback: Optional[Callable[[int, float], None]] = None,
 ) -> None:
-    del wandb_run, wandb_num_samples, profile_breakdown, profile_breakdown_steps, torch_profiler_trace, val_dataset
+    del profile_breakdown, profile_breakdown_steps, torch_profiler_trace
     if config_overrides:
         cfg = _apply_config_overrides(cfg, config_overrides)
     if cfg.batch_size < 2:
@@ -513,7 +609,7 @@ def train_loop(
     if cfg.checkpoint_interval < 1:
         raise ValueError("cfg.checkpoint_interval must be >= 1")
 
-    kmodel, gst, _mhubert, sv_model, disc, mel_loss_mod, _kokoro_cfg = build_models(cfg, device)
+    kmodel, gst, sv_model, disc, mel_loss_mod, _kokoro_cfg = build_training_models(cfg, device)
     params_g = generator_trainable_parameters(kmodel, gst)
     adam_betas = (cfg.adam_b1, cfg.adam_b2)
     opt_g = torch.optim.AdamW(params_g, lr=cfg.lr_g, betas=adam_betas, weight_decay=cfg.weight_decay_g)
@@ -549,93 +645,120 @@ def train_loop(
         )
         generator_updates = int(resume_state.get("generator_updates", start_step))
         discriminator_updates = int(resume_state.get("discriminator_updates", 0))
+        print(f"Resumed step {start_step} from {resume}")
+
+    fixed_val_batch: Optional[Dict[str, Any]] = None
+    if val_dataset is not None and len(val_dataset) > 0:
+        val_batch_size = min(int(wandb_num_samples), len(val_dataset))
+        fixed_val_batch = next(iter(create_val_dataloader(val_dataset, batch_size=val_batch_size, num_workers=0)))
+
+    try:
+        from tqdm.auto import tqdm as _tqdm_cls
+    except ImportError:
+        _tqdm_cls = None  # type: ignore[misc, assignment]
 
     step = start_step
     accum = 0
     opt_g.zero_grad(set_to_none=True)
     opt_d.zero_grad(set_to_none=True)
-    for _epoch in range(int(epochs)):
-        for batch in dataloader:
-            outputs, _ = _forward_batch_outputs(kmodel, gst, batch, device, speed=cfg.speed)
-            with _cuda_amp_context(cfg.use_amp, batch["target_wav_24k"].to(device)):
-                total_g, metrics, pred_wav = _compute_generator_losses(
-                    cfg=cfg,
-                    mel_loss_mod=mel_loss_mod,
-                    sv_model=sv_model,
-                    outputs=outputs,
-                    batch=batch,
-                    device=device,
+    try:
+        expected_steps_per_epoch = _effective_optimizer_steps_per_epoch(len(dataloader), cfg.grad_accum_steps)
+    except TypeError:
+        expected_steps_per_epoch = None
+    for epoch_idx in range(int(epochs)):
+        pbar_ctx: Any = contextlib.nullcontext()
+        use_tqdm_pbar = False
+        if _tqdm_cls is not None and expected_steps_per_epoch is not None:
+            remaining_steps = expected_steps_per_epoch
+            if max_steps is not None:
+                remaining_steps = min(remaining_steps, max(0, int(max_steps) - step))
+            if remaining_steps > 0:
+                use_tqdm_pbar = True
+                pbar_ctx = _tqdm_cls(
+                    total=remaining_steps,
+                    desc=f"train epoch {epoch_idx + 1}/{int(epochs)}",
+                    leave=False,
+                    dynamic_ncols=True,
                 )
-            scaled_g = total_g / float(cfg.grad_accum_steps)
-            if scaler_g is not None:
-                scaler_g.scale(scaled_g).backward()
-            else:
-                scaled_g.backward()
-            accum += 1
 
-            if step >= cfg.disc_start_step:
-                real_logits, _ = disc(batch["target_wav_24k"].to(device))
-                fake_logits, _ = disc(pred_wav.detach())
-                loss_d = discriminator_loss_lsgan(real_logits, fake_logits) / float(cfg.grad_accum_steps)
-                if scaler_d is not None:
-                    scaler_d.scale(loss_d).backward()
+        with pbar_ctx as pbar:
+            for batch in dataloader:
+                outputs, _ = _forward_batch_outputs(kmodel, gst, batch, device, speed=cfg.speed)
+                with _cuda_amp_context(cfg.use_amp, batch["target_wav_24k"].to(device)):
+                    total_g, metrics, pred_wav = _compute_generator_losses(
+                        cfg=cfg,
+                        mel_loss_mod=mel_loss_mod,
+                        sv_model=sv_model,
+                        outputs=outputs,
+                        batch=batch,
+                        device=device,
+                    )
+                scaled_g = total_g / float(cfg.grad_accum_steps)
+                if scaler_g is not None:
+                    scaler_g.scale(scaled_g).backward()
                 else:
-                    loss_d.backward()
-                metrics["loss_d"] = float(loss_d.detach()) * float(cfg.grad_accum_steps)
-            else:
-                metrics["loss_d"] = 0.0
+                    scaled_g.backward()
+                accum += 1
 
-            if accum < cfg.grad_accum_steps:
-                continue
-
-            if scaler_g is not None:
-                scaler_g.unscale_(opt_g)
-            torch.nn.utils.clip_grad_norm_(params_g, cfg.grad_clip_norm_g)
-            if scaler_g is not None:
-                scaler_g.step(opt_g)
-                scaler_g.update()
-            else:
-                opt_g.step()
-            sched_g.step()
-            opt_g.zero_grad(set_to_none=True)
-            generator_updates += 1
-
-            if step >= cfg.disc_start_step:
-                if scaler_d is not None:
-                    scaler_d.unscale_(opt_d)
-                torch.nn.utils.clip_grad_norm_(disc.parameters(), cfg.grad_clip_norm_d)
-                if scaler_d is not None:
-                    scaler_d.step(opt_d)
-                    scaler_d.update()
+                if step >= cfg.disc_start_step:
+                    real_logits, _ = disc(batch["target_wav_24k"].to(device))
+                    fake_logits, _ = disc(pred_wav.detach())
+                    loss_d = discriminator_loss_lsgan(real_logits, fake_logits) / float(cfg.grad_accum_steps)
+                    if scaler_d is not None:
+                        scaler_d.scale(loss_d).backward()
+                    else:
+                        loss_d.backward()
+                    metrics["loss_d"] = float(loss_d.detach()) * float(cfg.grad_accum_steps)
                 else:
-                    opt_d.step()
-                sched_d.step()
-                opt_d.zero_grad(set_to_none=True)
-                discriminator_updates += 1
+                    metrics["loss_d"] = 0.0
 
-            step += 1
-            accum = 0
-            if report_callback is not None:
-                report_callback(step, metrics["loss_g"])
-            if ckpt_dir is not None and step > 0 and step % cfg.checkpoint_interval == 0:
-                save_checkpoint(
-                    ckpt_dir / f"checkpoint_{step}.pt",
-                    gst=gst,
-                    disc=disc,
-                    kmodel=kmodel,
-                    opt_g=opt_g,
-                    opt_d=opt_d,
-                    step=step,
-                    cfg=cfg,
-                    scaler_g=scaler_g,
-                    scaler_d=scaler_d,
-                    sched_g=sched_g,
-                    sched_d=sched_d,
-                    generator_updates=generator_updates,
-                    discriminator_updates=discriminator_updates,
-                )
-            if max_steps is not None and step >= max_steps:
-                if ckpt_dir is not None and cfg.save_final_checkpoint:
+                if accum < cfg.grad_accum_steps:
+                    continue
+
+                if scaler_g is not None:
+                    scaler_g.unscale_(opt_g)
+                torch.nn.utils.clip_grad_norm_(params_g, cfg.grad_clip_norm_g)
+                if scaler_g is not None:
+                    scaler_g.step(opt_g)
+                    scaler_g.update()
+                else:
+                    opt_g.step()
+                sched_g.step()
+                opt_g.zero_grad(set_to_none=True)
+                generator_updates += 1
+
+                if step >= cfg.disc_start_step:
+                    if scaler_d is not None:
+                        scaler_d.unscale_(opt_d)
+                    torch.nn.utils.clip_grad_norm_(disc.parameters(), cfg.grad_clip_norm_d)
+                    if scaler_d is not None:
+                        scaler_d.step(opt_d)
+                        scaler_d.update()
+                    else:
+                        opt_d.step()
+                    sched_d.step()
+                    opt_d.zero_grad(set_to_none=True)
+                    discriminator_updates += 1
+
+                step += 1
+                accum = 0
+                if use_tqdm_pbar:
+                    postfix = {
+                        "loss_g": f"{metrics['loss_g']:.4f}",
+                        "mel": f"{metrics['loss_mel']:.4f}",
+                    }
+                    if "loss_d" in metrics:
+                        postfix["d"] = f"{metrics['loss_d']:.4f}"
+                    pbar.set_postfix(postfix, refresh=False)
+                    pbar.update(1)
+                if wandb_run is not None:
+                    train_logs = {f"train/{key}": value for key, value in metrics.items()}
+                    train_logs["train/lr_g"] = float(opt_g.param_groups[0]["lr"])
+                    train_logs["train/lr_d"] = float(opt_d.param_groups[0]["lr"])
+                    wandb_run.log(train_logs, step=step)
+                if report_callback is not None:
+                    report_callback(step, metrics["loss_g"])
+                if ckpt_dir is not None and step > 0 and step % cfg.checkpoint_interval == 0:
                     save_checkpoint(
                         ckpt_dir / f"checkpoint_{step}.pt",
                         gst=gst,
@@ -652,7 +775,38 @@ def train_loop(
                         generator_updates=generator_updates,
                         discriminator_updates=discriminator_updates,
                     )
-                return
+                if fixed_val_batch is not None and step > 0 and step % cfg.checkpoint_interval == 0:
+                    val_logs = _run_validation_snapshot(
+                        cfg=cfg,
+                        kmodel=kmodel,
+                        gst=gst,
+                        sv_model=sv_model,
+                        mel_loss_mod=mel_loss_mod,
+                        batch=fixed_val_batch,
+                        device=device,
+                        wandb_num_samples=wandb_num_samples,
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(val_logs, step=step)
+                if max_steps is not None and step >= max_steps:
+                    if ckpt_dir is not None and cfg.save_final_checkpoint:
+                        save_checkpoint(
+                            ckpt_dir / f"checkpoint_{step}.pt",
+                            gst=gst,
+                            disc=disc,
+                            kmodel=kmodel,
+                            opt_g=opt_g,
+                            opt_d=opt_d,
+                            step=step,
+                            cfg=cfg,
+                            scaler_g=scaler_g,
+                            scaler_d=scaler_d,
+                            sched_g=sched_g,
+                            sched_d=sched_d,
+                            generator_updates=generator_updates,
+                            discriminator_updates=discriminator_updates,
+                        )
+                    return
 
 
 def parse_args() -> argparse.Namespace:
@@ -679,9 +833,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", type=str, default=None)
     p.add_argument("--wandb-run-name", type=str, default=None)
-    p.add_argument("--profile-breakdown", action="store_true")
-    p.add_argument("--profile-breakdown-steps", type=int, default=3)
-    p.add_argument("--torch-profiler-trace", type=Path, default=None)
     return p.parse_args()
 
 
@@ -706,7 +857,22 @@ def main() -> None:
         cfg.save_final_checkpoint = False
 
     dataset = build_manifest_dataset(args.manifest, cfg=cfg, manifest_root=args.manifest_root)
+    val_dataset = None
+    if args.val_manifest is not None:
+        val_dataset = build_manifest_dataset(args.val_manifest, cfg=cfg, manifest_root=args.val_manifest_root)
     dataloader = create_train_dataloader(dataset, cfg=cfg, num_workers=args.num_workers)
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise RuntimeError("wandb logging requested but wandb is not installed") from exc
+        init_kwargs: Dict[str, Any] = {"config": asdict(cfg)}
+        if args.wandb_project:
+            init_kwargs["project"] = args.wandb_project
+        if args.wandb_run_name:
+            init_kwargs["name"] = args.wandb_run_name
+        wandb_run = wandb.init(**init_kwargs)
     train_loop(
         dataloader,
         cfg,
@@ -715,10 +881,11 @@ def main() -> None:
         max_steps=args.max_steps,
         ckpt_dir=args.ckpt_dir,
         resume=args.resume,
-        profile_breakdown=args.profile_breakdown,
-        profile_breakdown_steps=args.profile_breakdown_steps,
-        torch_profiler_trace=args.torch_profiler_trace,
+        wandb_run=wandb_run,
+        val_dataset=val_dataset,
     )
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

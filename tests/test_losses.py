@@ -58,3 +58,11 @@ def test_masked_l1_loss_ignores_masked_positions(losses_mod):
     mask = torch.tensor([[True, False]])
     loss = losses_mod.masked_l1_loss(pred, target, mask)
     assert loss.item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_masked_l1_loss_crops_to_overlapping_time_axis(losses_mod):
+    pred = torch.tensor([[4.0, 7.0, 100.0]])
+    target = torch.tensor([[1.0, 5.0]])
+    mask = torch.tensor([[True, True, False]])
+    loss = losses_mod.masked_l1_loss(pred, target, mask)
+    assert loss.item() == pytest.approx((3.0 + 2.0) / 2.0, abs=1e-6)
