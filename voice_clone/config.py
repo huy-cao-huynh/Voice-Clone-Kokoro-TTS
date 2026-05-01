@@ -12,7 +12,7 @@ from huggingface_hub import hf_hub_download
 @dataclass
 class LossWeights:
     lambda_mel: float = 20.0
-    lambda_spk_contrastive: float = 1.0
+    lambda_spk_contrastive: float = 5.0
     lambda_adv: float = 1.0
     lambda_fm: float = 2.0
     lambda_dur: float = 0.0
@@ -41,11 +41,13 @@ class TrainConfig:
     wespeaker_sample_rate: int = 16_000
     universal_style_vector_path: str = "voice_clone/universal_style_vector.pt"
     feature_cache_root: str = "cache"
+    mfa_min_coverage_ratio: float = 0.90
+    mfa_max_coverage_ratio: float = 1.10
     disable_amp_for_stft: bool = True
     gst_embed_dim: int = 1024
     loss_weights: LossWeights = field(default_factory=LossWeights)
     mel: MelLossConfig = field(default_factory=MelLossConfig)
-    contrastive_temperature: float = 0.07
+    contrastive_temperature: float = 0.1
     validate_cache_freshness: bool = True
     min_language_speakers: int = 2
     lr_g: float = 1e-4
@@ -58,15 +60,19 @@ class TrainConfig:
     log_interval: int = 1
     checkpoint_interval: int = 100
     save_final_checkpoint: bool = False
-    warmup_steps: int = 0
-    batch_size: int = 2
+    warmup_steps: int = 200
+    batch_size: int = 6
     grad_accum_steps: int = 1
     disc_start_step: int = 99_999_999
     speed: float = 1.0
+    style_decoder_only_steps: int = 200
     gst_dropout: float = 0.0
-    grad_clip_norm_g: float = 5.0
+    gst_conv_kernel_size: int = 5
+    gst_conv_stride: int = 2
+    gst_conv_padding: int = 2
+    grad_clip_norm_g: float = 1.0
     grad_clip_norm_d: float = 1.0
-    lr_min_g: float = 1e-4
+    lr_min_g: float = 1e-5
     lr_min_d: float = 5e-5
 
 

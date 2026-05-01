@@ -19,14 +19,18 @@ TrainConfig = _config.TrainConfig
 
 def test_train_config_defaults_match_contrastive_stack() -> None:
     cfg = TrainConfig()
-    assert cfg.batch_size == 2
+    assert cfg.batch_size == 6
     assert cfg.feature_cache_root == "cache"
     assert cfg.contrastive_temperature == 0.07
     assert cfg.validate_cache_freshness is True
     assert cfg.min_language_speakers == 2
+    assert cfg.mfa_min_coverage_ratio == 0.90
+    assert cfg.mfa_max_coverage_ratio == 1.10
     assert cfg.loss_weights.lambda_spk_contrastive == 1.0
-    assert cfg.loss_weights.lambda_dur == 1.0
-    assert cfg.loss_weights.lambda_f0 == 1.0
+    assert cfg.loss_weights.lambda_dur == 0.0
+    assert cfg.loss_weights.lambda_f0 == 0.0
+    assert cfg.warmup_steps == 500
+    assert cfg.lr_min_g == 1e-5
 
 
 def test_wespeaker_defaults_unchanged() -> None:

@@ -8,19 +8,24 @@ import torch
 B, T, FRAME_DIM = 2, 30, 768
 
 
-def test_ref_s_matches_universal_style_at_init(segment_gst_mod):
+def test_ref_s_stays_close_to_universal_style_at_init(segment_gst_mod):
     u = torch.linspace(-1.0, 1.0, 256)
+    torch.manual_seed(0)
     gst = segment_gst_mod.SegmentGST(universal_style_vector=u)
     out, _ = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T))
-    torch.testing.assert_close(out.ref_s, u.unsqueeze(0).expand(B, -1))
-    torch.testing.assert_close(out.style_dec, u[:128].unsqueeze(0).expand(B, -1))
-    torch.testing.assert_close(out.style_pred, u[128:].unsqueeze(0).expand(B, -1))
+    delta = out.ref_s - u.unsqueeze(0)
+    assert float(delta.norm(dim=-1).mean()) < 10.0
 
 
-def test_split_heads_zero_initialized(segment_gst_mod):
+def test_split_heads_small_normal_initialized(segment_gst_mod):
+    torch.manual_seed(0)
     gst = segment_gst_mod.SegmentGST()
-    assert torch.count_nonzero(gst.to_style_dec.weight) == 0
-    assert torch.count_nonzero(gst.to_style_pred.weight) == 0
+    assert torch.count_nonzero(gst.to_style_dec.weight) > 0
+    assert torch.count_nonzero(gst.to_style_pred.weight) > 0
+    assert gst.to_style_dec.bias.abs().sum() == 0
+    assert gst.to_style_pred.bias.abs().sum() == 0
+    assert float(gst.to_style_dec.weight.std()) == pytest.approx(0.01, rel=0.35)
+    assert float(gst.to_style_pred.weight.std()) == pytest.approx(0.01, rel=0.35)
 
 
 def test_decoder_head_only_receives_decoder_loss_grad(segment_gst_mod):

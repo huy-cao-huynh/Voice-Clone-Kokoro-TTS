@@ -134,15 +134,36 @@ def load_cache_row(cache_path: Union[str, Path], *, expected_fingerprint: Option
         "ref_hidden_states",
         "ref_frame_mask",
         "target_wespeaker_embedding",
+        "target_wespeaker_embedding_tf_span",
         "duration_targets",
         "duration_mask",
+        "gt_dur_frames",
+        "prosody_enabled",
+        "target_num_samples_24k",
+        "gt_total_duration_frames",
+        "gt_total_duration_samples",
+        "duration_coverage_ratio",
+        "coverage_min_ratio",
+        "coverage_max_ratio",
+        "coverage_accepted",
+        "coverage_rejection_reason",
         "f0_targets",
         "f0_mask",
+        "feature_cache_schema_version",
         "manifest_fingerprint",
     }
     missing = sorted(required.difference(row))
     if missing:
-        raise ValueError(f"Cache row {path} missing required keys: {missing}")
+        raise ValueError(
+            f"Cache row {path} missing required keys: {missing}. "
+            "This usually means the row was built with the legacy cache schema. "
+            "Rebuild alignments, prosody_cache, and cache for this manifest with the current Phase-1 pipeline."
+        )
+    if row.get("feature_cache_schema_version") != "phase1_mfa_v2":
+        raise ValueError(
+            f"Cache row {path} has unsupported feature cache schema {row.get('feature_cache_schema_version')!r}. "
+            "Rebuild alignments, prosody_cache, and cache for this manifest with the current Phase-1 pipeline."
+        )
     return row
 
 
@@ -259,8 +280,19 @@ class VoiceCloneManifestDataset(Dataset):
             "ref_hidden_states": cache["ref_hidden_states"].detach().float(),
             "ref_frame_mask": _to_bool_mask(cache["ref_frame_mask"]),
             "target_wespeaker_embedding": cache["target_wespeaker_embedding"].detach().float(),
+            "target_wespeaker_embedding_tf_span": cache["target_wespeaker_embedding_tf_span"].detach().float(),
             "duration_targets": cache["duration_targets"].detach().float(),
             "duration_mask": _to_bool_mask(cache["duration_mask"]),
+            "gt_dur_frames": cache["gt_dur_frames"].detach().long(),
+            "prosody_enabled": bool(cache["prosody_enabled"]),
+            "target_num_samples_24k": int(cache["target_num_samples_24k"]),
+            "gt_total_duration_frames": int(cache["gt_total_duration_frames"]),
+            "gt_total_duration_samples": int(cache["gt_total_duration_samples"]),
+            "duration_coverage_ratio": float(cache["duration_coverage_ratio"]),
+            "coverage_min_ratio": float(cache["coverage_min_ratio"]),
+            "coverage_max_ratio": float(cache["coverage_max_ratio"]),
+            "coverage_accepted": bool(cache["coverage_accepted"]),
+            "coverage_rejection_reason": cache.get("coverage_rejection_reason"),
             "f0_targets": cache["f0_targets"].detach().float(),
             "f0_mask": _to_bool_mask(cache["f0_mask"]),
         }
@@ -289,11 +321,16 @@ def collate_voice_clone_batch(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     duration_mask = torch.nn.utils.rnn.pad_sequence(
         [s["duration_mask"].to(dtype=torch.bool) for s in samples], batch_first=True, padding_value=False
     )
+    gt_dur_frames = torch.nn.utils.rnn.pad_sequence(
+        [s["gt_dur_frames"] for s in samples], batch_first=True, padding_value=0
+    )
+    prosody_enabled = torch.tensor([bool(s["prosody_enabled"]) for s in samples], dtype=torch.bool)
     f0_targets = torch.nn.utils.rnn.pad_sequence([s["f0_targets"] for s in samples], batch_first=True, padding_value=0.0)
     f0_mask = torch.nn.utils.rnn.pad_sequence(
         [s["f0_mask"].to(dtype=torch.bool) for s in samples], batch_first=True, padding_value=False
     )
     target_wespeaker_embedding = torch.stack([s["target_wespeaker_embedding"] for s in samples], dim=0)
+    target_wespeaker_embedding_tf_span = torch.stack([s["target_wespeaker_embedding_tf_span"] for s in samples], dim=0)
 
     batch: Dict[str, Any] = {
         "ref_wav_16k": ref_wav_16k,
@@ -305,8 +342,18 @@ def collate_voice_clone_batch(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "ref_hidden_states": ref_hidden_states,
         "ref_frame_mask": ref_frame_mask,
         "target_wespeaker_embedding": target_wespeaker_embedding,
+        "target_wespeaker_embedding_tf_span": target_wespeaker_embedding_tf_span,
         "duration_targets": duration_targets,
         "duration_mask": duration_mask,
+        "gt_dur_frames": gt_dur_frames,
+        "prosody_enabled": prosody_enabled,
+        "target_num_samples_24k": torch.tensor([int(s["target_num_samples_24k"]) for s in samples], dtype=torch.long),
+        "gt_total_duration_frames": torch.tensor([int(s["gt_total_duration_frames"]) for s in samples], dtype=torch.long),
+        "gt_total_duration_samples": torch.tensor([int(s["gt_total_duration_samples"]) for s in samples], dtype=torch.long),
+        "duration_coverage_ratio": torch.tensor([float(s["duration_coverage_ratio"]) for s in samples], dtype=torch.float32),
+        "coverage_min_ratio": torch.tensor([float(s["coverage_min_ratio"]) for s in samples], dtype=torch.float32),
+        "coverage_max_ratio": torch.tensor([float(s["coverage_max_ratio"]) for s in samples], dtype=torch.float32),
+        "coverage_accepted": torch.tensor([bool(s["coverage_accepted"]) for s in samples], dtype=torch.bool),
         "f0_targets": f0_targets,
         "f0_mask": f0_mask,
         "texts": [s.get("text", "") for s in samples],

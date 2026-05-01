@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import importlib.util
+import os
 import sys
 import types
 from dataclasses import dataclass, field
@@ -88,7 +90,11 @@ def _load_train_modules(monkeypatch):
         grad_accum_steps: int = 1
         disc_start_step: int = 99999999
         speed: float = 1.0
+        style_decoder_only_steps: int = 0
         gst_dropout: float = 0.0
+        gst_conv_kernel_size: int = 5
+        gst_conv_stride: int = 2
+        gst_conv_padding: int = 2
         grad_clip_norm_g: float = 5.0
         grad_clip_norm_d: float = 1.0
         lr_min_g: float = 1e-4
@@ -134,6 +140,15 @@ def _load_train_modules(monkeypatch):
 
     _load_module(monkeypatch, "voice_clone.segment_gst", _ROOT / "voice_clone" / "segment_gst.py")
     return config_mod, _load_module(monkeypatch, "voice_clone.train_adapters", _ROOT / "voice_clone" / "train_adapters.py")
+
+
+def _load_script_module(monkeypatch, name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, mod)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_checkpoint_resume_restores_scheduler_state(monkeypatch, tmp_path):
@@ -192,7 +207,95 @@ def test_train_loop_validates_intervals(monkeypatch):
         train_mod.train_loop(object(), config_mod.TrainConfig(checkpoint_interval=0), torch.device("cpu"))
 
 
-def test_train_loop_logs_fixed_validation_batch_to_wandb(monkeypatch):
+def test_train_launcher_only_forwards_max_steps_when_explicitly_set(monkeypatch):
+    train_script = _load_script_module(monkeypatch, "scripts.train", _ROOT / "scripts" / "train.py")
+    calls: list[dict[str, object]] = []
+
+    def fake_run(cmd, env, cwd):
+        calls.append({"cmd": cmd, "env": env, "cwd": cwd})
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(train_script.subprocess, "run", fake_run)
+    monkeypatch.setattr(train_script.sys, "argv", ["train.py"])
+
+    base_env = {
+        "MANIFEST": "manifests/custom_train.jsonl",
+        "VAL_MANIFEST": "",
+        "PYTHONPATH": "",
+    }
+
+    with mock.patch.dict(os.environ, base_env, clear=True):
+        with pytest.raises(SystemExit) as excinfo:
+            train_script.main()
+    assert excinfo.value.code == 0
+    assert "--max-steps" not in calls[-1]["cmd"]
+
+    with mock.patch.dict(os.environ, {**base_env, "MAX_STEPS": "75"}, clear=True):
+        with pytest.raises(SystemExit) as excinfo:
+            train_script.main()
+    assert excinfo.value.code == 0
+    assert "--max-steps" in calls[-1]["cmd"]
+    max_steps_index = calls[-1]["cmd"].index("--max-steps")
+    assert calls[-1]["cmd"][max_steps_index + 1] == "75"
+
+
+def test_train_loop_runs_multiple_epochs_without_explicit_max_steps(monkeypatch):
+    config_mod, train_mod = _load_train_modules(monkeypatch)
+    cfg = config_mod.TrainConfig(batch_size=2)
+    param = nn.Parameter(torch.tensor(0.0))
+
+    class DummyGST(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 1)
+            self.register_buffer("universal_style_vector", torch.zeros(256), persistent=True)
+
+    gst = DummyGST()
+    sv_model = nn.Linear(1, 1)
+    kmodel = nn.Linear(1, 1)
+    disc = nn.Linear(1, 1)
+    mel_loss_mod = nn.Identity()
+    train_batch = {
+        "target_wav_24k": torch.zeros(2, 8),
+        "texts": ["train_a", "train_b"],
+    }
+
+    monkeypatch.setattr(train_mod, "build_training_models", lambda cfg, device: (kmodel, gst, sv_model, disc, mel_loss_mod, {}))
+    monkeypatch.setattr(train_mod, "generator_trainable_parameters", lambda kmodel, gst: [param])
+
+    class DummyOutput:
+        def __init__(self):
+            self.audio = torch.zeros(1, 8)
+            self.duration_logits = torch.ones(1, 4)
+            self.rounded_durations = torch.ones(1, 4, dtype=torch.long)
+            self.f0_pred = torch.zeros(1, 2)
+            self.n_pred = torch.zeros(1, 2)
+
+    monkeypatch.setattr(
+        train_mod,
+        "_forward_batch_outputs",
+        lambda *args, **kwargs: ([DummyOutput() for _ in range(2)], torch.zeros(2, 256)),
+    )
+
+    def fake_losses(**kwargs):
+        total = (param * 0.0) + 1.0
+        metrics = {"loss_g": 1.0, "loss_mel": 0.5, "loss_spk_contrastive": 0.25}
+        pred = torch.zeros(2, 16)
+        return total, metrics, pred
+
+    monkeypatch.setattr(train_mod, "_compute_generator_losses", fake_losses)
+    seen_steps: list[int] = []
+    train_mod.train_loop(
+        [train_batch],
+        cfg,
+        torch.device("cpu"),
+        epochs=2,
+        report_callback=lambda step, loss: seen_steps.append(step),
+    )
+    assert seen_steps == [1, 2]
+
+
+def test_train_loop_logs_fixed_validation_batch_to_wandb(monkeypatch, tmp_path):
     config_mod, train_mod = _load_train_modules(monkeypatch)
 
     class TinyDataset:
@@ -200,23 +303,38 @@ def test_train_loop_logs_fixed_validation_batch_to_wandb(monkeypatch):
             return 3
 
     class DummyRun:
-        def __init__(self):
+        def __init__(self, run_dir: Path):
             self.calls = []
+            self.dir = str(run_dir)
 
         def log(self, data, step=None):
             self.calls.append((data, step))
 
     class DummyAudio:
-        def __init__(self, data, sample_rate, caption):
+        def __init__(self, data, sample_rate, caption=None):
             self.data = data
             self.sample_rate = sample_rate
             self.caption = caption
 
-    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(Audio=DummyAudio))
+    class DummyTable:
+        def __init__(self, columns):
+            self.columns = columns
+            self.rows = []
+
+        def add_data(self, *row):
+            self.rows.append(row)
+
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(Audio=DummyAudio, Table=DummyTable))
 
     cfg = config_mod.TrainConfig(batch_size=2, checkpoint_interval=1)
     param = nn.Parameter(torch.tensor(0.0))
-    gst = nn.Linear(1, 1)
+    class DummyGST(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 1)
+            self.register_buffer("universal_style_vector", torch.zeros(256), persistent=True)
+
+    gst = DummyGST()
     sv_model = nn.Linear(1, 1)
     kmodel = nn.Linear(1, 1)
     disc = nn.Linear(1, 1)
@@ -227,17 +345,43 @@ def test_train_loop_logs_fixed_validation_batch_to_wandb(monkeypatch):
     }
     val_batch = {
         "target_wav_24k": torch.zeros(3, 8),
+        "target_lengths": torch.tensor([8, 8, 8]),
         "texts": ["val_a", "val_b", "val_c"],
+        "speaker_ids": ["s1", "s2", "s3"],
+        "row_indices": torch.tensor([11, 12, 13]),
     }
 
     monkeypatch.setattr(train_mod, "build_training_models", lambda cfg, device: (kmodel, gst, sv_model, disc, mel_loss_mod, {}))
     monkeypatch.setattr(train_mod, "generator_trainable_parameters", lambda kmodel, gst: [param])
-    monkeypatch.setattr(train_mod, "_forward_batch_outputs", lambda *args, **kwargs: ([object()], torch.zeros(1, 256)))
+
+    class DummyOutput:
+        def __init__(self, audio_len, frame_len):
+            self.audio = torch.zeros(1, audio_len)
+            self.duration_logits = torch.ones(1, 4)
+            self.rounded_durations = torch.full((1, 4), frame_len // 4, dtype=torch.long)
+            self.f0_pred = torch.zeros(1, frame_len)
+            self.n_pred = torch.zeros(1, frame_len)
+
+    def fake_forward_batch_outputs(*args, force_target_total_frames=False, batch=None, **kwargs):
+        del kwargs
+        if batch is None:
+            batch = args[2]
+        count = len(batch["texts"])
+        audio_len = 8 if force_target_total_frames else 12
+        frame_len = 2 if force_target_total_frames else 3
+        outputs = [DummyOutput(audio_len=audio_len, frame_len=frame_len) for _ in range(count)]
+        return outputs, torch.zeros(count, 256)
+
+    monkeypatch.setattr(train_mod, "_forward_batch_outputs", fake_forward_batch_outputs)
 
     def fake_losses(*, batch, **kwargs):
         total = (param * 0.0) + 1.0
         prefix = "val" if len(batch["texts"]) == 3 else "train"
-        metrics = {"loss_g": 1.0 if prefix == "train" else 2.0, "loss_mel": 0.5}
+        metrics = {
+            "loss_g": 1.0 if prefix == "train" else 2.0,
+            "loss_mel": 0.5,
+            "loss_spk_contrastive": 0.25 if prefix == "train" else 0.75,
+        }
         pred = torch.zeros(len(batch["texts"]), 16)
         return total, metrics, pred
 
@@ -245,7 +389,7 @@ def test_train_loop_logs_fixed_validation_batch_to_wandb(monkeypatch):
     monkeypatch.setattr(train_mod, "create_val_dataloader", lambda dataset, *, batch_size, num_workers=0: [val_batch])
     monkeypatch.setattr(train_mod, "save_checkpoint", lambda *args, **kwargs: None)
 
-    run = DummyRun()
+    run = DummyRun(tmp_path / "wandb" / "run-001")
     train_mod.train_loop(
         [train_batch],
         cfg,
@@ -261,5 +405,49 @@ def test_train_loop_logs_fixed_validation_batch_to_wandb(monkeypatch):
     for data, _step in run.calls:
         logged_keys.update(data.keys())
     assert "train/loss_g" in logged_keys
-    assert "val/loss_g" in logged_keys
-    assert "val/audio_0" in logged_keys
+    assert "train/loss_spk_contrastive" in logged_keys
+    assert "train/grad_norm_g" in logged_keys
+    assert "val_free/loss_g" in logged_keys
+    assert "val_tf/loss_g" in logged_keys
+    assert "val/audio_table" in logged_keys
+    assert "val/text_0" not in logged_keys
+    assert "val/audio_gt_0" not in logged_keys
+    assert "val_free/audio_pred_0" not in logged_keys
+    assert "val_tf/audio_pred_0" not in logged_keys
+    assert "val_free/len_ratio" in logged_keys
+    assert "val_tf/len_ratio" in logged_keys
+    assert "val_gap/loss_mel" in logged_keys
+    assert "val_gap/loss_total" in logged_keys
+    assert "val_gap/len_ratio" in logged_keys
+    assert "train/lr_d" not in logged_keys
+    assert "train/style_decoder_only" not in logged_keys
+
+    table = next(data["val/audio_table"] for data, _step in run.calls if "val/audio_table" in data)
+    assert table.columns == [
+        "step",
+        "row_index",
+        "speaker_id",
+        "text",
+        "coverage_ratio",
+        "gt_audio",
+        "pred_audio_free",
+        "pred_audio_tf",
+        "gt_samples_full",
+        "gt_samples_tf",
+        "pred_samples_free",
+        "pred_samples_tf",
+    ]
+    assert len(table.rows) == 3
+
+    expected_csvs = {
+        "train_loss_mel.csv": [(1, 0.5)],
+        "train_loss_spk_contrastive.csv": [(1, 0.25)],
+        "val_free_loss_spk_contrastive.csv": [(1, 0.75)],
+        "val_tf_loss_spk_contrastive.csv": [(1, 0.75)],
+    }
+    for filename, expected_rows in expected_csvs.items():
+        csv_path = Path(run.dir) / filename
+        assert csv_path.is_file()
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert [(int(row["step"]), float(row["value"])) for row in rows] == expected_rows

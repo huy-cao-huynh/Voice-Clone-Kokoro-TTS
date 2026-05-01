@@ -100,6 +100,8 @@ class KModel(torch.nn.Module):
         input_ids: torch.LongTensor,
         ref_s: torch.FloatTensor,
         speed: float = 1,
+        gt_dur_frames: Optional[torch.LongTensor] = None,
+        force_total_frames: Optional[int] = None,
         return_training_outputs: bool = False,
     ) -> Union[tuple[torch.FloatTensor, torch.LongTensor], "KModel.TrainingOutputs"]:
         if input_ids.dim() == 1:
@@ -113,7 +115,21 @@ class KModel(torch.nn.Module):
 
         outputs: list[KModel.TrainingOutputs] = []
         for i in range(input_ids.size(0)):
-            outputs.append(self._forward_single_with_tokens(input_ids[i : i + 1], ref_s[i : i + 1], speed=speed))
+            item_gt_dur = None
+            if gt_dur_frames is not None:
+                if gt_dur_frames.dim() == 1:
+                    item_gt_dur = gt_dur_frames.unsqueeze(0)
+                else:
+                    item_gt_dur = gt_dur_frames[i : i + 1]
+            outputs.append(
+                self._forward_single_with_tokens(
+                    input_ids[i : i + 1],
+                    ref_s[i : i + 1],
+                    speed=speed,
+                    gt_dur_frames=item_gt_dur,
+                    force_total_frames=force_total_frames,
+                )
+            )
 
         if return_training_outputs:
             if len(outputs) == 1:
@@ -150,6 +166,8 @@ class KModel(torch.nn.Module):
         ref_s: torch.FloatTensor,
         *,
         speed: float,
+        gt_dur_frames: Optional[torch.LongTensor] = None,
+        force_total_frames: Optional[int] = None,
     ) -> "KModel.TrainingOutputs":
         input_lengths = torch.full(
             (input_ids.shape[0],), 
@@ -168,6 +186,14 @@ class KModel(torch.nn.Module):
         duration_logits_full = self.predictor.duration_proj(x)
         duration_logits = torch.sigmoid(duration_logits_full).sum(axis=-1) / speed
         pred_dur = torch.round(duration_logits).clamp(min=1).long()
+        if gt_dur_frames is not None:
+            if gt_dur_frames.dim() == 1:
+                gt_dur_frames = gt_dur_frames.unsqueeze(0)
+            if gt_dur_frames.shape != pred_dur.shape:
+                raise ValueError("gt_dur_frames must match the token shape of input_ids")
+            pred_dur = gt_dur_frames.to(device=self.device, dtype=torch.long).clamp(min=0)
+        elif force_total_frames is not None:
+            pred_dur = self._force_total_duration_frames(duration_logits, pred_dur, int(force_total_frames))
         indices = torch.repeat_interleave(torch.arange(input_ids.shape[1], device=self.device), pred_dur.squeeze(0))
         pred_aln_trg = torch.zeros((input_ids.shape[1], indices.shape[0]), device=self.device)
         pred_aln_trg[indices, torch.arange(indices.shape[0])] = 1
@@ -184,6 +210,57 @@ class KModel(torch.nn.Module):
             f0_pred=F0_pred,
             n_pred=N_pred,
         )
+
+    def _force_total_duration_frames(
+        self,
+        duration_logits: torch.FloatTensor,
+        rounded_durations: torch.LongTensor,
+        force_total_frames: int,
+    ) -> torch.LongTensor:
+        if duration_logits.dim() != 2 or rounded_durations.dim() != 2:
+            raise ValueError("duration_logits and rounded_durations must be shaped (batch, tokens)")
+        if duration_logits.shape != rounded_durations.shape:
+            raise ValueError("duration_logits and rounded_durations must have matching shapes")
+        if duration_logits.size(0) != 1:
+            raise ValueError("_force_total_duration_frames only supports batch size 1")
+
+        token_count = int(duration_logits.size(1))
+        target_total = max(int(force_total_frames), token_count)
+
+        base = duration_logits.squeeze(0).clamp_min(1e-6)
+        base_sum = float(base.sum().item())
+        if not base_sum > 0.0:
+            return rounded_durations.new_full((1, token_count), target_total // token_count)
+
+        scaled = base * (float(target_total) / base_sum)
+        forced = torch.floor(scaled).to(dtype=torch.long)
+        forced = torch.clamp(forced, min=1)
+
+        current_total = int(forced.sum().item())
+        if current_total < target_total:
+            deficit = target_total - current_total
+            frac = scaled - torch.floor(scaled)
+            order = torch.argsort(frac, descending=True)
+            for idx in order.tolist():
+                if deficit <= 0:
+                    break
+                forced[idx] += 1
+                deficit -= 1
+        elif current_total > target_total:
+            surplus = current_total - target_total
+            while surplus > 0:
+                removable = torch.nonzero(forced > 1, as_tuple=False).squeeze(-1)
+                if removable.numel() == 0:
+                    raise ValueError("Cannot force total frames below the number of tokens")
+                order = torch.argsort(forced[removable], descending=True)
+                for pos in order.tolist():
+                    idx = int(removable[pos].item())
+                    if surplus <= 0:
+                        break
+                    forced[idx] -= 1
+                    surplus -= 1
+
+        return forced.unsqueeze(0)
 
     @torch.no_grad()
     def forward(

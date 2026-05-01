@@ -29,6 +29,9 @@ class SegmentGST(nn.Module):
         ref_dim: int = 256,
         style_dec_dim: int = 128,
         dropout: float = 0.1,
+        conv_kernel_size: int = 8,
+        conv_stride: int = 4,
+        conv_padding: int = 3,
         universal_style_vector: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
@@ -46,9 +49,15 @@ class SegmentGST(nn.Module):
         self.ref_dim = ref_dim
         self.style_dec_dim = style_dec_dim
         self.style_pred_dim = ref_dim - style_dec_dim
-        self.conv_kernel_size = 8
-        self.conv_stride = 4
-        self.conv_padding = 3
+        self.conv_kernel_size = int(conv_kernel_size)
+        self.conv_stride = int(conv_stride)
+        self.conv_padding = int(conv_padding)
+        if self.conv_kernel_size < 1:
+            raise ValueError("conv_kernel_size must be >= 1")
+        if self.conv_stride < 1:
+            raise ValueError("conv_stride must be >= 1")
+        if self.conv_padding < 0:
+            raise ValueError("conv_padding must be >= 0")
 
         self.bank = nn.Parameter(torch.empty(num_bases, embed_dim))
         nn.init.normal_(self.bank, std=0.02)
@@ -74,9 +83,9 @@ class SegmentGST(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.to_style_dec = nn.Linear(embed_dim, self.style_dec_dim)
         self.to_style_pred = nn.Linear(embed_dim, self.style_pred_dim)
-        nn.init.zeros_(self.to_style_dec.weight)
+        nn.init.normal_(self.to_style_dec.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.to_style_dec.bias)
-        nn.init.zeros_(self.to_style_pred.weight)
+        nn.init.normal_(self.to_style_pred.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.to_style_pred.bias)
 
         if universal_style_vector is None:
@@ -122,6 +131,7 @@ class SegmentGST(nn.Module):
         frame_mask: torch.Tensor,
         *,
         need_weights: bool = False,
+        use_universal_style_pred: bool = False,
     ) -> tuple[SegmentGSTOutput, Optional[torch.Tensor]]:
         if frame_hidden_states.dim() != 3:
             raise ValueError(
@@ -153,6 +163,9 @@ class SegmentGST(nn.Module):
         u_dec = base[: self.style_dec_dim].unsqueeze(0).expand(b, -1)
         u_pred = base[self.style_dec_dim :].unsqueeze(0).expand(b, -1)
         style_dec = u_dec + self.to_style_dec(pooled)
-        style_pred = u_pred + self.to_style_pred(pooled)
+        if use_universal_style_pred:
+            style_pred = u_pred
+        else:
+            style_pred = u_pred + self.to_style_pred(pooled)
         ref_s = torch.cat([style_dec, style_pred], dim=-1)
         return SegmentGSTOutput(ref_s=ref_s, style_dec=style_dec, style_pred=style_pred, pooled_style=pooled), attn_w

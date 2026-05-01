@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import contextlib
 from dataclasses import asdict, fields, replace as dc_replace
 from pathlib import Path
@@ -32,6 +33,13 @@ from .wespeaker_sv import WeSpeakerSV
 from .discriminators.hifigan import HiFiGANMPDMSDDiscriminator
 
 _LEGACY_CHECKPOINT_KEYS = {"kokoro_lora", "duration_adapters", "decoder_adapters", "generator_adapters"}
+_WANDB_LOCAL_CSV_METRICS = {
+    "train/loss_mel": "train_loss_mel.csv",
+    "train/loss_spk_contrastive": "train_loss_spk_contrastive.csv",
+    "val_free/loss_spk_contrastive": "val_free_loss_spk_contrastive.csv",
+    "val_tf/loss_spk_contrastive": "val_tf_loss_spk_contrastive.csv",
+}
+_KOKORO_DURATION_FRAME_SAMPLES = 600
 
 
 def _cuda_amp_context(use_amp: bool, reference_tensor: torch.Tensor):
@@ -108,6 +116,9 @@ def build_models(
         ref_dim=256,
         style_dec_dim=128,
         dropout=cfg.gst_dropout,
+        conv_kernel_size=cfg.gst_conv_kernel_size,
+        conv_stride=cfg.gst_conv_stride,
+        conv_padding=cfg.gst_conv_padding,
         universal_style_vector=load_universal_style_vector(cfg.universal_style_vector_path, ref_dim=256),
     ).to(device)
     disc = HiFiGANMPDMSDDiscriminator().to(device)
@@ -135,6 +146,9 @@ def build_training_models(
         ref_dim=256,
         style_dec_dim=128,
         dropout=cfg.gst_dropout,
+        conv_kernel_size=cfg.gst_conv_kernel_size,
+        conv_stride=cfg.gst_conv_stride,
+        conv_padding=cfg.gst_conv_padding,
         universal_style_vector=load_universal_style_vector(cfg.universal_style_vector_path, ref_dim=256),
     ).to(device)
     disc = HiFiGANMPDMSDDiscriminator().to(device)
@@ -411,6 +425,28 @@ def _trimmed_input_ids(batch_input_ids: torch.Tensor, lengths: torch.Tensor, i: 
     return batch_input_ids[i, : int(lengths[i].item())].unsqueeze(0)
 
 
+def _trimmed_gt_durations(batch: Dict[str, Any], lengths: torch.Tensor, i: int, device: torch.device) -> Optional[torch.Tensor]:
+    prosody_enabled = batch.get("prosody_enabled")
+    if prosody_enabled is None or not bool(prosody_enabled[i]):
+        return None
+    gt_dur_frames = batch.get("gt_dur_frames")
+    if gt_dur_frames is None:
+        return None
+    token_count = int(lengths[i].item())
+    return gt_dur_frames[i, :token_count].to(device=device, dtype=torch.long).unsqueeze(0)
+
+
+def _gst_projection_diagnostics(gst_out: Any, universal_style_vector: torch.Tensor) -> Dict[str, float]:
+    base = universal_style_vector.to(device=gst_out.style_dec.device, dtype=gst_out.style_dec.dtype)
+    split = gst_out.style_dec.size(-1)
+    dec_proj = gst_out.style_dec.detach() - base[:split].unsqueeze(0)
+    pred_proj = gst_out.style_pred.detach() - base[split:].unsqueeze(0)
+    return {
+        "gst/proj_dec_norm_mean": float(dec_proj.norm(dim=-1).mean().detach()),
+        "gst/proj_pred_norm_mean": float(pred_proj.norm(dim=-1).mean().detach()),
+    }
+
+
 def _forward_batch_outputs(
     kmodel: KModel,
     gst: SegmentGST,
@@ -418,21 +454,38 @@ def _forward_batch_outputs(
     device: torch.device,
     *,
     speed: float,
-) -> Tuple[List[KModel.TrainingOutputs], torch.Tensor]:
+    force_target_total_frames: bool = False,
+    style_decoder_only: bool = False,
+) -> Tuple[List[KModel.TrainingOutputs], Any]:
     ref_hidden_states = batch["ref_hidden_states"].to(device)
     ref_frame_mask = batch["ref_frame_mask"].to(device)
-    gst_out, _ = gst(ref_hidden_states, ref_frame_mask)
+    input_ids = batch["input_ids"].to(device)
+    input_ids_lengths = batch["input_ids_lengths"].to(device)
+    target_lengths = batch["target_lengths"].to(device)
+    gst_out, _ = gst(
+        ref_hidden_states,
+        ref_frame_mask,
+        use_universal_style_pred=style_decoder_only,
+    )
     outputs: List[KModel.TrainingOutputs] = []
     for i in range(ref_hidden_states.size(0)):
+        gt_dur_frames = _trimmed_gt_durations(batch, input_ids_lengths, i, device)
+        force_total_frames = None
+        if force_target_total_frames and gt_dur_frames is None:
+            token_count = int(input_ids_lengths[i].item())
+            target_samples = int(target_lengths[i].item())
+            force_total_frames = max(token_count, int(round(target_samples / float(_KOKORO_DURATION_FRAME_SAMPLES))))
         outputs.append(
             kmodel.forward_with_tokens(
-                _trimmed_input_ids(batch["input_ids"].to(device), batch["input_ids_lengths"].to(device), i),
+                _trimmed_input_ids(input_ids, input_ids_lengths, i),
                 gst_out.ref_s[i : i + 1],
                 speed=speed,
+                gt_dur_frames=gt_dur_frames,
+                force_total_frames=force_total_frames,
                 return_training_outputs=True,
             )
         )
-    return outputs, gst_out.ref_s
+    return outputs, gst_out
 
 
 def _predicted_audio_batch(outputs: Sequence[KModel.TrainingOutputs], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -444,6 +497,49 @@ def _predicted_audio_batch(outputs: Sequence[KModel.TrainingOutputs], device: to
         audio[i, :n] = out.audio.squeeze(0)
         lengths[i] = n
     return audio, lengths
+
+
+def _target_audio_lengths(batch: Dict[str, Any], device: torch.device) -> torch.Tensor:
+    if "target_lengths" in batch:
+        return batch["target_lengths"].to(device)
+    target_wav = batch["target_wav_24k"].to(device)
+    return torch.full((target_wav.size(0),), target_wav.size(1), dtype=torch.long, device=device)
+
+
+def _effective_target_audio_lengths(
+    batch: Dict[str, Any],
+    device: torch.device,
+    *,
+    match_teacher_forced_span: bool,
+) -> torch.Tensor:
+    target_lengths = _target_audio_lengths(batch, device)
+    if not match_teacher_forced_span:
+        return target_lengths
+    prosody_enabled = batch.get("prosody_enabled")
+    gt_total_duration_samples = batch.get("gt_total_duration_samples")
+    if prosody_enabled is None or gt_total_duration_samples is None:
+        return target_lengths
+    prosody_enabled = prosody_enabled.to(device)
+    forced_lengths = gt_total_duration_samples.to(device=device, dtype=torch.long)
+    forced_lengths = torch.minimum(forced_lengths, target_lengths)
+    return torch.where(prosody_enabled, forced_lengths, target_lengths)
+
+
+def _speaker_target_embeddings(
+    batch: Dict[str, Any],
+    device: torch.device,
+    *,
+    match_teacher_forced_span: bool,
+) -> torch.Tensor:
+    targets = batch["target_wespeaker_embedding"].to(device)
+    if not match_teacher_forced_span:
+        return targets
+    prosody_enabled = batch.get("prosody_enabled")
+    span_targets = batch.get("target_wespeaker_embedding_tf_span")
+    if prosody_enabled is None or span_targets is None:
+        return targets
+    prosody_mask = prosody_enabled.to(device=device, dtype=torch.bool).unsqueeze(1)
+    return torch.where(prosody_mask, span_targets.to(device), targets)
 
 
 def _duration_tensor(outputs: Sequence[KModel.TrainingOutputs], device: torch.device) -> torch.Tensor:
@@ -464,6 +560,71 @@ def _f0_tensor(outputs: Sequence[KModel.TrainingOutputs], device: torch.device) 
     return f0
 
 
+def _duration_frame_lengths(outputs: Sequence[KModel.TrainingOutputs], device: torch.device) -> torch.Tensor:
+    return torch.tensor(
+        [int(out.rounded_durations.sum().item()) for out in outputs],
+        dtype=torch.long,
+        device=device,
+    )
+
+
+def _mean_length_ratio(pred_lengths: torch.Tensor, target_lengths: torch.Tensor) -> float:
+    pred = pred_lengths.to(dtype=torch.float32)
+    target = target_lengths.to(dtype=torch.float32).clamp_min(1.0)
+    return float((pred / target).mean().detach())
+
+
+def _grad_norm(parameters: Sequence[nn.Parameter]) -> float:
+    norms: List[torch.Tensor] = []
+    for param in parameters:
+        if param.grad is None:
+            continue
+        norms.append(param.grad.detach().norm(2))
+    if not norms:
+        return 0.0
+    return float(torch.norm(torch.stack(norms), 2).detach())
+
+
+def _style_decoder_only_active(cfg: TrainConfig, step: int) -> bool:
+    return int(cfg.style_decoder_only_steps) > 0 and int(step) < int(cfg.style_decoder_only_steps)
+
+
+def _collapse_diagnostics(ref_s: torch.Tensor, universal_style_vector: torch.Tensor) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    if ref_s.dim() != 2:
+        raise ValueError(f"ref_s must be shaped (batch, dim), got {tuple(ref_s.shape)}")
+    base = universal_style_vector.to(device=ref_s.device, dtype=ref_s.dtype).unsqueeze(0)
+    delta = ref_s - base
+    ref_s_std = ref_s.std(dim=0, unbiased=False)
+    metrics["collapse/ref_s_std_mean"] = float(ref_s_std.mean().detach())
+    metrics["collapse/ref_s_delta_norm_mean"] = float(delta.norm(dim=-1).mean().detach())
+    if ref_s.size(0) >= 2:
+        sim = torch.nn.functional.cosine_similarity(ref_s[:, None, :], ref_s[None, :, :], dim=-1)
+        offdiag = sim[~torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)]
+        metrics["collapse/ref_s_pairwise_cos_mean"] = float(offdiag.mean().detach())
+    else:
+        metrics["collapse/ref_s_pairwise_cos_mean"] = 1.0
+    return metrics
+
+
+def _maybe_train_diagnostics(gst_out: Any, gst: SegmentGST) -> Dict[str, float]:
+    if not hasattr(gst_out, "ref_s") or not hasattr(gst, "universal_style_vector"):
+        return {}
+    logs = {f"train/{key}": value for key, value in _collapse_diagnostics(gst_out.ref_s.detach(), gst.universal_style_vector).items()}
+    if hasattr(gst_out, "pooled_style") and hasattr(gst_out, "style_dec") and hasattr(gst_out, "style_pred"):
+        logs.update({f"train/{key}": value for key, value in _gst_projection_diagnostics(gst_out, gst.universal_style_vector).items()})
+    return logs
+
+
+def _maybe_val_diagnostics(prefix: str, gst_out: Any, gst: SegmentGST) -> Dict[str, float]:
+    if not hasattr(gst_out, "ref_s") or not hasattr(gst, "universal_style_vector"):
+        return {}
+    logs = {f"{prefix}/{key}": value for key, value in _collapse_diagnostics(gst_out.ref_s, gst.universal_style_vector).items()}
+    if prefix == "val_tf" and hasattr(gst_out, "pooled_style") and hasattr(gst_out, "style_dec") and hasattr(gst_out, "style_pred"):
+        logs.update({f"{prefix}/{key}": value for key, value in _gst_projection_diagnostics(gst_out, gst.universal_style_vector).items()})
+    return logs
+
+
 def _compute_generator_losses(
     *,
     cfg: TrainConfig,
@@ -472,10 +633,15 @@ def _compute_generator_losses(
     outputs: Sequence[KModel.TrainingOutputs],
     batch: Dict[str, Any],
     device: torch.device,
+    match_teacher_forced_span: bool,
 ) -> Tuple[torch.Tensor, Dict[str, float], torch.Tensor]:
     pred_wav, pred_lengths = _predicted_audio_batch(outputs, device)
     tgt_wav = batch["target_wav_24k"].to(device)
-    target_lengths = batch["target_lengths"].to(device)
+    target_lengths = _effective_target_audio_lengths(
+        batch,
+        device,
+        match_teacher_forced_span=match_teacher_forced_span,
+    )
     duration_pred = _duration_tensor(outputs, device)
     f0_pred = _f0_tensor(outputs, device)
 
@@ -489,7 +655,7 @@ def _compute_generator_losses(
     ).pooled_embedding
     spk_loss = speaker_contrastive_loss(
         spk_pred,
-        batch["target_wespeaker_embedding"].to(device),
+        _speaker_target_embeddings(batch, device, match_teacher_forced_span=match_teacher_forced_span),
         temperature=cfg.contrastive_temperature,
         detach_targets=True,
     )
@@ -524,24 +690,103 @@ def _temporary_eval(modules: Sequence[nn.Module]) -> Iterator[None]:
             module.train(was_training)
 
 
-def _wandb_audio_logs(
+def _wandb_audio_table(
     *,
-    pred_wav: torch.Tensor,
+    pred_wav_free: torch.Tensor,
+    pred_wav_tf: torch.Tensor,
+    pred_lengths_free: torch.Tensor,
+    pred_lengths_tf: torch.Tensor,
     batch: Dict[str, Any],
     sample_rate: int,
     max_items: int,
+    step: int,
 ) -> Dict[str, Any]:
     try:
         import wandb
     except ImportError:
         return {}
-    logs: Dict[str, Any] = {}
+    table = wandb.Table(
+        columns=[
+            "step",
+            "row_index",
+            "speaker_id",
+            "text",
+            "coverage_ratio",
+            "gt_audio",
+            "pred_audio_free",
+            "pred_audio_tf",
+            "gt_samples_full",
+            "gt_samples_tf",
+            "pred_samples_free",
+            "pred_samples_tf",
+        ]
+    )
     texts = batch.get("texts") or []
-    count = min(int(pred_wav.size(0)), int(max_items))
+    speaker_ids = batch.get("speaker_ids") or []
+    target_wav = batch["target_wav_24k"]
+    target_lengths_free = _target_audio_lengths(batch, pred_lengths_free.device).cpu()
+    target_lengths_tf = _effective_target_audio_lengths(
+        batch,
+        pred_lengths_tf.device,
+        match_teacher_forced_span=True,
+    ).cpu()
+    coverage_ratios = batch.get("duration_coverage_ratio")
+    count = min(int(pred_wav_free.size(0)), int(pred_wav_tf.size(0)), int(target_wav.size(0)), int(max_items))
+    row_indices = batch.get("row_indices")
     for i in range(count):
-        caption = texts[i] if i < len(texts) else f"validation_example_{i}"
-        logs[f"val/audio_{i}"] = wandb.Audio(pred_wav[i].detach().float().cpu().numpy(), sample_rate=sample_rate, caption=caption)
-    return logs
+        text = texts[i] if i < len(texts) else f"validation_example_{i}"
+        speaker_id = speaker_ids[i] if i < len(speaker_ids) else ""
+        row_index = int(row_indices[i]) if row_indices is not None else i
+        free_len = int(pred_lengths_free[i].item())
+        tf_len = int(pred_lengths_tf[i].item())
+        gt_free_len = int(target_lengths_free[i].item())
+        gt_tf_len = int(target_lengths_tf[i].item())
+        coverage = float(coverage_ratios[i]) if coverage_ratios is not None else None
+        table.add_data(
+            int(step),
+            row_index,
+            speaker_id,
+            text,
+            coverage,
+            wandb.Audio(target_wav[i, :gt_free_len].detach().float().cpu().numpy(), sample_rate=sample_rate),
+            wandb.Audio(pred_wav_free[i, :free_len].detach().float().cpu().numpy(), sample_rate=sample_rate),
+            wandb.Audio(pred_wav_tf[i, :tf_len].detach().float().cpu().numpy(), sample_rate=sample_rate),
+            gt_free_len,
+            gt_tf_len,
+            free_len,
+            tf_len,
+        )
+    return {"val/audio_table": table}
+
+
+def _wandb_run_dir(wandb_run: Any) -> Optional[Path]:
+    run_dir = getattr(wandb_run, "dir", None)
+    if not run_dir:
+        return None
+    return Path(run_dir)
+
+
+def _append_metric_csv(csv_path: Path, *, step: int, value: float) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists()
+    with csv_path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=("step", "value"))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({"step": int(step), "value": float(value)})
+
+
+def _write_wandb_metric_csvs(wandb_run: Optional[Any], logs: Dict[str, Any], *, step: int) -> None:
+    if wandb_run is None:
+        return
+    run_dir = _wandb_run_dir(wandb_run)
+    if run_dir is None:
+        return
+    for metric_name, filename in _WANDB_LOCAL_CSV_METRICS.items():
+        value = logs.get(metric_name)
+        if value is None:
+            continue
+        _append_metric_csv(run_dir / filename, step=step, value=float(value))
 
 
 def _run_validation_snapshot(
@@ -554,26 +799,72 @@ def _run_validation_snapshot(
     batch: Dict[str, Any],
     device: torch.device,
     wandb_num_samples: int,
+    step: int,
 ) -> Dict[str, Any]:
+    style_decoder_only = _style_decoder_only_active(cfg, step)
     with _temporary_eval((kmodel, gst, sv_model)):
         with torch.no_grad():
-            outputs, _ = _forward_batch_outputs(kmodel, gst, batch, device, speed=cfg.speed)
-            total, metrics, pred_wav = _compute_generator_losses(
+            outputs_free, gst_out_free = _forward_batch_outputs(
+                kmodel,
+                gst,
+                batch,
+                device,
+                speed=cfg.speed,
+                force_target_total_frames=False,
+                style_decoder_only=style_decoder_only,
+            )
+            total_free, metrics_free, pred_wav_free = _compute_generator_losses(
                 cfg=cfg,
                 mel_loss_mod=mel_loss_mod,
                 sv_model=sv_model,
-                outputs=outputs,
+                outputs=outputs_free,
                 batch=batch,
                 device=device,
+                match_teacher_forced_span=False,
             )
-    logs = {f"val/{key}": value for key, value in metrics.items()}
-    logs["val/loss_total"] = float(total.detach())
+            outputs_tf, gst_out_tf = _forward_batch_outputs(
+                kmodel,
+                gst,
+                batch,
+                device,
+                speed=cfg.speed,
+                force_target_total_frames=True,
+                style_decoder_only=style_decoder_only,
+            )
+            total_tf, metrics_tf, pred_wav_tf = _compute_generator_losses(
+                cfg=cfg,
+                mel_loss_mod=mel_loss_mod,
+                sv_model=sv_model,
+                outputs=outputs_tf,
+                batch=batch,
+                device=device,
+                match_teacher_forced_span=True,
+            )
+    pred_lengths_free = _predicted_audio_batch(outputs_free, device)[1]
+    pred_lengths_tf = _predicted_audio_batch(outputs_tf, device)[1]
+    target_lengths_free = _target_audio_lengths(batch, device)
+    target_lengths_tf = _effective_target_audio_lengths(batch, device, match_teacher_forced_span=True)
+    logs = {f"val_free/{key}": value for key, value in metrics_free.items()}
+    logs["val_free/loss_total"] = float(total_free.detach())
+    logs.update({f"val_tf/{key}": value for key, value in metrics_tf.items()})
+    logs["val_tf/loss_total"] = float(total_tf.detach())
+    logs["val_free/len_ratio"] = _mean_length_ratio(pred_lengths_free, target_lengths_free)
+    logs["val_tf/len_ratio"] = _mean_length_ratio(pred_lengths_tf, target_lengths_tf)
+    logs["val_gap/loss_mel"] = logs["val_free/loss_mel"] - logs["val_tf/loss_mel"]
+    logs["val_gap/loss_total"] = logs["val_free/loss_total"] - logs["val_tf/loss_total"]
+    logs["val_gap/len_ratio"] = logs["val_free/len_ratio"] - logs["val_tf/len_ratio"]
+    logs.update(_maybe_val_diagnostics("val_free", gst_out_free, gst))
+    logs.update(_maybe_val_diagnostics("val_tf", gst_out_tf, gst))
     logs.update(
-        _wandb_audio_logs(
-            pred_wav=pred_wav,
+        _wandb_audio_table(
+            pred_wav_free=pred_wav_free,
+            pred_wav_tf=pred_wav_tf,
+            pred_lengths_free=pred_lengths_free,
+            pred_lengths_tf=pred_lengths_tf,
             batch=batch,
             sample_rate=cfg.mel.sample_rate,
             max_items=wandb_num_samples,
+            step=step,
         )
     )
     return logs
@@ -683,7 +974,16 @@ def train_loop(
 
         with pbar_ctx as pbar:
             for batch in dataloader:
-                outputs, _ = _forward_batch_outputs(kmodel, gst, batch, device, speed=cfg.speed)
+                style_decoder_only = _style_decoder_only_active(cfg, step)
+                outputs, gst_out = _forward_batch_outputs(
+                    kmodel,
+                    gst,
+                    batch,
+                    device,
+                    speed=cfg.speed,
+                    force_target_total_frames=True,
+                    style_decoder_only=style_decoder_only,
+                )
                 with _cuda_amp_context(cfg.use_amp, batch["target_wav_24k"].to(device)):
                     total_g, metrics, pred_wav = _compute_generator_losses(
                         cfg=cfg,
@@ -692,6 +992,7 @@ def train_loop(
                         outputs=outputs,
                         batch=batch,
                         device=device,
+                        match_teacher_forced_span=True,
                     )
                 scaled_g = total_g / float(cfg.grad_accum_steps)
                 if scaler_g is not None:
@@ -717,6 +1018,7 @@ def train_loop(
 
                 if scaler_g is not None:
                     scaler_g.unscale_(opt_g)
+                grad_norm_g = _grad_norm(params_g)
                 torch.nn.utils.clip_grad_norm_(params_g, cfg.grad_clip_norm_g)
                 if scaler_g is not None:
                     scaler_g.step(opt_g)
@@ -753,9 +1055,11 @@ def train_loop(
                     pbar.update(1)
                 if wandb_run is not None:
                     train_logs = {f"train/{key}": value for key, value in metrics.items()}
+                    train_logs["train/grad_norm_g"] = grad_norm_g
                     train_logs["train/lr_g"] = float(opt_g.param_groups[0]["lr"])
-                    train_logs["train/lr_d"] = float(opt_d.param_groups[0]["lr"])
+                    train_logs.update(_maybe_train_diagnostics(gst_out, gst))
                     wandb_run.log(train_logs, step=step)
+                    _write_wandb_metric_csvs(wandb_run, train_logs, step=step)
                 if report_callback is not None:
                     report_callback(step, metrics["loss_g"])
                 if ckpt_dir is not None and step > 0 and step % cfg.checkpoint_interval == 0:
@@ -785,9 +1089,11 @@ def train_loop(
                         batch=fixed_val_batch,
                         device=device,
                         wandb_num_samples=wandb_num_samples,
+                        step=step,
                     )
                     if wandb_run is not None:
                         wandb_run.log(val_logs, step=step)
+                        _write_wandb_metric_csvs(wandb_run, val_logs, step=step)
                 if max_steps is not None and step >= max_steps:
                     if ckpt_dir is not None and cfg.save_final_checkpoint:
                         save_checkpoint(
@@ -827,6 +1133,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=None)
     p.add_argument("--disc-start-step", type=int, default=None)
     p.add_argument("--checkpoint-interval", type=int, default=None)
+    p.add_argument("--style-decoder-only-steps", type=int, default=None)
+    p.add_argument("--gst-conv-kernel-size", type=int, default=None)
+    p.add_argument("--gst-conv-stride", type=int, default=None)
+    p.add_argument("--gst-conv-padding", type=int, default=None)
+    p.add_argument("--lambda-mel", type=float, default=None)
+    p.add_argument("--lambda-spk-contrastive", type=float, default=None)
+    p.add_argument("--contrastive-temperature", type=float, default=None)
+    p.add_argument("--grad-clip-norm-g", type=float, default=None)
     p.add_argument("--save-final-checkpoint", action="store_true")
     p.add_argument("--no-save-final-checkpoint", action="store_true")
     p.add_argument("--amp", action="store_true")
@@ -849,6 +1163,22 @@ def main() -> None:
         cfg.disc_start_step = args.disc_start_step
     if args.checkpoint_interval is not None:
         cfg.checkpoint_interval = args.checkpoint_interval
+    if args.style_decoder_only_steps is not None:
+        cfg.style_decoder_only_steps = args.style_decoder_only_steps
+    if args.gst_conv_kernel_size is not None:
+        cfg.gst_conv_kernel_size = args.gst_conv_kernel_size
+    if args.gst_conv_stride is not None:
+        cfg.gst_conv_stride = args.gst_conv_stride
+    if args.gst_conv_padding is not None:
+        cfg.gst_conv_padding = args.gst_conv_padding
+    if args.lambda_mel is not None:
+        cfg.loss_weights.lambda_mel = args.lambda_mel
+    if args.lambda_spk_contrastive is not None:
+        cfg.loss_weights.lambda_spk_contrastive = args.lambda_spk_contrastive
+    if args.contrastive_temperature is not None:
+        cfg.contrastive_temperature = args.contrastive_temperature
+    if args.grad_clip_norm_g is not None:
+        cfg.grad_clip_norm_g = args.grad_clip_norm_g
     if args.amp:
         cfg.use_amp = True
     if args.save_final_checkpoint:

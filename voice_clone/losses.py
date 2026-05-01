@@ -43,6 +43,20 @@ def speaker_input_mel_from_waveform(
 
 
 class MelReconstructionLoss(nn.Module):
+    """Multi-resolution STFT loss with mel-scale magnitude warping.
+
+    Wraps `auraloss.freq.MultiResolutionSTFTLoss` (Yamamoto et al., 2019) configured
+    with `scale="mel"` so the per-resolution log-magnitude term is computed against a
+    mel-warped magnitude spectrum at each FFT size. The class name and constructor
+    keyword signature are preserved from the previous single-resolution log-mel L1
+    implementation so existing call sites (`voice_clone/train_adapters.py`) and
+    `MelLossOutput` consumers do not need to change. `n_fft / hop_length / win_length /
+    f_min / f_max` are now consumed only by the kept viz spectrogram used to populate
+    `MelLossOutput.mel_pred` / `mel_target`; the actual loss uses the multi-resolution
+    schedule below. `l1_weight` / `l2_weight` are accepted for backwards compatibility
+    but ignored: auraloss already uses an L1 distance internally.
+    """
+
     def __init__(
         self,
         *,
@@ -54,16 +68,39 @@ class MelReconstructionLoss(nn.Module):
         f_min: float = 0.0,
         f_max: Optional[float] = None,
         log_floor: float = 1e-5,
-        l1_weight: float = 1.0,
-        l2_weight: float = 0.0,
+        fft_sizes: Sequence[int] = (512, 1024, 2048),
+        hop_sizes: Sequence[int] = (50, 120, 240),
+        win_lengths: Sequence[int] = (240, 600, 1200),
+        **_unused: object,
     ) -> None:
         super().__init__()
         self.log_floor = log_floor
-        self.l1_weight = l1_weight
-        self.l2_weight = l2_weight
+        self.fft_sizes = tuple(int(x) for x in fft_sizes)
+        self.hop_sizes = tuple(int(x) for x in hop_sizes)
+        self.win_lengths = tuple(int(x) for x in win_lengths)
+        if not (len(self.fft_sizes) == len(self.hop_sizes) == len(self.win_lengths)):
+            raise ValueError(
+                "fft_sizes, hop_sizes, and win_lengths must all have the same length"
+            )
+        if int(n_mels) > min(self.fft_sizes):
+            raise ValueError(
+                f"n_mels={n_mels} must be <= smallest fft_size={min(self.fft_sizes)}"
+            )
+
+        import auraloss
         import torchaudio
 
-        self.mel = torchaudio.transforms.MelSpectrogram(
+        self.mr_stft = auraloss.freq.MultiResolutionSTFTLoss(
+            fft_sizes=list(self.fft_sizes),
+            hop_sizes=list(self.hop_sizes),
+            win_lengths=list(self.win_lengths),
+            scale="mel",
+            n_bins=int(n_mels),
+            sample_rate=int(sample_rate),
+            perceptual_weighting=False,
+        )
+
+        self.mel_viz = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
             hop_length=hop_length,
@@ -74,6 +111,21 @@ class MelReconstructionLoss(nn.Module):
             center=True,
             power=1.0,
         )
+
+    def _viz_log_mel(self, wav: torch.Tensor) -> torch.Tensor:
+        # STFT in fp16 is numerically unstable (inf/nan even on well-scaled audio),
+        # so we force fp32 here regardless of the surrounding autocast region.
+        ctx = autocast("cuda", enabled=False) if wav.is_cuda else contextlib.nullcontext()
+        with ctx:
+            mel = self.mel_viz(wav.float())
+        return torch.log(mel.clamp_min(self.log_floor))
+
+    def _mr_stft_pair(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # auraloss STFTLoss expects (batch, channels, time); waveforms are (batch, time).
+        # Force fp32 to keep the STFT + mel-warp + log path numerically stable under AMP.
+        ctx = autocast("cuda", enabled=False) if pred.is_cuda else contextlib.nullcontext()
+        with ctx:
+            return self.mr_stft(pred.float().unsqueeze(1), target.float().unsqueeze(1))
 
     def forward(
         self,
@@ -94,18 +146,16 @@ class MelReconstructionLoss(nn.Module):
                 valid = min(int(pred_lengths[i].item()), int(target_lengths[i].item()))
                 p_i = pred_wav[i : i + 1, :valid]
                 t_i = target_wav[i : i + 1, :valid]
-                mp = torch.log(self.mel(p_i).clamp_min(self.log_floor))
-                mt = torch.log(self.mel(t_i).clamp_min(self.log_floor))
-                item = self.l1_weight * (mp - mt).abs().mean() + self.l2_weight * ((mp - mt) ** 2).mean()
-                items.append(item)
+                items.append(self._mr_stft_pair(p_i, t_i))
                 if first_p is None:
-                    first_p, first_t = mp, mt
+                    first_p = self._viz_log_mel(p_i)
+                    first_t = self._viz_log_mel(t_i)
             return MelLossOutput(loss=sum(items) / len(items), mel_pred=first_p, mel_target=first_t)
 
         pred_wav, target_wav = _min_time_crop(pred_wav, target_wav)
-        mel_p = torch.log(self.mel(pred_wav).clamp_min(self.log_floor))
-        mel_t = torch.log(self.mel(target_wav).clamp_min(self.log_floor))
-        loss = self.l1_weight * (mel_p - mel_t).abs().mean() + self.l2_weight * ((mel_p - mel_t) ** 2).mean()
+        loss = self._mr_stft_pair(pred_wav, target_wav)
+        mel_p = self._viz_log_mel(pred_wav)
+        mel_t = self._viz_log_mel(target_wav)
         return MelLossOutput(loss=loss, mel_pred=mel_p, mel_target=mel_t)
 
 

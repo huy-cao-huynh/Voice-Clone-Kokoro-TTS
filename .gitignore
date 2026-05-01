@@ -28,6 +28,8 @@ ckpt/
 /kokoro/voices
 research/
 cache/
+prosody_cache/
+alignments/
 
 # ------------------------------------------------------------------------------
 # One-off or machine-local scripts (not part of shared training pipeline)
@@ -45,6 +47,12 @@ scripts/build_prosody_targets.sh
 scripts/build_phonemes.sh
 scripts/smoke_cached_train_step.py
 scripts/build_memorization_subset.py
+scripts/build_mfa_alignments.sh
+scripts/build_single_manifest_same_speaker_subset.py
+scripts/measure_teacher_forced_offset.py
+scripts/rebuild_all_caches.sh
+scripts/rebuild_minimal_memorization_cache.sh
+scripts/rebuild_minimal_memorization_cache.py
 
 # ------------------------------------------------------------------------------
 # Python

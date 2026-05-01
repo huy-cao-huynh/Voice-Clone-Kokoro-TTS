@@ -8,6 +8,7 @@ import torch
 
 def _make_mel_loss(losses_mod):
     pytest.importorskip("torchaudio", reason="MelReconstructionLoss needs torchaudio")
+    pytest.importorskip("auraloss", reason="MelReconstructionLoss needs auraloss")
     return losses_mod.MelReconstructionLoss(
         sample_rate=24_000,
         n_mels=80,
@@ -22,6 +23,23 @@ def test_mel_loss_backprops(losses_mod):
     pred = torch.randn(1, 24_000, requires_grad=True)
     target = torch.randn(1, 24_000)
     out = mel(pred, target)
+    out.loss.backward()
+    assert pred.grad is not None
+    assert pred.grad.abs().sum() > 0
+
+
+def test_mel_loss_mr_stft_finite_and_grads_flow_with_lengths(losses_mod):
+    """Multi-resolution STFT branch over the (pred_lengths, target_lengths) path."""
+    mel = _make_mel_loss(losses_mod)
+    pred = torch.randn(2, 24_000, requires_grad=True)
+    target = torch.randn(2, 24_000)
+    pred_lengths = torch.tensor([24_000, 18_000], dtype=torch.long)
+    target_lengths = torch.tensor([24_000, 20_000], dtype=torch.long)
+    out = mel(pred, target, pred_lengths=pred_lengths, target_lengths=target_lengths)
+    assert torch.isfinite(out.loss)
+    assert out.loss.item() > 0.0
+    assert out.mel_pred.shape[0] == 1
+    assert out.mel_target.shape[0] == 1
     out.loss.backward()
     assert pred.grad is not None
     assert pred.grad.abs().sum() > 0

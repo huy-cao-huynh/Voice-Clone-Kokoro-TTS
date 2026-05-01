@@ -69,6 +69,8 @@ def train_mod(monkeypatch):
         wespeaker_sample_rate: int = 16_000
         universal_style_vector_path: str = "voice_clone/universal_style_vector.pt"
         feature_cache_root: str = "cache"
+        mfa_min_coverage_ratio: float = 0.90
+        mfa_max_coverage_ratio: float = 1.10
         disable_amp_for_stft: bool = True
         gst_embed_dim: int = 1024
         loss_weights: LossWeights = field(default_factory=LossWeights)
@@ -91,7 +93,11 @@ def train_mod(monkeypatch):
         grad_accum_steps: int = 1
         disc_start_step: int = 99999999
         speed: float = 1.0
+        style_decoder_only_steps: int = 0
         gst_dropout: float = 0.0
+        gst_conv_kernel_size: int = 5
+        gst_conv_stride: int = 2
+        gst_conv_padding: int = 2
         grad_clip_norm_g: float = 5.0
         grad_clip_norm_d: float = 1.0
         lr_min_g: float = 1e-4
@@ -214,3 +220,176 @@ def test_train_loop_validates_batch_and_logging_constraints(train_mod):
         train_adapters.train_loop(object(), config_mod.TrainConfig(grad_accum_steps=0), torch.device("cpu"))
     with pytest.raises(ValueError, match="log_interval"):
         train_adapters.train_loop(object(), config_mod.TrainConfig(log_interval=0), torch.device("cpu"))
+
+
+def test_forward_batch_outputs_forces_target_total_frames(train_mod):
+    train_adapters, _config_mod, _segment_mod = train_mod
+
+    class DummyGST(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(self, ref_hidden_states, ref_frame_mask, use_universal_style_pred=False):
+            del ref_hidden_states, ref_frame_mask
+            self.calls.append(use_universal_style_pred)
+            return types.SimpleNamespace(
+                ref_s=torch.zeros(2, 256),
+                style_dec=torch.zeros(2, 128),
+                style_pred=torch.zeros(2, 128),
+                pooled_style=torch.zeros(2, 1024),
+            ), None
+
+    class DummyKModel:
+        def __init__(self):
+            self.calls = []
+
+        def forward_with_tokens(self, input_ids, ref_s, speed, gt_dur_frames=None, force_total_frames=None, return_training_outputs=False):
+            del ref_s
+            self.calls.append(
+                {
+                    "tokens": tuple(input_ids.squeeze(0).tolist()),
+                    "speed": speed,
+                    "gt_dur_frames": None if gt_dur_frames is None else tuple(gt_dur_frames.squeeze(0).tolist()),
+                    "force_total_frames": force_total_frames,
+                    "return_training_outputs": return_training_outputs,
+                }
+            )
+            frames = max(int(force_total_frames or (gt_dur_frames.sum().item() if gt_dur_frames is not None else 1)), 1)
+            return types.SimpleNamespace(
+                audio=torch.zeros(1, frames * 600),
+                duration_logits=torch.ones(1, input_ids.size(1)),
+                rounded_durations=torch.ones(1, input_ids.size(1), dtype=torch.long),
+                f0_pred=torch.zeros(1, frames),
+                n_pred=torch.zeros(1, frames),
+            )
+
+    batch = {
+        "ref_hidden_states": torch.zeros(2, 3, 4),
+        "ref_frame_mask": torch.ones(2, 3, dtype=torch.bool),
+        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 0]]),
+        "input_ids_lengths": torch.tensor([3, 2]),
+        "target_lengths": torch.tensor([24000, 12600]),
+        "gt_dur_frames": torch.tensor([[0, 5, 6], [0, 0, 0]], dtype=torch.long),
+        "prosody_enabled": torch.tensor([True, False], dtype=torch.bool),
+    }
+
+    kmodel = DummyKModel()
+    gst = DummyGST()
+    outputs, gst_out = train_adapters._forward_batch_outputs(
+        kmodel,
+        gst,
+        batch,
+        torch.device("cpu"),
+        speed=1.0,
+        force_target_total_frames=True,
+        style_decoder_only=True,
+    )
+
+    assert len(outputs) == 2
+    assert gst_out.ref_s.shape == (2, 256)
+    assert kmodel.calls[0]["gt_dur_frames"] == (0, 5, 6)
+    assert kmodel.calls[0]["force_total_frames"] is None
+    assert kmodel.calls[1]["force_total_frames"] == 21
+    assert all(call["return_training_outputs"] is True for call in kmodel.calls)
+    assert gst.calls == [True]
+
+
+def test_effective_target_audio_lengths_and_speaker_targets_follow_tf_span(train_mod):
+    train_adapters, _config_mod, _segment_mod = train_mod
+    batch = {
+        "target_lengths": torch.tensor([24000, 18000], dtype=torch.long),
+        "prosody_enabled": torch.tensor([True, False], dtype=torch.bool),
+        "gt_total_duration_samples": torch.tensor([12000, 9000], dtype=torch.long),
+        "target_wespeaker_embedding": torch.tensor([[1.0, 1.0], [2.0, 2.0]]),
+        "target_wespeaker_embedding_tf_span": torch.tensor([[3.0, 3.0], [4.0, 4.0]]),
+    }
+    tf_lengths = train_adapters._effective_target_audio_lengths(
+        batch,
+        torch.device("cpu"),
+        match_teacher_forced_span=True,
+    )
+    free_lengths = train_adapters._effective_target_audio_lengths(
+        batch,
+        torch.device("cpu"),
+        match_teacher_forced_span=False,
+    )
+    spk_targets = train_adapters._speaker_target_embeddings(
+        batch,
+        torch.device("cpu"),
+        match_teacher_forced_span=True,
+    )
+    assert tf_lengths.tolist() == [12000, 18000]
+    assert free_lengths.tolist() == [24000, 18000]
+    assert spk_targets.tolist() == [[3.0, 3.0], [2.0, 2.0]]
+
+
+def test_forward_batch_outputs_leaves_validation_free_running(train_mod):
+    train_adapters, _config_mod, _segment_mod = train_mod
+
+    class DummyGST(nn.Module):
+        def forward(self, ref_hidden_states, ref_frame_mask, use_universal_style_pred=False):
+            del ref_hidden_states, ref_frame_mask
+            assert use_universal_style_pred is False
+            return types.SimpleNamespace(
+                ref_s=torch.zeros(1, 256),
+                style_dec=torch.zeros(1, 128),
+                style_pred=torch.zeros(1, 128),
+                pooled_style=torch.zeros(1, 1024),
+            ), None
+
+    class DummyKModel:
+        def __init__(self):
+            self.force_total_frames = []
+
+        def forward_with_tokens(self, input_ids, ref_s, speed, gt_dur_frames=None, force_total_frames=None, return_training_outputs=False):
+            del input_ids, ref_s, speed, return_training_outputs
+            self.force_total_frames.append(force_total_frames)
+            assert gt_dur_frames is None
+            return types.SimpleNamespace(
+                audio=torch.zeros(1, 600),
+                duration_logits=torch.ones(1, 3),
+                rounded_durations=torch.ones(1, 3, dtype=torch.long),
+                f0_pred=torch.zeros(1, 1),
+                n_pred=torch.zeros(1, 1),
+            )
+
+    batch = {
+        "ref_hidden_states": torch.zeros(1, 3, 4),
+        "ref_frame_mask": torch.ones(1, 3, dtype=torch.bool),
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "input_ids_lengths": torch.tensor([3]),
+        "target_lengths": torch.tensor([24000]),
+    }
+
+    kmodel = DummyKModel()
+    train_adapters._forward_batch_outputs(
+        kmodel,
+        DummyGST(),
+        batch,
+        torch.device("cpu"),
+        speed=1.0,
+        force_target_total_frames=False,
+    )
+
+    assert kmodel.force_total_frames == [None]
+
+
+def test_collapse_diagnostics_detects_collapsed_batch(train_mod):
+    train_adapters, _config_mod, _segment_mod = train_mod
+    ref_s = torch.ones(3, 256)
+    metrics = train_adapters._collapse_diagnostics(ref_s, torch.zeros(256))
+    assert metrics["collapse/ref_s_std_mean"] == pytest.approx(0.0)
+    assert metrics["collapse/ref_s_pairwise_cos_mean"] == pytest.approx(1.0)
+
+
+def test_gst_projection_diagnostics_report_projection_and_prior_norms(train_mod):
+    train_adapters, _config_mod, _segment_mod = train_mod
+    gst_out = types.SimpleNamespace(
+        style_dec=torch.ones(2, 128) * 3.0,
+        style_pred=torch.ones(2, 128) * 5.0,
+    )
+    metrics = train_adapters._gst_projection_diagnostics(gst_out, torch.ones(256))
+    assert metrics["gst/proj_dec_norm_mean"] > 0.0
+    assert metrics["gst/proj_pred_norm_mean"] > metrics["gst/proj_dec_norm_mean"]
+    assert set(metrics) == {"gst/proj_dec_norm_mean", "gst/proj_pred_norm_mean"}

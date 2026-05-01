@@ -13,6 +13,7 @@ import torchaudio
 
 from kokoro.pipeline import KPipeline
 
+from .alignment import default_alignment_row_path
 from .config import kokoro_vocab_and_context_length
 from .dataset import (
     build_manifest_row_fingerprint,
@@ -21,6 +22,8 @@ from .dataset import (
     phonemes_to_input_ids,
     text_to_phonemes,
 )
+
+PROSODY_CACHE_SCHEMA_VERSION = "phase1_mfa_v2"
 
 
 def default_prosody_row_path(
@@ -60,6 +63,7 @@ def _extract_f0_targets(
     frame_time_seconds: float,
     sample_rate: int = 24_000,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    target_length = max(int(target_length), 1)
     wav = target_wav_24k.unsqueeze(0)
     f0 = torchaudio.functional.detect_pitch_frequency(
         wav,
@@ -81,6 +85,7 @@ def build_prosody_targets_for_manifest(
     *,
     kokoro_repo_id: str,
     prosody_cache_root: Path,
+    alignments_root: Optional[Path] = None,
     manifest_root: Optional[Path] = None,
     duration_steps_per_second: float = 100.0,
     strict_single_chunk: bool = True,
@@ -124,14 +129,57 @@ def build_prosody_targets_for_manifest(
                     )
                 input_ids = phonemes_to_input_ids(vocab, str(phonemes), context_length=context_length)
                 target_wav_24k = load_audio_mono(target_wav_path, target_sr=24_000).to(device)
-
-                total_duration_steps = _estimate_total_duration_steps(
-                    target_num_samples_24k=int(target_wav_24k.numel()),
-                    token_count=int(input_ids.numel()),
-                    duration_steps_per_second=float(duration_steps_per_second),
-                )
-                duration_targets = _allocate_uniform_durations(int(input_ids.numel()), total_duration_steps)
-                duration_mask = torch.ones_like(duration_targets, dtype=torch.bool)
+                alignment_payload = None
+                if alignments_root is not None:
+                    alignment_path = default_alignment_row_path(manifest_path, idx, alignments_root=alignments_root)
+                    if alignment_path.is_file():
+                        alignment_payload = torch.load(alignment_path, map_location="cpu", weights_only=False)
+                if alignment_payload is not None and bool(alignment_payload.get("prosody_enabled", False)):
+                    gt_dur_frames = torch.as_tensor(alignment_payload["gt_dur_frames"], dtype=torch.long)
+                    gt_dur_mask = torch.as_tensor(alignment_payload["gt_dur_mask"], dtype=torch.bool)
+                    if gt_dur_frames.numel() != int(input_ids.numel()):
+                        raise ValueError(
+                            f"{manifest_path}:{idx}: alignment duration length {gt_dur_frames.numel()} "
+                            f"!= input token count {int(input_ids.numel())}"
+                        )
+                    duration_targets = gt_dur_frames.to(dtype=torch.float32)
+                    duration_mask = gt_dur_mask
+                    prosody_enabled = bool(alignment_payload.get("prosody_enabled", False))
+                    alignment_status = str(alignment_payload.get("alignment_status", "unknown"))
+                    mfa_acoustic_model_id = alignment_payload.get("mfa_acoustic_model_id")
+                    mfa_lexicon_id = alignment_payload.get("mfa_lexicon_id")
+                    phoneme_set_version = alignment_payload.get("phoneme_set_version", "unknown")
+                    target_num_samples_24k = int(alignment_payload["target_num_samples_24k"])
+                    gt_total_duration_frames = int(alignment_payload["gt_total_duration_frames"])
+                    gt_total_duration_samples = int(alignment_payload["gt_total_duration_samples"])
+                    duration_coverage_ratio = float(alignment_payload["duration_coverage_ratio"])
+                    coverage_min_ratio = float(alignment_payload["coverage_min_ratio"])
+                    coverage_max_ratio = float(alignment_payload["coverage_max_ratio"])
+                    coverage_accepted = bool(alignment_payload["coverage_accepted"])
+                    coverage_rejection_reason = alignment_payload.get("coverage_rejection_reason")
+                else:
+                    total_duration_steps = _estimate_total_duration_steps(
+                        target_num_samples_24k=int(target_wav_24k.numel()),
+                        token_count=int(input_ids.numel()),
+                        duration_steps_per_second=float(duration_steps_per_second),
+                    )
+                    duration_targets = _allocate_uniform_durations(int(input_ids.numel()), total_duration_steps)
+                    duration_mask = torch.ones_like(duration_targets, dtype=torch.bool)
+                    gt_dur_frames = torch.zeros(int(input_ids.numel()), dtype=torch.long)
+                    gt_dur_mask = torch.zeros(int(input_ids.numel()), dtype=torch.bool)
+                    prosody_enabled = False
+                    alignment_status = "heuristic_fallback"
+                    mfa_acoustic_model_id = None
+                    mfa_lexicon_id = None
+                    phoneme_set_version = "heuristic_uniform_v1"
+                    target_num_samples_24k = int(target_wav_24k.numel())
+                    gt_total_duration_frames = 0
+                    gt_total_duration_samples = 0
+                    duration_coverage_ratio = 0.0
+                    coverage_min_ratio = 0.0
+                    coverage_max_ratio = 0.0
+                    coverage_accepted = False
+                    coverage_rejection_reason = "heuristic_fallback"
 
                 f0_target_length = int(duration_targets.sum().item()) * 2
                 frame_time_seconds = 1.0 / (float(duration_steps_per_second) * 2.0)
@@ -151,15 +199,32 @@ def build_prosody_targets_for_manifest(
             payload = {
                 "duration_targets": duration_targets.cpu(),
                 "duration_mask": duration_mask.cpu(),
+                "gt_dur_frames": gt_dur_frames.cpu(),
+                "gt_dur_mask": gt_dur_mask.cpu(),
+                "prosody_enabled": bool(prosody_enabled),
                 "f0_targets": f0_targets.to(dtype=torch.float16).cpu(),
                 "f0_mask": f0_mask.cpu(),
                 "manifest_fingerprint": build_manifest_row_fingerprint(row, index=idx),
                 "row_index": idx,
                 "manifest_path": str(manifest_path),
+                "prosody_cache_schema_version": PROSODY_CACHE_SCHEMA_VERSION,
                 "duration_steps_per_second": float(duration_steps_per_second),
+                "alignment_status": alignment_status,
+                "mfa_acoustic_model_id": mfa_acoustic_model_id,
+                "mfa_lexicon_id": mfa_lexicon_id,
+                "phoneme_set_version": phoneme_set_version,
+                "target_num_samples_24k": target_num_samples_24k,
+                "gt_total_duration_frames": gt_total_duration_frames,
+                "gt_total_duration_samples": gt_total_duration_samples,
+                "duration_coverage_ratio": duration_coverage_ratio,
+                "coverage_min_ratio": coverage_min_ratio,
+                "coverage_max_ratio": coverage_max_ratio,
+                "coverage_accepted": coverage_accepted,
+                "coverage_rejection_reason": coverage_rejection_reason,
                 "note": (
-                    "Duration targets are heuristically allocated uniformly across Kokoro tokens. "
-                    "Replace with forced-alignment targets for higher-quality training."
+                    "Duration targets come from MFA-backed alignments when available, "
+                    "falling back to heuristic uniform allocation for unsupported rows. "
+                    "F0 targets remain placeholder compatibility fields until explicit Phase-2 prosody supervision."
                 ),
             }
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,6 +237,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manifest-root", type=Path, default=None)
     p.add_argument("--kokoro-repo", type=str, default="hexgrad/Kokoro-82M")
     p.add_argument("--prosody-cache-root", type=Path, default=Path("prosody_cache"))
+    p.add_argument("--alignments-root", type=Path, default=None)
     p.add_argument("--duration-steps-per-second", type=float, default=100.0)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--start-index", type=int, default=0)
@@ -185,6 +251,7 @@ def main() -> None:
         args.manifest,
         kokoro_repo_id=args.kokoro_repo,
         prosody_cache_root=args.prosody_cache_root,
+        alignments_root=args.alignments_root,
         manifest_root=args.manifest_root,
         duration_steps_per_second=args.duration_steps_per_second,
         device=torch.device(args.device),

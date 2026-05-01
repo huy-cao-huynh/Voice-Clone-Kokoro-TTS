@@ -47,20 +47,66 @@ def test_cache_builder_loads_external_prosody_cache(monkeypatch, tmp_path):
     prosody_path = tmp_path / "prosody.pt"
     torch.save(
         {
+            "prosody_cache_schema_version": "phase1_mfa_v2",
             "duration_targets": torch.tensor([1.0, 2.0, 3.0]),
             "duration_mask": torch.tensor([1, 1, 0], dtype=torch.bool),
+            "gt_dur_frames": torch.tensor([0, 4, 5], dtype=torch.long),
+            "gt_dur_mask": torch.tensor([0, 1, 1], dtype=torch.bool),
+            "prosody_enabled": True,
+            "mfa_acoustic_model_id": "english_mfa",
+            "mfa_lexicon_id": "english_mfa",
+            "phoneme_set_version": "test-v1",
+            "target_num_samples_24k": 5400,
+            "gt_total_duration_frames": 9,
+            "gt_total_duration_samples": 5400,
+            "duration_coverage_ratio": 1.0,
+            "coverage_min_ratio": 0.9,
+            "coverage_max_ratio": 1.1,
+            "coverage_accepted": True,
+            "coverage_rejection_reason": None,
             "f0_targets": torch.tensor([100.0, 110.0]),
             "f0_mask": torch.tensor([1, 0], dtype=torch.bool),
         },
         prosody_path,
     )
 
-    dur, dur_mask, f0, f0_mask = cache_builder._load_row_prosody(
+    (
+        dur,
+        dur_mask,
+        f0,
+        f0_mask,
+        gt_dur,
+        prosody_enabled,
+        acoustic_model,
+        lexicon_id,
+        phoneme_set_version,
+        target_num_samples_24k,
+        gt_total_duration_frames,
+        gt_total_duration_samples,
+        duration_coverage_ratio,
+        coverage_min_ratio,
+        coverage_max_ratio,
+        coverage_accepted,
+        coverage_rejection_reason,
+    ) = cache_builder._load_row_prosody(
         {"text": "hello"},
         token_count=3,
         prosody_cache_path=prosody_path,
     )
     assert dur.tolist() == [1.0, 2.0, 3.0]
     assert dur_mask.tolist() == [True, True, False]
+    assert gt_dur.tolist() == [0, 4, 5]
+    assert prosody_enabled is True
+    assert acoustic_model == "english_mfa"
+    assert lexicon_id == "english_mfa"
+    assert phoneme_set_version == "test-v1"
+    assert target_num_samples_24k == 5400
+    assert gt_total_duration_frames == 9
+    assert gt_total_duration_samples == 5400
+    assert duration_coverage_ratio == 1.0
+    assert coverage_min_ratio == 0.9
+    assert coverage_max_ratio == 1.1
+    assert coverage_accepted is True
+    assert coverage_rejection_reason is None
     assert f0.tolist() == [100.0, 110.0]
     assert f0_mask.tolist() == [True, False]

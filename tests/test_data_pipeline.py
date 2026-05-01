@@ -120,10 +120,22 @@ def test_dataset_loads_cache_and_collate_pads(dataset_mod, tmp_path):
             "ref_hidden_states": torch.randn(5, 768),
             "ref_frame_mask": torch.tensor([1, 1, 1, 0, 0], dtype=torch.bool),
             "target_wespeaker_embedding": torch.randn(256),
+            "target_wespeaker_embedding_tf_span": torch.randn(256),
             "duration_targets": torch.tensor([1.0, 2.0, 3.0, 4.0]),
             "duration_mask": torch.tensor([1, 1, 1, 1], dtype=torch.bool),
+            "gt_dur_frames": torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            "prosody_enabled": True,
+            "target_num_samples_24k": 7000,
+            "gt_total_duration_frames": 6,
+            "gt_total_duration_samples": 3600,
+            "duration_coverage_ratio": 0.95,
+            "coverage_min_ratio": 0.9,
+            "coverage_max_ratio": 1.1,
+            "coverage_accepted": True,
+            "coverage_rejection_reason": None,
             "f0_targets": torch.tensor([100.0, 101.0, 102.0]),
             "f0_mask": torch.tensor([1, 1, 0], dtype=torch.bool),
+            "feature_cache_schema_version": "phase1_mfa_v2",
             "manifest_fingerprint": fingerprint,
         },
         cache_root=tmp_path / "cache",
@@ -140,9 +152,13 @@ def test_dataset_loads_cache_and_collate_pads(dataset_mod, tmp_path):
     sample = dataset[0]
     batch = ds.collate_voice_clone_batch([sample, sample])
     assert sample["target_wespeaker_embedding"].shape == (256,)
+    assert sample["target_wespeaker_embedding_tf_span"].shape == (256,)
     assert batch["ref_hidden_states"].shape == (2, 5, 768)
     assert batch["target_wespeaker_embedding"].shape == (2, 256)
+    assert batch["target_wespeaker_embedding_tf_span"].shape == (2, 256)
     assert batch["duration_mask"].dtype is torch.bool
+    assert batch["gt_dur_frames"].shape == (2, 4)
+    assert batch["prosody_enabled"].tolist() == [True, True]
 
 
 def test_dataset_rejects_stale_cache(dataset_mod, tmp_path):
@@ -163,10 +179,22 @@ def test_dataset_rejects_stale_cache(dataset_mod, tmp_path):
             "ref_hidden_states": torch.randn(5, 768),
             "ref_frame_mask": torch.ones(5, dtype=torch.bool),
             "target_wespeaker_embedding": torch.randn(256),
+            "target_wespeaker_embedding_tf_span": torch.randn(256),
             "duration_targets": torch.ones(4),
             "duration_mask": torch.ones(4, dtype=torch.bool),
+            "gt_dur_frames": torch.ones(4, dtype=torch.long),
+            "prosody_enabled": False,
+            "target_num_samples_24k": 7000,
+            "gt_total_duration_frames": 0,
+            "gt_total_duration_samples": 0,
+            "duration_coverage_ratio": 0.0,
+            "coverage_min_ratio": 0.9,
+            "coverage_max_ratio": 1.1,
+            "coverage_accepted": False,
+            "coverage_rejection_reason": "heuristic_fallback",
             "f0_targets": torch.ones(3),
             "f0_mask": torch.ones(3, dtype=torch.bool),
+            "feature_cache_schema_version": "phase1_mfa_v2",
             "manifest_fingerprint": "stale",
         },
         cache_root=tmp_path / "cache",
@@ -203,6 +231,44 @@ def test_dataset_rejects_missing_cache(dataset_mod, tmp_path):
         )
 
 
+def test_dataset_rejects_legacy_cache_schema_with_rebuild_hint(dataset_mod, tmp_path):
+    ds, harness = dataset_mod
+    row = _row()
+    ref_path = tmp_path / "clips" / "ref.wav"
+    tgt_path = tmp_path / "clips" / "target.wav"
+    _touch(ref_path)
+    _touch(tgt_path)
+    harness.audio_by_path[str(ref_path)] = (np.ones(6_000, dtype=np.float32), 16_000)
+    harness.audio_by_path[str(tgt_path)] = (np.ones(7_000, dtype=np.float32), 24_000)
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", row)
+    fingerprint = ds.build_manifest_row_fingerprint(row, index=0)
+    _write_cache(
+        ds,
+        manifest,
+        0,
+        {
+            "ref_hidden_states": torch.randn(5, 768),
+            "ref_frame_mask": torch.ones(5, dtype=torch.bool),
+            "target_wespeaker_embedding": torch.randn(256),
+            "duration_targets": torch.ones(4),
+            "duration_mask": torch.ones(4, dtype=torch.bool),
+            "f0_targets": torch.ones(3),
+            "f0_mask": torch.ones(3, dtype=torch.bool),
+            "manifest_fingerprint": fingerprint,
+        },
+        cache_root=tmp_path / "cache",
+    )
+    with pytest.raises(ValueError, match="legacy cache schema"):
+        ds.VoiceCloneManifestDataset(
+            manifest,
+            kokoro_repo_id="repo",
+            vocab={"a": 1, "b": 2},
+            context_length=8,
+            manifest_root=tmp_path,
+            feature_cache_root=tmp_path / "cache",
+        )
+
+
 def test_dataset_max_rows_limits_startup_scan(dataset_mod, tmp_path):
     ds, harness = dataset_mod
     row = _row()
@@ -224,18 +290,30 @@ def test_dataset_max_rows_limits_startup_scan(dataset_mod, tmp_path):
             ds,
             manifest,
             idx,
-            {
-                "ref_hidden_states": torch.randn(5, 768),
-                "ref_frame_mask": torch.ones(5, dtype=torch.bool),
-                "target_wespeaker_embedding": torch.randn(256),
-                "duration_targets": torch.ones(4),
-                "duration_mask": torch.ones(4, dtype=torch.bool),
-                "f0_targets": torch.ones(3),
-                "f0_mask": torch.ones(3, dtype=torch.bool),
-                "manifest_fingerprint": fingerprint,
-            },
-            cache_root=tmp_path / "cache",
-        )
+                {
+                    "ref_hidden_states": torch.randn(5, 768),
+                    "ref_frame_mask": torch.ones(5, dtype=torch.bool),
+                    "target_wespeaker_embedding": torch.randn(256),
+                    "target_wespeaker_embedding_tf_span": torch.randn(256),
+                    "duration_targets": torch.ones(4),
+                    "duration_mask": torch.ones(4, dtype=torch.bool),
+                    "gt_dur_frames": torch.ones(4, dtype=torch.long),
+                    "prosody_enabled": False,
+                    "target_num_samples_24k": 7000,
+                    "gt_total_duration_frames": 0,
+                    "gt_total_duration_samples": 0,
+                    "duration_coverage_ratio": 0.0,
+                    "coverage_min_ratio": 0.9,
+                    "coverage_max_ratio": 1.1,
+                    "coverage_accepted": False,
+                    "coverage_rejection_reason": "heuristic_fallback",
+                    "f0_targets": torch.ones(3),
+                    "f0_mask": torch.ones(3, dtype=torch.bool),
+                    "feature_cache_schema_version": "phase1_mfa_v2",
+                    "manifest_fingerprint": fingerprint,
+                },
+                cache_root=tmp_path / "cache",
+            )
 
     dataset = ds.VoiceCloneManifestDataset(
         manifest,

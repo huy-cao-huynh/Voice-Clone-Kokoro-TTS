@@ -27,6 +27,10 @@ from .mhubert_encoder import MHuBERTEncoder
 from .wespeaker_sv import WeSpeakerSV
 from kokoro.pipeline import KPipeline
 
+FEATURE_CACHE_SCHEMA_VERSION = "phase1_mfa_v2"
+PROSODY_CACHE_SCHEMA_VERSION = "phase1_mfa_v2"
+_KOKORO_DURATION_FRAME_SAMPLES_16K = 400
+
 
 def _tensor_1d(values: Any, *, name: str) -> torch.Tensor:
     t = torch.as_tensor(values, dtype=torch.float32)
@@ -49,31 +53,148 @@ def _load_row_prosody(
     *,
     token_count: int,
     prosody_cache_path: Optional[Path] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    bool,
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    int,
+    int,
+    int,
+    float,
+    float,
+    float,
+    bool,
+    Optional[str],
+]:
     if row.get("duration_targets") is not None and row.get("f0_targets") is not None:
+        required_keys = {
+            "prosody_cache_schema_version",
+            "duration_targets",
+            "duration_mask",
+            "gt_dur_frames",
+            "gt_dur_mask",
+            "prosody_enabled",
+            "f0_targets",
+            "f0_mask",
+            "mfa_acoustic_model_id",
+            "mfa_lexicon_id",
+            "phoneme_set_version",
+            "target_num_samples_24k",
+            "gt_total_duration_frames",
+            "gt_total_duration_samples",
+            "duration_coverage_ratio",
+            "coverage_min_ratio",
+            "coverage_max_ratio",
+            "coverage_accepted",
+            "coverage_rejection_reason",
+        }
+        nullable_keys = {"coverage_rejection_reason"}
+        missing = sorted(k for k in required_keys if k not in row or (k not in nullable_keys and row.get(k) is None))
+        if missing:
+            raise ValueError(
+                "Embedded prosody row is missing required keys: "
+                f"{missing}. Rebuild prosody_cache and feature cache with the current Phase-1 pipeline."
+            )
         payload = {
+            "prosody_cache_schema_version": row["prosody_cache_schema_version"],
             "duration_targets": row["duration_targets"],
-            "duration_mask": None,
+            "duration_mask": row["duration_mask"],
+            "gt_dur_frames": row["gt_dur_frames"],
+            "gt_dur_mask": row["gt_dur_mask"],
+            "prosody_enabled": row["prosody_enabled"],
             "f0_targets": row["f0_targets"],
-            "f0_mask": None,
+            "f0_mask": row["f0_mask"],
+            "mfa_acoustic_model_id": row["mfa_acoustic_model_id"],
+            "mfa_lexicon_id": row["mfa_lexicon_id"],
+            "phoneme_set_version": row["phoneme_set_version"],
+            "target_num_samples_24k": row["target_num_samples_24k"],
+            "gt_total_duration_frames": row["gt_total_duration_frames"],
+            "gt_total_duration_samples": row["gt_total_duration_samples"],
+            "duration_coverage_ratio": row["duration_coverage_ratio"],
+            "coverage_min_ratio": row["coverage_min_ratio"],
+            "coverage_max_ratio": row["coverage_max_ratio"],
+            "coverage_accepted": row["coverage_accepted"],
+            "coverage_rejection_reason": row["coverage_rejection_reason"],
         }
     else:
         if prosody_cache_path is None:
             raise ValueError("Prosody cache path is required when duration_targets/f0_targets are not embedded in the manifest.")
         payload = torch.load(prosody_cache_path, map_location="cpu", weights_only=False)
+    schema_version = payload.get("prosody_cache_schema_version")
+    if schema_version != PROSODY_CACHE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Prosody cache schema mismatch: expected {PROSODY_CACHE_SCHEMA_VERSION!r}, got {schema_version!r}. "
+            "Rebuild alignments, prosody_cache, and cache with the current Phase-1 pipeline."
+        )
     dur = _tensor_1d(payload["duration_targets"], name="duration_targets")
     if dur.numel() != token_count:
         raise ValueError(f"duration_targets length {dur.numel()} != input token count {token_count}")
-    dur_mask = payload.get("duration_mask")
-    dur_mask = torch.ones_like(dur, dtype=torch.bool) if dur_mask is None else torch.as_tensor(dur_mask, dtype=torch.bool)
+    if payload.get("duration_mask") is None:
+        raise ValueError(
+            "Prosody cache row is missing required key: 'duration_mask'. "
+            "Rebuild alignments, prosody_cache, and cache with the current Phase-1 pipeline."
+        )
+    dur_mask = torch.as_tensor(payload["duration_mask"], dtype=torch.bool)
     if dur_mask.shape != dur.shape:
         raise ValueError(f"duration_mask shape {tuple(dur_mask.shape)} != duration_targets shape {tuple(dur.shape)}")
+    missing_payload_keys = sorted(
+        k
+        for k in ("gt_dur_frames", "gt_dur_mask", "prosody_enabled")
+        if payload.get(k) is None
+    )
+    if missing_payload_keys:
+        raise ValueError(
+            f"Prosody cache row is missing required keys: {missing_payload_keys}. "
+            "Rebuild alignments, prosody_cache, and cache with the current Phase-1 pipeline."
+        )
+    gt_dur = torch.as_tensor(payload["gt_dur_frames"], dtype=torch.long)
+    if gt_dur.numel() != token_count:
+        raise ValueError(f"gt_dur_frames length {gt_dur.numel()} != input token count {token_count}")
+    gt_dur_mask = torch.as_tensor(payload["gt_dur_mask"], dtype=torch.bool)
+    if gt_dur_mask.shape != gt_dur.shape:
+        raise ValueError(f"gt_dur_mask shape {tuple(gt_dur_mask.shape)} != gt_dur_frames shape {tuple(gt_dur.shape)}")
     f0 = _tensor_1d(payload["f0_targets"], name="f0_targets")
-    f0_mask = payload.get("f0_mask")
-    f0_mask = torch.ones_like(f0, dtype=torch.bool) if f0_mask is None else torch.as_tensor(f0_mask, dtype=torch.bool)
+    if payload.get("f0_mask") is None:
+        raise ValueError(
+            "Prosody cache row is missing required key: 'f0_mask'. "
+            "Rebuild alignments, prosody_cache, and cache with the current Phase-1 pipeline."
+        )
+    f0_mask = torch.as_tensor(payload["f0_mask"], dtype=torch.bool)
     if f0_mask.shape != f0.shape:
         raise ValueError(f"f0_mask shape {tuple(f0_mask.shape)} != f0_targets shape {tuple(f0.shape)}")
-    return dur, dur_mask, f0, f0_mask
+    target_num_samples_24k = int(payload["target_num_samples_24k"])
+    gt_total_duration_frames = int(payload["gt_total_duration_frames"])
+    gt_total_duration_samples = int(payload["gt_total_duration_samples"])
+    duration_coverage_ratio = float(payload["duration_coverage_ratio"])
+    coverage_min_ratio = float(payload["coverage_min_ratio"])
+    coverage_max_ratio = float(payload["coverage_max_ratio"])
+    coverage_accepted = bool(payload["coverage_accepted"])
+    coverage_rejection_reason = payload.get("coverage_rejection_reason")
+    return (
+        dur,
+        dur_mask,
+        f0,
+        f0_mask,
+        gt_dur,
+        bool(payload.get("prosody_enabled", False)),
+        payload.get("mfa_acoustic_model_id"),
+        payload.get("mfa_lexicon_id"),
+        payload.get("phoneme_set_version"),
+        target_num_samples_24k,
+        gt_total_duration_frames,
+        gt_total_duration_samples,
+        duration_coverage_ratio,
+        coverage_min_ratio,
+        coverage_max_ratio,
+        coverage_accepted,
+        coverage_rejection_reason,
+    )
 
 
 def _resolve_audio_path(path_value: str, *, manifest_root: Path) -> Path:
@@ -139,21 +260,58 @@ def _prepare_cache_item(
     prosody_path = None
     if prosody_cache_root is not None:
         prosody_path = default_prosody_row_path(manifest_path, idx, prosody_cache_root=prosody_cache_root)
-    duration_targets, duration_mask, f0_targets, f0_mask = _load_row_prosody(
+    (
+        duration_targets,
+        duration_mask,
+        f0_targets,
+        f0_mask,
+        gt_dur_frames,
+        prosody_enabled,
+        mfa_acoustic_model_id,
+        mfa_lexicon_id,
+        phoneme_set_version,
+        target_num_samples_24k,
+        gt_total_duration_frames,
+        gt_total_duration_samples,
+        duration_coverage_ratio,
+        coverage_min_ratio,
+        coverage_max_ratio,
+        coverage_accepted,
+        coverage_rejection_reason,
+    ) = _load_row_prosody(
         row,
         token_count=int(input_ids.numel()),
         prosody_cache_path=prosody_path,
+    )
+    tgt_wav_16k = load_audio_mono(tgt_path, target_sr=16_000)
+    teacher_forced_target_samples_16k = min(
+        int(tgt_wav_16k.numel()),
+        int(gt_total_duration_frames * _KOKORO_DURATION_FRAME_SAMPLES_16K),
     )
     return {
         "idx": idx,
         "row": row,
         "cache_path": cache_path,
         "ref_wav": load_audio_mono(ref_path, target_sr=16_000),
-        "tgt_wav": load_audio_mono(tgt_path, target_sr=16_000),
+        "tgt_wav": tgt_wav_16k,
         "duration_targets": duration_targets,
         "duration_mask": duration_mask,
+        "gt_dur_frames": gt_dur_frames,
+        "prosody_enabled": prosody_enabled,
+        "mfa_acoustic_model_id": mfa_acoustic_model_id,
+        "mfa_lexicon_id": mfa_lexicon_id,
+        "phoneme_set_version": phoneme_set_version,
         "f0_targets": f0_targets,
         "f0_mask": f0_mask,
+        "target_num_samples_24k": target_num_samples_24k,
+        "gt_total_duration_frames": gt_total_duration_frames,
+        "gt_total_duration_samples": gt_total_duration_samples,
+        "duration_coverage_ratio": duration_coverage_ratio,
+        "coverage_min_ratio": coverage_min_ratio,
+        "coverage_max_ratio": coverage_max_ratio,
+        "coverage_accepted": coverage_accepted,
+        "coverage_rejection_reason": coverage_rejection_reason,
+        "teacher_forced_target_samples_16k": teacher_forced_target_samples_16k,
     }
 
 
@@ -346,6 +504,13 @@ def _flush_feature_cache_batch(
     ref_batch, ref_lengths = _pad_waveforms([item["ref_wav"] for item in batch_items], device=model_device)
     ref_attn = torch.arange(ref_batch.size(1), device=model_device).unsqueeze(0) < ref_lengths.unsqueeze(1)
     tgt_batch, tgt_lengths = _pad_waveforms([item["tgt_wav"] for item in batch_items], device=model_device)
+    span_rows = [
+        item["tgt_wav"][: max(int(item["teacher_forced_target_samples_16k"]), 1)]
+        if bool(item["prosody_enabled"])
+        else item["tgt_wav"]
+        for item in batch_items
+    ]
+    tgt_span_batch, tgt_span_lengths = _pad_waveforms(span_rows, device=model_device)
 
     encode_start = time.perf_counter()
     amp_ctx = (
@@ -363,6 +528,13 @@ def _flush_feature_cache_batch(
                 grad_through_input=False,
                 return_frame_features=False,
             ).pooled_embedding.detach()
+            tgt_embed_tf = wespeaker(
+                tgt_span_batch,
+                sampling_rate=wespeaker.sample_rate,
+                waveform_lengths=tgt_span_lengths,
+                grad_through_input=False,
+                return_frame_features=False,
+            ).pooled_embedding.detach()
     encode_s = time.perf_counter() - encode_start
 
     frame_lengths = ref_out.frame_mask.sum(dim=1).tolist()
@@ -373,10 +545,25 @@ def _flush_feature_cache_batch(
             "ref_hidden_states": ref_out.hidden_states[i, :n_frames].detach().to(dtype=torch.float16).cpu(),
             "ref_frame_mask": ref_out.frame_mask[i, :n_frames].detach().bool().cpu(),
             "target_wespeaker_embedding": tgt_embed[i].to(dtype=torch.float16).cpu(),
+            "target_wespeaker_embedding_tf_span": tgt_embed_tf[i].to(dtype=torch.float16).cpu(),
             "duration_targets": item["duration_targets"].cpu(),
             "duration_mask": item["duration_mask"].cpu(),
+            "gt_dur_frames": item["gt_dur_frames"].cpu(),
+            "prosody_enabled": bool(item["prosody_enabled"]),
+            "mfa_acoustic_model_id": item["mfa_acoustic_model_id"],
+            "mfa_lexicon_id": item["mfa_lexicon_id"],
+            "phoneme_set_version": item["phoneme_set_version"],
+            "target_num_samples_24k": item["target_num_samples_24k"],
+            "gt_total_duration_frames": item["gt_total_duration_frames"],
+            "gt_total_duration_samples": item["gt_total_duration_samples"],
+            "duration_coverage_ratio": item["duration_coverage_ratio"],
+            "coverage_min_ratio": item["coverage_min_ratio"],
+            "coverage_max_ratio": item["coverage_max_ratio"],
+            "coverage_accepted": bool(item["coverage_accepted"]),
+            "coverage_rejection_reason": item["coverage_rejection_reason"],
             "f0_targets": item["f0_targets"].to(dtype=torch.float16).cpu(),
             "f0_mask": item["f0_mask"].cpu(),
+            "feature_cache_schema_version": FEATURE_CACHE_SCHEMA_VERSION,
             "manifest_fingerprint": build_manifest_row_fingerprint(item["row"], index=item["idx"]),
             "row_index": item["idx"],
             "manifest_path": str(manifest_path),

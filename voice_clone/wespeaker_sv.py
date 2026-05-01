@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import yaml
 from unittest import mock
@@ -13,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+from torch.amp import autocast
 
 # Prevent crash from s3prl calling removed torchaudio backend function
 if not hasattr(torchaudio, "set_audio_backend"):
@@ -340,22 +342,28 @@ class WeSpeakerSV(nn.Module):
         return_frame_features: bool = True,
     ) -> WeSpeakerSVOutput:
         wav, wav_lengths = self._prepare_waveforms(waveforms, waveform_lengths=waveform_lengths)
-        if sampling_rate != self.sample_rate:
-            # Differentiable resampling for generated waveforms.
-            wav = torchaudio.functional.resample(
-                wav,
-                orig_freq=sampling_rate,
-                new_freq=self.sample_rate,
-            )
-            wav_lengths = self._resampled_lengths(
-                wav_lengths,
-                orig_freq=sampling_rate,
-                new_freq=self.sample_rate,
-                max_len=int(wav.size(-1)),
-            )
-
-        mel = self._waveforms_to_mel(wav)
-        mel_lengths = self._waveform_lengths_to_mel_lengths(wav_lengths, max_frames=int(mel.size(-1)))
+        # The resample + STFT/mel/dB pipeline is numerically unstable in fp16
+        # (torch.stft falls back to ComplexHalf which routinely produces inf/NaN
+        # in stored activations and corrupts backward gradients). Force fp32
+        # through this preprocessing block regardless of the surrounding autocast.
+        amp_off = autocast("cuda", enabled=False) if wav.is_cuda else contextlib.nullcontext()
+        with amp_off:
+            wav_fp32 = wav.float()
+            if sampling_rate != self.sample_rate:
+                # Differentiable resampling for generated waveforms.
+                wav_fp32 = torchaudio.functional.resample(
+                    wav_fp32,
+                    orig_freq=sampling_rate,
+                    new_freq=self.sample_rate,
+                )
+                wav_lengths = self._resampled_lengths(
+                    wav_lengths,
+                    orig_freq=sampling_rate,
+                    new_freq=self.sample_rate,
+                    max_len=int(wav_fp32.size(-1)),
+                )
+            mel = self._waveforms_to_mel(wav_fp32)
+            mel_lengths = self._waveform_lengths_to_mel_lengths(wav_lengths, max_frames=int(mel.size(-1)))
         return self.forward_from_mel(
             mel,
             frame_lengths=mel_lengths,
