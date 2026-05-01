@@ -447,6 +447,42 @@ def _gst_projection_diagnostics(gst_out: Any, universal_style_vector: torch.Tens
     }
 
 
+def _gst_internals_diagnostics(
+    pooled_style: torch.Tensor,
+    style_dec: torch.Tensor,
+    style_pred: torch.Tensor,
+) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    metrics["gst/pooled_style_norm_mean"] = float(pooled_style.norm(dim=-1).mean().detach())
+    if pooled_style.size(0) >= 2:
+        def _offdiag_cos_mean(x: torch.Tensor) -> float:
+            sim = torch.nn.functional.cosine_similarity(x[:, None, :], x[None, :, :], dim=-1)
+            mask = ~torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
+            return float(sim[mask].mean().detach())
+        metrics["gst/pooled_style_pairwise_cos_mean"] = _offdiag_cos_mean(pooled_style)
+        metrics["gst/style_dec_pairwise_cos_mean"] = _offdiag_cos_mean(style_dec)
+        metrics["gst/style_pred_pairwise_cos_mean"] = _offdiag_cos_mean(style_pred)
+    return metrics
+
+
+def _gst_attn_diagnostics(attn_weights: torch.Tensor) -> Dict[str, float]:
+    # attn_weights: (B, T_query, num_bases), softmax output from MHA with average_attn_weights=True
+    metrics: Dict[str, float] = {}
+    eps = 1e-8
+    entropy = -(attn_weights * (attn_weights + eps).log()).sum(dim=-1).mean()
+    metrics["gst/attn_entropy_mean"] = float(entropy.detach())
+    b = attn_weights.size(0)
+    top1 = attn_weights.argmax(dim=-1)  # (B, T_query)
+    modal_per_item: List[int] = []
+    for i in range(b):
+        vals, cnts = top1[i].unique(return_counts=True)
+        modal_per_item.append(int(vals[cnts.argmax()].item()))
+    modal_tensor = torch.tensor(modal_per_item, dtype=torch.long)
+    _, modal_counts = modal_tensor.unique(return_counts=True)
+    metrics["gst/attn_top1_index_mode_count"] = float(int(modal_counts.max().item()))
+    return metrics
+
+
 def _forward_batch_outputs(
     kmodel: KModel,
     gst: SegmentGST,
@@ -462,9 +498,10 @@ def _forward_batch_outputs(
     input_ids = batch["input_ids"].to(device)
     input_ids_lengths = batch["input_ids_lengths"].to(device)
     target_lengths = batch["target_lengths"].to(device)
-    gst_out, _ = gst(
+    gst_out = gst(
         ref_hidden_states,
         ref_frame_mask,
+        need_weights=True,
         use_universal_style_pred=style_decoder_only,
     )
     outputs: List[KModel.TrainingOutputs] = []
@@ -613,6 +650,11 @@ def _maybe_train_diagnostics(gst_out: Any, gst: SegmentGST) -> Dict[str, float]:
     logs = {f"train/{key}": value for key, value in _collapse_diagnostics(gst_out.ref_s.detach(), gst.universal_style_vector).items()}
     if hasattr(gst_out, "pooled_style") and hasattr(gst_out, "style_dec") and hasattr(gst_out, "style_pred"):
         logs.update({f"train/{key}": value for key, value in _gst_projection_diagnostics(gst_out, gst.universal_style_vector).items()})
+        logs.update({f"train/{key}": value for key, value in _gst_internals_diagnostics(
+            gst_out.pooled_style.detach(), gst_out.style_dec.detach(), gst_out.style_pred.detach()
+        ).items()})
+    if hasattr(gst_out, "attn_weights") and gst_out.attn_weights is not None:
+        logs.update({f"train/{key}": value for key, value in _gst_attn_diagnostics(gst_out.attn_weights.detach()).items()})
     return logs
 
 
@@ -622,6 +664,12 @@ def _maybe_val_diagnostics(prefix: str, gst_out: Any, gst: SegmentGST) -> Dict[s
     logs = {f"{prefix}/{key}": value for key, value in _collapse_diagnostics(gst_out.ref_s, gst.universal_style_vector).items()}
     if prefix == "val_tf" and hasattr(gst_out, "pooled_style") and hasattr(gst_out, "style_dec") and hasattr(gst_out, "style_pred"):
         logs.update({f"{prefix}/{key}": value for key, value in _gst_projection_diagnostics(gst_out, gst.universal_style_vector).items()})
+    if hasattr(gst_out, "pooled_style") and hasattr(gst_out, "style_dec") and hasattr(gst_out, "style_pred"):
+        logs.update({f"{prefix}/{key}": value for key, value in _gst_internals_diagnostics(
+            gst_out.pooled_style, gst_out.style_dec, gst_out.style_pred
+        ).items()})
+    if hasattr(gst_out, "attn_weights") and gst_out.attn_weights is not None:
+        logs.update({f"{prefix}/{key}": value for key, value in _gst_attn_diagnostics(gst_out.attn_weights).items()})
     return logs
 
 

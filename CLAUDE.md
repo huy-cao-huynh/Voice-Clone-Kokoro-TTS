@@ -183,11 +183,15 @@ Read together: low std + high pairwise cos = style collapse; `delta_norm_mean �
 
 Empirical collapse thresholds (from 2026-04-29 failure): `pairwise_cos_mean > 0.5` = significant collapse; `> 0.8` = severe/audio-degrading. `delta_norm_mean > 5` with growing `proj_*_norm_mean` = unbounded residual growth, usually accompanied by gradient explosion.
 
-**GST projection diagnostics:**
-- `gst/proj_dec_norm_mean`
-- `gst/proj_pred_norm_mean`
-
-L2 norms of `Δ_dec` and `Δ_pred`. Runaway growth during warmup usually means LR is too high or `style_decoder_only_steps` is needed.
+**GST internal diagnostics:**
+- `gst/proj_dec_norm_mean` — L2 norm of `Δ_dec = to_style_dec(pooled)`. Runaway growth means LR is too high or `style_decoder_only_steps` is needed.
+- `gst/pred_norm_mean` — L2 norm of `Δ_pred = to_style_pred(pooled)`. Zero during the `style_decoder_only_steps` window (expected); rapid growth after unlock is a warning sign.
+- `gst/pooled_style_norm_mean` — L2 norm of the aggregated pooled style vector; growing norm indicates the bank is being pushed to larger magnitude by the mel reconstruction gradient.
+- `gst/pooled_style_pairwise_cos_mean` — key collapse localization metric. High (> 0.5) → aggregation itself is collapsing; combined with low `collapse/ref_s_pairwise_cos_mean` → projection layer collapse. Compare against `collapse/ref_s_pairwise_cos_mean` using the decision table in `experiment_notebook.md`.
+- `gst/style_dec_pairwise_cos_mean` — pairwise cosine of `style_dec` across the batch; tracks dec-branch collapse independently.
+- `gst/style_pred_pairwise_cos_mean` — pairwise cosine of `style_pred` across the batch. Value of 1.0 during `style_decoder_only_steps` is expected (all rows receive the same universal prior). Rapid rebound toward 1.0 after unlock = pred branch collapse.
+- `gst/attn_entropy_mean` — entropy of the attention weight distribution over the bank. Maximum is log(num_bases) = log(1024) ≈ 6.931. Near-maximum throughout = **query diffusion** (all utterances produce near-uniform attention → all get `pooled_style ≈ mean(bank)`, regardless of speaker). Very low entropy = bank collapse (same few bases dominate all utterances). Meaningful attention sharpening should be visible as entropy declining noticeably below log(num_bases).
+- `gst/attn_top1_index_mode_count` — number of batch items that share the same top-1 bank basis in a given step. High count with low entropy = bank collapse. With near-uniform attention (entropy ≈ log(1024)), this metric is noisy and secondary.
 
 **Validation media:**
 - `val/audio_table`: step, row_index, speaker_id, text, coverage_ratio, gt_audio, pred_audio_free, pred_audio_tf
@@ -223,7 +227,7 @@ See `architecture.md` for the full stack description and `voice_clone/segment_gs
 ### Loss Components (`voice_clone/losses.py`)
 
 - `MelReconstructionLoss`: Multi-resolution STFT with mel-warped magnitude via `auraloss`. STFT is **forced to fp32** regardless of AMP — fp16 STFT is numerically unstable on ROCm/CUDA.
-- `speaker_contrastive_loss`: InfoNCE, temperature 0.07. **Requires batch ≥ 2.**
+- `speaker_contrastive_loss`: InfoNCE, temperature from `contrastive_temperature` config (default 0.1). **Requires batch ≥ 2.**
 - `duration_loss_log_space`: MSE in `log1p` space. Active only when `lambda_dur > 0` and `prosody_enabled=True`.
 - `masked_l1_loss` (F0): **Not production-ready** — F0 targets are placeholder quality. Keep `lambda_f0 = 0`.
 - GAN losses: dormant until `disc_start_step` is reached.

@@ -12,7 +12,7 @@ def test_ref_s_stays_close_to_universal_style_at_init(segment_gst_mod):
     u = torch.linspace(-1.0, 1.0, 256)
     torch.manual_seed(0)
     gst = segment_gst_mod.SegmentGST(universal_style_vector=u)
-    out, _ = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T))
+    out = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T))
     delta = out.ref_s - u.unsqueeze(0)
     assert float(delta.norm(dim=-1).mean()) < 10.0
 
@@ -30,7 +30,7 @@ def test_split_heads_small_normal_initialized(segment_gst_mod):
 
 def test_decoder_head_only_receives_decoder_loss_grad(segment_gst_mod):
     gst = segment_gst_mod.SegmentGST()
-    out, _ = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T))
+    out = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T))
     out.style_dec.sum().backward()
     assert gst.to_style_dec.weight.grad is not None
     assert gst.to_style_dec.weight.grad.abs().sum() > 0
@@ -39,7 +39,7 @@ def test_decoder_head_only_receives_decoder_loss_grad(segment_gst_mod):
 
 def test_prosody_head_only_receives_prosody_loss_grad(segment_gst_mod):
     gst = segment_gst_mod.SegmentGST()
-    out, _ = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T))
+    out = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T))
     out.style_pred.sum().backward()
     assert gst.to_style_pred.weight.grad is not None
     assert gst.to_style_pred.weight.grad.abs().sum() > 0
@@ -49,3 +49,25 @@ def test_prosody_head_only_receives_prosody_loss_grad(segment_gst_mod):
 def test_rejects_invalid_universal_vector_length(segment_gst_mod):
     with pytest.raises(ValueError, match="length"):
         segment_gst_mod.SegmentGST(universal_style_vector=torch.zeros(255))
+
+
+def test_need_weights_false_attn_weights_is_none(segment_gst_mod):
+    gst = segment_gst_mod.SegmentGST()
+    out = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T), need_weights=False)
+    assert out.attn_weights is None
+
+
+def test_need_weights_true_returns_correct_shape(segment_gst_mod):
+    gst = segment_gst_mod.SegmentGST()
+    out = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T), need_weights=True)
+    assert out.attn_weights is not None
+    # shape: (B, T_query_reduced, num_bases)
+    assert out.attn_weights.shape[0] == B
+    assert out.attn_weights.shape[2] == gst.num_bases
+    assert out.attn_weights.dim() == 3
+
+
+def test_pooled_style_shape(segment_gst_mod):
+    gst = segment_gst_mod.SegmentGST()
+    out = gst(torch.randn(B, T, FRAME_DIM), torch.ones(B, T))
+    assert out.pooled_style.shape == (B, gst.embed_dim)

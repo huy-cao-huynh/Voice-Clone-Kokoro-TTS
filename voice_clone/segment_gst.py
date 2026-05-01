@@ -16,6 +16,7 @@ class SegmentGSTOutput:
     style_dec: torch.Tensor
     style_pred: torch.Tensor
     pooled_style: torch.Tensor
+    attn_weights: Optional[torch.Tensor] = None
 
 
 class SegmentGST(nn.Module):
@@ -132,7 +133,7 @@ class SegmentGST(nn.Module):
         *,
         need_weights: bool = False,
         use_universal_style_pred: bool = False,
-    ) -> tuple[SegmentGSTOutput, Optional[torch.Tensor]]:
+    ) -> SegmentGSTOutput:
         if frame_hidden_states.dim() != 3:
             raise ValueError(
                 f"frame_hidden_states must be (batch, time, dim); got {tuple(frame_hidden_states.shape)}"
@@ -168,4 +169,4 @@ class SegmentGST(nn.Module):
         else:
             style_pred = u_pred + self.to_style_pred(pooled)
         ref_s = torch.cat([style_dec, style_pred], dim=-1)
-        return SegmentGSTOutput(ref_s=ref_s, style_dec=style_dec, style_pred=style_pred, pooled_style=pooled), attn_w
+        return SegmentGSTOutput(ref_s=ref_s, style_dec=style_dec, style_pred=style_pred, pooled_style=pooled, attn_weights=attn_w)

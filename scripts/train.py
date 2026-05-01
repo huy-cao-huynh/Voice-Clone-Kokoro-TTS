@@ -9,10 +9,10 @@ Usage (from repo root):
 All knobs are controlled via environment variables with sensible defaults.
 Override any of them before invoking the script:
 
-    MANIFEST          manifests/memorization_en_6x1.phonemes.jsonl   JSONL manifest path
-    MANIFEST_ROOT     (empty)                             optional root for relative manifest paths;
-                                                         omit for merged multilingual manifests
-    CKPT_DIR          ckpt/memorization_en_6x1  periodic checkpoint directory
+    MANIFEST          manifests/memorization_en_6x1_min.phonemes.jsonl   JSONL manifest path
+    MANIFEST_ROOT     data/en                             base path prepended to relative audio paths in the manifest;
+                                                         override when using a different dataset root
+    CKPT_DIR          ckpt/memorization_en_6x1_min  periodic checkpoint directory
     RESUME            (empty)                    checkpoint to resume from
     KOKORO_REPO       hexgrad/Kokoro-82M         HF model repo
     EPOCHS            1
@@ -20,9 +20,9 @@ Override any of them before invoking the script:
     DEVICE            (auto)                     cuda | cpu | mps
     NUM_WORKERS       auto                       dataloader workers (auto = cpu_count or 0 on Windows)
     WANDB_PROJECT     Voice-Clone-Kokoro-TTS
-    WANDB_RUN_NAME    memorization_en_6x1-train-<timestamp>
-    VAL_MANIFEST      manifests/memorization_en_6x1_val.phonemes.jsonl    validation JSONL manifest (skipped if missing)
-    VAL_MANIFEST_ROOT (empty)                             optional root for relative val manifest paths
+    WANDB_RUN_NAME    memorization_en_6x1_min-diag-<timestamp>
+    VAL_MANIFEST      manifests/memorization_en_6x1_min_val.phonemes.jsonl    validation JSONL manifest (skipped if missing)
+    VAL_MANIFEST_ROOT (falls back to MANIFEST_ROOT)       optional root for relative val manifest paths
     SAVE_FINAL_CHECKPOINT   (unset)                1 to force a final off-interval checkpoint, 0 for interval-only
     BATCH_SIZE              6                      batch size per micro-step for this launcher's 6-row gate default
     GRAD_ACCUM_STEPS        (from TrainConfig)     micro-steps per optimizer step
@@ -73,19 +73,19 @@ def main() -> None:
     _ensure_default_gpu_alloc_conf()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    manifest = os.environ.get("MANIFEST", "manifests/memorization_en_6x1.phonemes.jsonl")
-    manifest_root = os.environ.get("MANIFEST_ROOT", "")
-    ckpt_dir = os.environ.get("CKPT_DIR", "ckpt/memorization_en_6x1")
-    resume = os.environ.get("RESUME", "")
+    manifest = os.environ.get("MANIFEST", "manifests/memorization_en_6x1_min.phonemes.jsonl")
+    manifest_root = os.environ.get("MANIFEST_ROOT", "data/en")
+    ckpt_dir = os.environ.get("CKPT_DIR", "ckpt/memorization_en_6x1_min")
+    resume = os.environ.get("RESUME", "ckpt/memorization_en_6x1_min/checkpoint_100.pt")
     kokoro_repo = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
     epochs = os.environ.get("EPOCHS", "500")
     max_steps = os.environ.get("MAX_STEPS")
     device = os.environ.get("DEVICE")
     num_workers = os.environ.get("NUM_WORKERS", str(_default_num_workers()))
     wandb_project = os.environ.get("WANDB_PROJECT", "Voice-Clone-Kokoro-TTS")
-    wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"memorization_en_6x1-train-{timestamp}")
-    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/memorization_en_6x1_val.phonemes.jsonl")
-    val_manifest_root = os.environ.get("VAL_MANIFEST_ROOT", "")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME", f"memorization_en_6x1_min-diag-{timestamp}")
+    val_manifest = os.environ.get("VAL_MANIFEST", "manifests/memorization_en_6x1_min_val.phonemes.jsonl")
+    val_manifest_root = os.environ.get("VAL_MANIFEST_ROOT", manifest_root)
     if val_manifest and not (REPO_ROOT / val_manifest).is_file():
         val_manifest = ""
         val_manifest_root = ""
